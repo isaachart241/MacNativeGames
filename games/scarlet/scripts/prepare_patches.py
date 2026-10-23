@@ -46,7 +46,7 @@ def parse(path, build_id):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mods', type=Path, nargs='?', default=HERE / 'mods/1.2.0', help='folder of <name>/exefs/*.pchtxt')
-    parser.add_argument('--work', type=Path, default=HERE / 'BY3_build')
+    parser.add_argument('--work', type=Path, default=HERE / 'SCARLET_build')
     args = parser.parse_args()
     work = args.work.resolve()
     original = nsoimg.load(work / 'extracted/v120/exefs/main')

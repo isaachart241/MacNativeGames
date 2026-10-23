@@ -1,8 +1,9 @@
-/* Bayonetta 3 1.2.0 (main build ID B47CC79B88B7091EA514B2B725C50AE01C6F00DF).
+/* Pokemon Scarlet / Violet. Version, version folder and main build ID are not pinned yet (stage 1); the values below are
+   placeholders kept from the by3 fork so the tree builds. Title ID unverified until stage 0 (Violet: 0x01008f6008c5e000).
    No game-code address is defined on purpose: the TotK GAME_ADDR maps do not apply, so any leftover use is a
-   compile error. Bayonetta addresses get named defines here when a patch needs one. */
+   compile error. Scarlet addresses get named defines here when a patch needs one. */
 #pragma once
-#define GAME_BY3 1
-#define TOTK_GAME_VERSION "1.2.0"
+#define GAME_SCARLET 1
+#define TOTK_GAME_VERSION "0.0.0"
 #define TOTK_GAME_DIR "v120"
-#define GAME_TITLE_ID 0x01004a4010fea000ULL
+#define GAME_TITLE_ID 0x0100a3d008c5c000ULL

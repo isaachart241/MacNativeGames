@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))   # extract_exefs / ext
 from extract_exefs import decrypt, read_at, require, load_keys, container_entries, common_tickets, nca_ctr_key
 from extract_romfs import index_romfs
 
-BASE_TITLE = '01004A4010FEA000'
+BASE_TITLE = '0100A3D008C5C000'
 NODE = 0x4000
 CHUNK = 8 << 20
 

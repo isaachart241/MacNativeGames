@@ -1,74 +1,60 @@
-# Bayonetta 3 (work in progress)
+# Pokémon Scarlet / Violet (work in progress)
 
-An experiment: run Bayonetta 3 natively the way `games/totk` runs Tears of the Kingdom. It started from that code
-(rewriter, loader, Horizon host, NVN on Metal) and keeps its own copies of all of it in this folder (`runtime/`,
-`third_party/d2r`, `third_party/d2r_gfx`, `prebuilt/`, `scripts/`), so changes here never affect another game and
-nothing here reads `games/totk`. **It is playable**: title, menus and the story run with picture,
-sound, keyboard input and saves, from a small app with a settings window. Known gaps are listed in CHANGELOG.md.
+An experiment: run Pokémon Scarlet or Violet natively the way `games/by3` runs Bayonetta 3. This folder started as an
+unchanged copy of `games/by3` (commit `caec8d3`), so the next commit's diff is the whole fork. Like by3, it keeps its
+own copies of everything (`runtime/`, `third_party/d2r`, `third_party/d2r_gfx`, `prebuilt/`, `scripts/`), so changes here
+never affect another game. Bayonetta 3 was chosen as the base because it already runs a third-party engine: CMIF
+domains, offline network services, Wwise's AudioOut and indirect draws are all there.
 
-How the work was done, what was found and what went wrong on the way: [CHANGELOG.md](CHANGELOG.md).
+**Nothing runs yet.** How the work goes: [CHANGELOG.md](CHANGELOG.md).
 
-You must own the game: use your own NSPs and the `prod.keys` dumped from your own Switch. Nothing from the game is in
-this repository; `BY3_build/` (the work folder) and `mods/` are ignored by git.
+You must own the game: use your own dump and the `prod.keys` from your own Switch. Nothing from the game is in this
+repository; `SCARLET_build/` (the work folder) and `mods/` are ignored by git.
 
-## Inputs
+## What is still Bayonetta's
 
-- Base `01004A4010FEA000` (v65536) and update 1.2.0 `01004A4010FEA800` (v131072), both NSP.
-- The base Program NCA is **sparse**: its ExeFS is empty and the RomFS parts the update replaces are not stored.
-  The code always comes from the update, and the pinned hactool cannot read the base RomFS.
+These are placeholders until stage 1 pins Scarlet's version. Each is a compile-time or hash check, so nothing can
+silently use Bayonetta values with Scarlet data:
 
-## Build and play
+- `runtime/game_version.h`: `TOTK_GAME_VERSION "0.0.0"`, `TOTK_GAME_DIR "v120"`.
+- `v120` in `Makefile`, `scripts/prepare_runtime.py`, `scripts/prepare_patches.py`, `scripts/make_res_patch.py`,
+  `scripts/make_mod_manifest.py`.
+- `assets/expected-v1.2.0.json` was removed; `prepare_runtime.py` and `prepare_patches.py` need a Scarlet
+  `assets/expected-v<version>.json` (stage 1) before they run.
+- `runtime/game_patches.c` reads Bayonetta's patch tables (`SCARLET_PATCHES` picks them); Scarlet has none yet.
+- `scripts/merge_romfs.py` was written for Bayonetta's sparse base NCA. If Scarlet's base is not sparse, the update
+  RomFS may be enough, or the script needs a non-sparse path.
 
-From `games/by3`, with a Python environment made from `requirements.txt` in this folder (`PY=<that python>`):
+## Stage 0: the first session with the dump
 
-```sh
-python scripts/extract_code.py "<update>.nsp" --keys prod.keys --output BY3_build/extracted/v120/exefs
-python scripts/merge_romfs.py "<base>.nsp" "<update>.nsp" --keys prod.keys --output BY3_build/extracted/v120/romfs
-for m in sdk subsdk0 main; do
-  DM_RULESET=native DM_PRIVATE_GATES=0 $PY third_party/d2r/patch_nso.py BY3_build/extracted/v120/exefs/$m BY3_build/rewritten/v120 $m
-done
-$PY scripts/prepare_modules.py BY3_build/extracted/v120/exefs --output BY3_build/extracted/v120/elf
-make prepare patches mods app PY=$PY GAME="<update>.nsp" KEYS=prod.keys
-open "Bayonetta 3.app"
-```
+From the repository root, after `source ../env.sh` (Homebrew, the Python 3.14 environment, `LLVM_BIN`):
 
-Optional mods go in `mods/`: exefs patches as `mods/1.2.0/<name>/exefs/*.pchtxt`, RomFS mods as `mods/<name>/romfs/`.
-The app keeps running the game from `BY3_build`; do not move or delete it.
+1. Put the dump, update and keys somewhere outside the repository, e.g. `~/Games/Scarlet/`.
+2. Extract the code from the update:
 
-## Stage 1 (done)
+   ```sh
+   cd games/scarlet/scripts
+   python extract_code.py ~/Games/Scarlet/update.nsp --keys ~/Games/Scarlet/prod.keys --output ../SCARLET_build/extracted/exefs
+   ```
 
-From `games/by3`, with the Python environment of `requirements.txt`:
+   Add `--title 01008F6008C5E000` for Violet. If it refuses (a layout Bayonetta did not have), that is the first fix.
+3. Survey it:
 
-```sh
-python scripts/extract_code.py "<update>.nsp" --keys prod.keys --output BY3_build/extracted/v120/exefs
-python scripts/merge_romfs.py "<base>.nsp" "<update>.nsp" --keys prod.keys --output BY3_build/extracted/v120/romfs
-for m in sdk subsdk0 main; do
-  DM_RULESET=native DM_PRIVATE_GATES=0 python third_party/d2r/patch_nso.py BY3_build/extracted/v120/exefs/$m BY3_build/rewritten/v120 $m
-done
-```
+   ```sh
+   python survey.py ../SCARLET_build/extracted/exefs --json ../SCARLET_build/survey.json
+   ```
 
-`assets/expected-v1.2.0.json` pins every resulting hash.
+   It lists build IDs and the SDK version, middleware markers, NVN names this tree does not implement, and services in
+   `main.npdm` the host never mentions. Copy the summary (counts and names, no game data) into CHANGELOG.md.
+4. Try the rewrite, which is generic. Expect a new site kind or two, as Bayonetta needed `site_spset`:
 
-| Check | Result |
-|---|---|
-| ExeFS (main, sdk, subsdk0, rtld, main.npdm) | FS header, hash table and every block verified |
-| Merged RomFS (sparse base + BKTR update) | all six IVFC levels: 918,430 / 918,430 data blocks; 552 files, 15.0 GB; one flipped byte is caught |
-| Rewrite structure (`structck.py`) | OK for all three modules, 0 violations |
-| Rewrite semantics (`equiv.py`, emulator, random states) | 36,627 sites, 0 divergent; all 600 mutation controls caught |
+   ```sh
+   for m in sdk subsdk0 main; do
+     DM_RULESET=native DM_PRIVATE_GATES=0 python ../third_party/d2r/patch_nso.py ../SCARLET_build/extracted/exefs/$m ../SCARLET_build/rewritten/v0 $m
+   done
+   ```
 
-The rewrite needed one new block kind: `main` sets `sp` from x18 for a variable-length stack array
-(`mov sp, x18` at `0x12874f4`). `site_spset` in `patch_nso.py` keeps the old sp in a scratch register and restores the
-scratch pair from it; `structck.py` accepts that one restore form only when the register is an untouched copy of the
-entry sp. The TotK rewrites never contain such a site, so their output bytes do not change.
+   Use the build's variables: without `DM_RULESET=native DM_PRIVATE_GATES=0` the rewrite has to be redone.
+5. Look up main's build ID in community `.pchtxt` files (60 fps, resolution) for that version.
 
-## What the game uses
-
-- NVN (SDK 13.3.2). Of the 533 NVN names it loads, 419 are implemented here and 5 are intentional no-ops; most of the
-  rest are getters. Unimplemented ones abort with their name when called.
-- Wwise audio (through `audren:u` / `audout:u`), Nintendo's online SDK (NPLN: needs offline answers for `nifm`,
-  sockets, `ssl`, `friends`, `bcat`), movies as WebM (478 files), data in Platinum `.pkz` archives.
-
-## Next
-
-Stage 2: a runtime target with every TotK-specific patch, address and overlay compiled out, booting to `nnMain`.
-Stage 3: follow each unknown service, command or NVN call it aborts on until the first `nvnQueuePresentTexture`.
+Then stage 1: rename `v120` to the real version folder, write `assets/expected-v<version>.json`, and merge the RomFS.

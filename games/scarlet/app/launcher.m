@@ -1,12 +1,12 @@
 /* Bayonetta 3 launcher: a settings window with presets, then the game.
-   The app is a small bundle; the game's data stay in the work folder (BY3_build) named by Info.plist's BY3WorkFolder,
-   so nothing large is copied. Settings are saved at every change (org.macnativegames.by3) and shown again next time.
+   The app is a small bundle; the game's data stay in the work folder (SCARLET_build) named by Info.plist's ScarletWorkFolder,
+   so nothing large is copied. Settings are saved at every change (org.macnativegames.scarlet) and shown again next time.
    What each setting does in the runtime:
    - Frame rate: 30 = the game's own pacing (30 / 60 by scene); 60 = the 60 fps patch; 120 = the 60 fps patch on a 120 Hz
      present base (experimental: correct only if the game advances by real time, not by frames).
    - Internal resolution: dynamic (the game's own, up to 1600x900) or fixed 900p (patches/res-1600x900, else the
      community "Force Scaling 900p" patch). Larger internal sizes do not start yet (the game's texture heaps).
-   - Monitor (BY3_DISPLAY), window or full screen (BY3_FULLSCREEN), window size (TOTK_WINDOW_SIZE), the full-screen
+   - Monitor (SCARLET_DISPLAY), window or full screen (SCARLET_FULLSCREEN), window size (TOTK_WINDOW_SIZE), the full-screen
      output resolution (TOTK_DRAWABLE_SCALE relative to the monitor's pixels) and the scaler (MetalFX spatial upscaling of
      the game's picture to the output, TOTK_MFX_UPSCALE / TOTK_MFX_OUTPUT, or plain linear scaling).
    - Extras: improved LOD (off in every preset: it breaks the geometry here), no film grain (patches); the RomFS
@@ -36,8 +36,8 @@ static const int sizes[][2] = {{1280, 720}, {1600, 900}, {1920, 1080}, {2560, 14
 static const int outputs[] = {0, 2160, 1440, 1080, 900};
 
 static NSString *work_folder(void) {
-    const char *e = getenv("BY3_WORK");
-    return e && *e ? @(e) : [NSBundle.mainBundle objectForInfoDictionaryKey:@"BY3WorkFolder"];
+    const char *e = getenv("SCARLET_WORK");
+    return e && *e ? @(e) : [NSBundle.mainBundle objectForInfoDictionaryKey:@"ScarletWorkFolder"];
 }
 static BOOL have_patch(NSString *slug) {
     return [NSFileManager.defaultManager fileExistsAtPath:[work_folder() stringByAppendingFormat:@"/patches/%@.tsv", slug]];
@@ -117,7 +117,7 @@ static NSString *screen_name(NSScreen *s) { return s.localizedName ?: @"?"; }
     stack.edgeInsets = NSEdgeInsetsMake(20, 20, 20, 20);
     self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 680, 480) styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
                                                 backing:NSBackingStoreBuffered defer:NO];
-    self.window.title = @"Bayonetta 3"; self.window.contentView = stack; self.window.delegate = self;
+    self.window.title = @"Pokemon Scarlet"; self.window.contentView = stack; self.window.delegate = self;
     [self.note.widthAnchor constraintEqualToConstant:600].active = YES;
 
     [self loadCommon:d];
@@ -189,7 +189,7 @@ static NSString *screen_name(NSScreen *s) { return s.localizedName ?: @"?"; }
         [s appendFormat:T("Faltan estos parches y se omitirán: %@ (make patches). ", "These patches are missing and will be left out: %@ (make patches). "),
                           [missing componentsJoinedByString:@", "]];
     self.play.enabled = YES;
-    if (!work_folder() || ![NSFileManager.defaultManager isExecutableFileAtPath:[work_folder() stringByAppendingPathComponent:@"build/by3-native"]]) {
+    if (!work_folder() || ![NSFileManager.defaultManager isExecutableFileAtPath:[work_folder() stringByAppendingPathComponent:@"build/scarlet-native"]]) {
         [s appendFormat:T("No encuentro el juego en %@.", "The game is not in %@."), work_folder() ?: @"?"]; self.play.enabled = NO;
     }
     self.note.stringValue = s; self.note.hidden = !s.length;
@@ -212,7 +212,7 @@ static NSString *screen_name(NSScreen *s) { return s.localizedName ?: @"?"; }
 @end
 
 static void fail(NSString *s) {
-    NSAlert *a = [NSAlert new]; a.messageText = T("Bayonetta 3 no pudo arrancar", "Bayonetta 3 could not start"); a.informativeText = s; [a runModal];
+    NSAlert *a = [NSAlert new]; a.messageText = T("Pokemon Scarlet no pudo arrancar", "Pokemon Scarlet could not start"); a.informativeText = s; [a runModal];
 }
 static BOOL make_dir(NSString *p) { return [NSFileManager.defaultManager createDirectoryAtPath:p withIntermediateDirectories:YES attributes:nil error:nil]; }
 
@@ -225,7 +225,7 @@ int main(int argc, char **argv) {
         if (!l.launch) return 0;
         NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
         NSString *work = work_folder(), *home = NSHomeDirectory();
-        NSString *data = [home stringByAppendingPathComponent:@"Library/Application Support/MacNativeGames/BY3"];
+        NSString *data = [home stringByAppendingPathComponent:@"Library/Application Support/MacNativeGames/Scarlet"];
         NSString *logs = [home stringByAppendingPathComponent:@"Library/Logs/MacNativeGames"];
         NSString *profile = [data stringByAppendingPathComponent:@"profile"], *slot = [data stringByAppendingPathComponent:@"game-slot"];
         if (!make_dir(profile) || !make_dir(slot) || !make_dir(logs)) { fail([NSString stringWithFormat:@"%@", data]); return 1; }
@@ -236,16 +236,16 @@ int main(int argc, char **argv) {
         if ([d boolForKey:@"fixed900"] && fixed900_patch()) [patches addObject:fixed900_patch()];
         if ([d boolForKey:@"lod"] && have_patch(@"improved-lod-v2")) [patches addObject:@"improved-lod-v2"];
         if ([d boolForKey:@"nograin"] && have_patch(@"remove-film-grain")) [patches addObject:@"remove-film-grain"];
-        setenv("BY3_PATCHES", [patches componentsJoinedByString:@","].UTF8String, 1);
+        setenv("SCARLET_PATCHES", [patches componentsJoinedByString:@","].UTF8String, 1);
         setenv("DM_PRESENT_HZ", fps == 120 ? "120" : "60", 1);
 
         NSArray<NSScreen *> *all = NSScreen.screens; NSUInteger mi = [all indexOfObject:NSScreen.mainScreen];
         if (mi == NSNotFound) mi = 0;
         for (NSUInteger i = 0; i < all.count; i++) if ([screen_name(all[i]) isEqualToString:[d stringForKey:@"monitor"]]) mi = i;
-        setenv("BY3_DISPLAY", [NSString stringWithFormat:@"%lu", (unsigned long)mi].UTF8String, 1);
+        setenv("SCARLET_DISPLAY", [NSString stringWithFormat:@"%lu", (unsigned long)mi].UTF8String, 1);
         BOOL full = [d boolForKey:@"fullscreen"];
         if (full) {
-            setenv("BY3_FULLSCREEN", "1", 1);
+            setenv("SCARLET_FULLSCREEN", "1", 1);
             int h = (int)[d integerForKey:@"output"]; NSSize px = screen_pixels(all.count ? all[mi] : NSScreen.mainScreen);
             if (h > 0 && h < px.height) setenv("TOTK_DRAWABLE_SCALE", [NSString stringWithFormat:@"%.4f", h / px.height].UTF8String, 1);
         }
@@ -269,13 +269,13 @@ int main(int argc, char **argv) {
         { NSString *cmds = [data stringByAppendingPathComponent:@"input.txt"]; FILE *cf = fopen(cmds.fileSystemRepresentation, "w"); if (cf) fclose(cf);
           setenv("TOTK_INPUT_FILE", cmds.fileSystemRepresentation, 1); }   // echo "shot ~/Desktop/shot.png" >> it
 
-        NSString *log = [logs stringByAppendingPathComponent:@"by3.log"], *prev = [logs stringByAppendingPathComponent:@"by3.previous.log"];
+        NSString *log = [logs stringByAppendingPathComponent:@"scarlet.log"], *prev = [logs stringByAppendingPathComponent:@"scarlet.previous.log"];
         [NSFileManager.defaultManager removeItemAtPath:prev error:nil]; [NSFileManager.defaultManager moveItemAtPath:log toPath:prev error:nil];
         FILE *lf = fopen(log.fileSystemRepresentation, "w"); if (lf) { dup2(fileno(lf), STDOUT_FILENO); dup2(fileno(lf), STDERR_FILENO); fclose(lf); }
         fprintf(stderr, "[launcher] work %s, patches %s, present %s Hz, display %s, fullscreen %s, window %s, drawable scale %s, MetalFX %s, mod %s\n",
-                work.UTF8String, getenv("BY3_PATCHES"), getenv("DM_PRESENT_HZ"), getenv("BY3_DISPLAY"), full ? "yes" : "no", getenv("TOTK_WINDOW_SIZE"),
+                work.UTF8String, getenv("SCARLET_PATCHES"), getenv("DM_PRESENT_HZ"), getenv("SCARLET_DISPLAY"), full ? "yes" : "no", getenv("TOTK_WINDOW_SIZE"),
                 getenv("TOTK_DRAWABLE_SCALE") ?: "1", getenv("TOTK_MFX_OUTPUT") ? "on" : "off", getenv("TOTK_ROMFS_MODS"));
-        NSString *binary = [work stringByAppendingPathComponent:@"build/by3-native"];
+        NSString *binary = [work stringByAppendingPathComponent:@"build/scarlet-native"];
         char *const args[] = {(char *)binary.fileSystemRepresentation, "rewritten/v120", "boot", NULL};
         execv(args[0], args);
         fprintf(stderr, "[launcher] execv failed: %s\n", strerror(errno));

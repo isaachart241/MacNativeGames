@@ -7,7 +7,7 @@ replacement's size and SHA-256 and the original's SHA-256; the game checks all o
 another game version stops the start instead of loading. A file the RomFS lacks is added (its original's SHA-256 is
 "-"), unless a RomFS path differs from it only in case: that is a misspelt replacement (paths are case-sensitive), so
 nothing is written. The originals come from the RomFS the game was prepared with, which stays in the work folder (the app
-holds only the launcher): <work>/extracted/v120/romfs (romfs.bin and runtime-index.bin), BY3_build by default.
+holds only the launcher): <work>/extracted/v120/romfs (romfs.bin and runtime-index.bin), SCARLET_build by default.
 
 usage: make_mod_manifest.py <mod folder> [--romfs <folder>]
 """
@@ -17,8 +17,8 @@ from pathlib import Path
 import struct
 import sys
 
-BY3 = Path(__file__).resolve().parents[1]
-DEFAULT_ROMFS = BY3/'BY3_build/extracted/v120/romfs'   # the Makefile's WORK ?= BY3_build, version 1.2.0
+HERE = Path(__file__).resolve().parents[1]
+DEFAULT_ROMFS = HERE/'SCARLET_build/extracted/v120/romfs'   # the Makefile's WORK ?= SCARLET_build, version dir from runtime/game_version.h
 CHUNK = 8 << 20
 
 
@@ -81,7 +81,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('mod', type=Path, help='the mod folder, files under their RomFS paths')
     parser.add_argument('--romfs', type=Path, default=DEFAULT_ROMFS,
-                        help=f'a folder holding romfs.bin and runtime-index.bin (default: {DEFAULT_ROMFS.relative_to(BY3)})')
+                        help=f'a folder holding romfs.bin and runtime-index.bin (default: {DEFAULT_ROMFS.relative_to(HERE)})')
     args = parser.parse_args()
     romfs = args.romfs
     for need in ('romfs.bin', 'runtime-index.bin'):

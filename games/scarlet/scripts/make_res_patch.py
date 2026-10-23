@@ -11,7 +11,7 @@ H16 is H rounded down to a multiple of 16, as the game does (900 -> 896). Other 
 keep their sizes. Every site is checked against the original instruction or data before the line is written; the
 runtime checks it again. Larger sizes need more GPU memory than the game planned for: test them before relying on them.
 
-usage: make_res_patch.py <W> <H> [--work BY3_build]
+usage: make_res_patch.py <W> <H> [--work SCARLET_build]
 """
 import argparse
 import struct
@@ -46,7 +46,7 @@ def movz(reg, imm):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('width', type=int); ap.add_argument('height', type=int)
-    ap.add_argument('--work', type=Path, default=HERE / 'BY3_build')
+    ap.add_argument('--work', type=Path, default=HERE / 'SCARLET_build')
     a = ap.parse_args()
     if not (640 <= a.width <= 3840 and 360 <= a.height <= 2160 and a.width % 32 == 0):
         sys.exit('width 640..3840 (a multiple of 32), height 360..2160')

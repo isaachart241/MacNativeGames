@@ -5,7 +5,7 @@ Symbols are the modules' own exports; main exports little, so main addresses oft
 import bisect, json, re, subprocess, sys
 from pathlib import Path
 
-work = Path(__file__).resolve().parents[1] / 'BY3_build'
+work = Path(__file__).resolve().parents[1] / 'SCARLET_build'
 modules = {m['name']: m for m in json.loads((work / 'analysis/runtime-layout.json').read_text())}
 tables = {}
 for name, m in modules.items():

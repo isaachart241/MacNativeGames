@@ -181,7 +181,7 @@ def shared_fonts_config(work, out):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--work', type=Path, default=HERE / 'BY3_build')
+    parser.add_argument('--work', type=Path, default=HERE / 'SCARLET_build')
     work = parser.parse_args().work.resolve()
     out = work / 'build'
     out.mkdir(parents=True, exist_ok=True)

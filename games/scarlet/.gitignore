@@ -1,5 +1,5 @@
-# Bayonetta 3: work folder, player mods (they hold game data) and game data by format, wherever it lands in this folder
-BY3_build/
+# Pokemon Scarlet / Violet: work folder, player mods (they hold game data) and game data by format, wherever it lands in this folder
+SCARLET_build/
 /mods/
 /extracted/
 /rewritten/
@@ -9,3 +9,6 @@ BY3_build/
 romfs.bin
 *.pkz
 *.pchtxt
+# Scarlet / Violet archives (Trinity engine; unverified until stage 0)
+*.trpfs
+*.trpfd

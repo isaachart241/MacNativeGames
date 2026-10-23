@@ -220,7 +220,7 @@ static void *probe_thread(void *unused) {
     SetText initial = (SetText)sym("_ZN2nn5swkbd14SetInitialTextEPNS0_15ShowKeyboardArgEPKDs");
     Size string_size = (Size)sym("_ZN2nn5swkbd27GetRequiredStringBufferSizeEv");
     WorkSize work_size = (WorkSize)sym("_ZN2nn5swkbd25GetRequiredWorkBufferSizeEb");
-    if (!MAIN_PLT_SHOW_KEYBOARD) runtime_fail("software keyboard probe: Bayonetta 3 PLT addresses are not mapped");
+    if (!MAIN_PLT_SHOW_KEYBOARD) runtime_fail("software keyboard probe: Scarlet PLT addresses are not mapped");
     uint8_t *main_base = runtime_module_base("main");
     need(main_base != NULL, "main module base");
     void *got; memcpy(&got, main_base + MAIN_GOT_SHOW_KEYBOARD, 8);

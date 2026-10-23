@@ -3,7 +3,7 @@
    Each AudioOut is a Core Audio AudioQueue: an appended buffer's samples are copied and enqueued; when the device has
    played it, the queue's callback gives the buffer back (GetReleasedAudioOutBuffers) and signals the buffer event, so
    the game is paced by the real output. 5.1 output is mixed down to stereo (Switch order FL FR FC LFE BL BR).
-   BY3_AUDIO=0 keeps the silent real-time sink (each buffer held for its duration) for tests without a sound device. */
+   SCARLET_AUDIO=0 keeps the silent real-time sink (each buffer held for its duration) for tests without a sound device. */
 #include "runtime.h"
 #include "ipc.h"
 #include <AudioToolbox/AudioToolbox.h>
@@ -58,7 +58,7 @@ static void *silent_playback(void *arg) {
     }
 }
 static void open_device(AudioOut *o) {
-    const char *e = getenv("BY3_AUDIO");
+    const char *e = getenv("SCARLET_AUDIO");
     o->silent = e && !strcmp(e, "0");
     if (!o->silent) {
         AudioStreamBasicDescription f = {.mSampleRate = o->rate, .mFormatID = kAudioFormatLinearPCM,
