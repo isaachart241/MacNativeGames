@@ -4910,7 +4910,7 @@ static id<MTLLibrary> totk_msl_library(NSString *src, NSError **err) {
 static int drv_fillable(int stage, int bank, unsigned off) {
     if (bank == 2) return (off >= 0x20 && off < 0x120) || (off >= 0x168 && off < 0x968);
     switch (stage) {
-    case 0: return (off >= 0x110 && off < 0x210) || off == 0x610;
+    case 0: return (off >= 0x110 && off < 0x210) || off == 0x610 || off == 0x640;   // 0x640: Scarlet, draw parameters (g_draw_params)
     case 1: return off >= 0x510 && off < 0x610;
     case 5: return off >= 0x200 && off < 0x410;
     default: return 0;
@@ -4984,6 +4984,17 @@ static id<MTLLibrary> shader_lib_prebuilt(NSData *src) {
     return lib;
 }
 #endif
+/* Scarlet: a translated function that declares function constants cannot build a pipeline unspecialized. SPIRV-Cross
+   declares spvLinearTextureAlignmentOverride (65535) for texel buffers and reads it through is_function_constant_defined,
+   so specializing with no values keeps its default. A function without constants is returned as before. */
+static id<MTLFunction> shader_fn(id<MTLLibrary> lib, NSString *name) {
+    if (!lib) return nil;
+    id<MTLFunction> f = [lib newFunctionWithName:name];
+    if (!f || !f.functionConstantsDictionary.count) return f;
+    NSError *e = nil; id<MTLFunction> s = [lib newFunctionWithName:name constantValues:[MTLFunctionConstantValues new] error:&e];
+    if (!s) MLOG("【红】shader function %s declares function constants and could not be specialized: %s", name.UTF8String, e.localizedDescription.UTF8String);
+    return s;
+}
 static NvShader *shader_load(NSString *pc, int stage) {
     NSError *e = nil;
     // TOTK: runtime translations are MSL source compiled here (macOS allows runtime compilation); the OS caches compiled code.
@@ -5014,7 +5025,7 @@ static NvShader *shader_load(NSString *pc, int stage) {
     char err[160];
     if (nvn_refl_from_json(j, &o->rf, err, sizeof err)) { MLOG("【红】着色器 %s 反射转换失败：%s", pc.UTF8String, err); return nil; }
     if (rt_range_on()) o->range_ro=rt_range_bindings_ro(j);
-    o->fn = [lib newFunctionWithName:j[@"entry"]]; o->stage = stage; strlcpy(o->key, pc.UTF8String, sizeof o->key);
+    o->fn = shader_fn(lib, j[@"entry"]); o->stage = stage; strlcpy(o->key, pc.UTF8String, sizeof o->key);
     NSString *full = rt ? [NSString stringWithContentsOfFile:rt_src encoding:NSUTF8StringEncoding error:nil] : nil;
     o->writes_depth = full && [full rangeOfString:@"[[depth("].location != NSNotFound;
     if (full) { o->src_path = rt_src; drv_scan(o, full); refl_mark_stores(o, j[@"bindings"], full); }   // TOTK: scan before iOS drops the source (NPC-culling fix needs it there too); rw from the MSL's stores
@@ -5945,7 +5956,7 @@ static id<MTLFunction> fs_fn_border(NvShader *fs, int nodepth) {
         NSString *src = border_src(fs, nodepth && fs->writes_depth ? fs_src_without_depth(fs) : sh_src(fs), colours, aids, n);
         if (!src) { os_unfair_lock_unlock(&lock); return nil; }
         NSError *err = nil; id<MTLLibrary> lib = totk_msl_library(src, &err);
-        fn = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
+        fn = shader_fn(lib, fs->fn.name);
         if (!fn) MDIE("fragment shader %s with emulated sampler border colour: %s", fs->key, err.localizedDescription.UTF8String);
         if (!fs->bpatch) fs->bpatch = [NSMutableDictionary dictionary];
         fs->bpatch[key] = fn;
@@ -5990,7 +6001,7 @@ static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered, int bo
             src = [src stringByReplacingOccurrencesOfString:@"return out;" withString:@"{ out.totk_layer = totk_layer_in; return out; }"];
         }
         NSError *e = nil; id<MTLLibrary> lib = totk_msl_library(src, &e);
-        f = lib ? [lib newFunctionWithName:vs->fn.name] : nil;
+        f = shader_fn(lib, vs->fn.name);
         if (!f) MDIE("vertex shader %s (variant %s): %s", vs->key, key.UTF8String, e.localizedDescription.UTF8String);
         if (!vs->vpatch) vs->vpatch = [NSMutableDictionary dictionary];
         vs->vpatch[key] = f;
@@ -6023,7 +6034,7 @@ static id<MTLFunction> fs_fn_without_depth(NvShader *fs) {
     if (!fs->no_depth_fn) {
         NSString *src = fs_src_without_depth(fs);
         NSError *err = nil; id<MTLLibrary> lib = totk_msl_library(src, &err);
-        fs->no_depth_fn = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
+        fs->no_depth_fn = shader_fn(lib, fs->fn.name);
         if (!fs->no_depth_fn) MDIE("fragment shader %s without depth export: %s", fs->key, err.localizedDescription.UTF8String);
         MLOG("[totk] fragment depth export omitted for a color-only pass: %s", fs->key);
     }
@@ -6052,7 +6063,7 @@ static id<MTLFunction> fs_fn_mfx(NvShader *fs, int role, int nodepth) {
             src = [src stringByReplacingCharactersInRange:[src rangeOfString:head] withString:[head stringByAppendingString:@"    float4 totk_mfx_copy [[color(7)]];\n"]];
             src = [src stringByReplacingOccurrencesOfString:@"return out;" withString:[NSString stringWithFormat:@"{ out.totk_mfx_copy = %@; return out; }", e]];
             NSError *err = nil; id<MTLLibrary> lib = totk_msl_library(src, &err);
-            fs->mfx_fn[idx] = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
+            fs->mfx_fn[idx] = shader_fn(lib, fs->fn.name);
             if (!fs->mfx_fn[idx]) MDIE("fragment shader %s, MetalFX copy (role %d): %s", fs->key, role, err.localizedDescription.UTF8String);
         } else MLOG("【红】[mfx] fragment shader %s: colour 0 (%s) cannot be copied to the UI layer; this draw is left out of it", fs->key, type ? type.UTF8String : "none");
     }
@@ -6116,7 +6127,7 @@ static id<MTLFunction> nan_trace_fn(NvShader *fs) {
     }
     if (in_entry != 3) MDIE("TOTK_NAN_TRACE: could not instrument %s (state %d)", fs->key, in_entry);
     NSError *err = nil; id<MTLLibrary> lib = totk_msl_library(o, &err);
-    id<MTLFunction> fn = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
+    id<MTLFunction> fn = shader_fn(lib, fs->fn.name);
     if (!fn) MDIE("TOTK_NAN_TRACE: %s does not compile: %s", fs->key, err.localizedDescription.UTF8String);
     MLOG("TOTK_NAN_TRACE: %s rebuilt with %d checked temporaries, outputs %s", fs->key, instrumented, [outs componentsJoinedByString:@","].UTF8String);
     os_unfair_lock_lock(&lock); done[k] = fn; os_unfair_lock_unlock(&lock);
@@ -6959,6 +6970,10 @@ static uint64_t ui_mat_patch(const p_bind_buf *u, void *mb, uint64_t mo) {
 }
 /* TOTK_NAN_TRACE: g_nt_watch is the texture the traced shader read in its watched slot (see nt_watch_after_pass). */
 static uint32_t g_dispatch_grid[3];   // TOTK: thread-group counts of the dispatch being encoded (driver segment c0 + 0x200)
+// Scarlet: the draw being encoded writes NVN's draw parameters to the vertex stage's driver segment, as the console's
+// driver does: c0 + 0x640 base vertex (first vertex of a plain draw, base vertex of an indexed one), + 0x644 base
+// instance, + 0x648 draw index (0: multi-draw indirect would need one value per draw). Set by draw_inner.
+static int32_t g_draw_params[3];
 /* Driver banks contain binding metadata, not the pointed-to bytes. Reuse their immutable arena
    allocation while those bindings match; the submission epoch prevents arena reuse from returning
    a previous frame's address. No texture residency or guest-memory freshness checks are skipped. */
@@ -6969,6 +6984,7 @@ typedef struct {
     p_bind_buf storage[16], uniform[16];
     uint64_t textures[128], samplers[128];
     uint32_t grid[3];
+    int32_t draw[3];   // Scarlet: g_draw_params of the vertex stage
 } driver_bank_cache;
 static driver_bank_cache g_driver_bank[6][2];
 static uint64_t g_driver_hit, g_driver_miss, g_driver_check;
@@ -6992,6 +7008,7 @@ static void driver_bank_fill(uint8_t *d, int bank, int stage) {
             for (int r = 0; r < 16; r++) { uint64_t a = S.ubo[5][r].addr; uint32_t n = (uint32_t)S.ubo[5][r].size; memcpy(d + 0x210 + 16 * r, &a, 8); memcpy(d + 0x210 + 16 * r + 8, &n, 4); }
         } else if (stage == 0) {   // TOTK: point-size limit the vertex shaders clamp gl_PointSize to (the driver's hardware limit 0x44fffe00 = 2047.9375)
             const float ps_max = 2047.9375f; memcpy(d + 0x610, &ps_max, sizeof ps_max);
+            memcpy(d + 0x640, g_draw_params, sizeof g_draw_params);   // Scarlet: base vertex, base instance, draw index
         }
     } else {
         for (int r = 0; r < 128; r++) { uint32_t th = (uint32_t)S.tex[stage][r], sh_ = (uint32_t)S.samp[stage][r]; memcpy(d + 0x168 + 8 * r, &th, 4); memcpy(d + 0x568 + 8 * r, &sh_, 4); }
@@ -7010,7 +7027,8 @@ static uint64_t driver_bank_gpu(int bank, int stage, id<MTLBuffer> *out) {
     int same = c->epoch == g_arena_epoch && c->gpu;
     if (same && !g_driver_probe_stale) {
         if (bank == 0) same = !memcmp(c->storage, S.ssbo[stage], sizeof c->storage) &&
-            (stage != 5 || (!memcmp(c->uniform, S.ubo[5], sizeof c->uniform) && !memcmp(c->grid, g_dispatch_grid, sizeof c->grid)));
+            (stage != 5 || (!memcmp(c->uniform, S.ubo[5], sizeof c->uniform) && !memcmp(c->grid, g_dispatch_grid, sizeof c->grid))) &&
+            (stage != 0 || !memcmp(c->draw, g_draw_params, sizeof c->draw));
         else same = !memcmp(c->textures, S.tex[stage], sizeof c->textures) && !memcmp(c->samplers, S.samp[stage], sizeof c->samplers);
     }
     int check = atomic_load(&g_driver_cache_check);
@@ -7027,6 +7045,7 @@ static uint64_t driver_bank_gpu(int bank, int stage, id<MTLBuffer> *out) {
     c->epoch = g_arena_epoch; c->gpu = g_cur_arena->gpu + offset; c->buffer = buffer; c->offset = offset;
     if (bank == 0) { memcpy(c->storage, S.ssbo[stage], sizeof c->storage);
         if (stage == 5) { memcpy(c->uniform, S.ubo[5], sizeof c->uniform); memcpy(c->grid, g_dispatch_grid, sizeof c->grid); }
+        if (stage == 0) memcpy(c->draw, g_draw_params, sizeof c->draw);
     } else { memcpy(c->textures, S.tex[stage], sizeof c->textures); memcpy(c->samplers, S.samp[stage], sizeof c->samplers); }
     g_driver_miss++; *out = buffer; return c->gpu;
 }
@@ -9794,6 +9813,8 @@ static int mfxup_draw(NvProg *pr) {
 #include "nvn_cube_group.h"
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
+    g_draw_params[0] = di ? di->base_vertex : dw ? dw->first : 0;   // Scarlet: driver segment c0 + 0x640 (driver_bank_fill)
+    g_draw_params[1] = di ? di->base_instance : dw ? dw->base_instance : 0; g_draw_params[2] = 0;
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
     if (pr && pr->missing) { g_draw_skip[15]++; return; }   // TOTK (iOS): a stage is not translated yet
     if (g_nupd) upd_guard_draw(pr, di);   // TOTK: before any encoder or texture preparation of this draw

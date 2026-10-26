@@ -90,6 +90,30 @@ static void execute_program(int index, const void *param, uint64_t size) {
 }
 /* Open users kept across a program jump (PushOpenUsers before ExecuteProgram, PopOpenUsers in the next program). A
    fresh start has none; the game then opens its user the usual way (runtime/account.c). */
+/* Scarlet: BCAT (news and distributions) as a console that never connected: the delivery cache mounts and is empty,
+   a sync request is refused as unavailable, nothing opens. The classes' constructors and destructors stay the SDK's
+   (no IPC); every call that would reach bcat:u is answered here. */
+#define BCAT_UNAVAILABLE RESULT(122, 300)
+#define BCAT_NOT_FOUND RESULT(122, 1)
+static uint32_t bcat_enumerate(int32_t *count, void *names, int32_t max) {
+    (void)names; (void)max; if (!count) runtime_fail("bcat enumerate count"); *count = 0; return 0;
+}
+static uint32_t bcat_sync(void *progress) {
+    (void)progress; static int once; if (!once++) fprintf(stderr, "[totk-net] BCAT delivery cache sync: offline\n"); return BCAT_UNAVAILABLE;
+}
+static uint32_t bcat_not_found(void) { return BCAT_NOT_FOUND; }
+static uint32_t bcat_dir_read(void *self, int32_t *count, void *entries, int32_t max) {
+    (void)self; (void)entries; (void)max; if (!count) runtime_fail("bcat directory read count"); *count = 0; return 0;
+}
+static uint32_t bcat_file_read(void *self, uint64_t *done, int64_t off, void *buf, uint64_t size) {
+    (void)self; (void)off; (void)buf; (void)size; if (done) *done = 0; return BCAT_NOT_FOUND;
+}
+static int64_t bcat_file_size(void) { return 0; }
+/* Scarlet: Bluetooth LE (the Pokemon GO Plus + accessory) as no device in range: init succeeds (the game ignores its
+   result) and the BLE events are created and never signalled, so a scan never reports anything. */
+static uint32_t ble_event(void *event) { if (!event) runtime_fail("BLE event"); hle_bind_system_event(event, 0); return 0; }
+/* Scarlet: cryptographic random bytes come from csrng on the console; macOS's arc4random is the same kind of source. */
+static void random_bytes(void *buf, uint64_t size) { if (size && !buf) runtime_fail("random bytes buffer"); arc4random_buf(buf, (size_t)size); }
 static void push_open_users(void) {}
 static uint32_t pop_open_users(int32_t *count, void *handles, int32_t max) {
     (void)handles; (void)max; if (!count) runtime_fail("PopOpenUsers count pointer"); *count = 0; return 0;
@@ -119,6 +143,28 @@ void *runtime_scarlet_override(const char *name) {
         {"_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", nop},
         {"_ZN2nn7account13PushOpenUsersEv", push_open_users},
         {"_ZN2nn7account12PopOpenUsersEPiPNS0_10UserHandleEi", pop_open_users},
+        {"_ZN2nn6crypto36GenerateCryptographicallyRandomBytesEPvm", random_bytes},   /* Scarlet */
+        /* Scarlet: Bluetooth LE with no device in range (above) */
+        {"_ZN2nn9bluetooth13InitializeBleEv", ok},
+        {"_ZN2nn9bluetooth19AcquireBleScanEventEPNS_2os15SystemEventTypeE", ble_event},
+        {"_ZN2nn9bluetooth24AcquireBleMtuConfigEventEPNS_2os15SystemEventTypeE", ble_event},
+        {"_ZN2nn9bluetooth28AcquireBleGattOperationEventEPNS_2os15SystemEventTypeE", ble_event},
+        {"_ZN2nn9bluetooth31AcquireBleServiceDiscoveryEventEPNS_2os15SystemEventTypeE", ble_event},
+        {"_ZN2nn9bluetooth37AcquireBleConnectionStateChangedEventEPNS_2os15SystemEventTypeE", ble_event},
+        /* Scarlet: BCAT offline (above) */
+        {"_ZN2nn4bcat10InitializeEv", nop}, {"_ZN2nn4bcat25MountDeliveryCacheStorageEv", ok},
+        {"_ZN2nn4bcat27UnmountDeliveryCacheStorageEv", nop},
+        {"_ZN2nn4bcat31EnumerateDeliveryCacheDirectoryEPiPNS0_13DirectoryNameEi", bcat_enumerate},
+        {"_ZN2nn4bcat24RequestSyncDeliveryCacheEPNS0_21DeliveryCacheProgressE", bcat_sync},
+        {"_ZN2nn4bcat21DeliveryCacheProgress6UpdateEv", nop},
+        {"_ZN2nn4bcat22DeliveryCacheDirectory4OpenEPKc", bcat_not_found},
+        {"_ZN2nn4bcat22DeliveryCacheDirectory4OpenERKNS0_13DirectoryNameE", bcat_not_found},
+        {"_ZN2nn4bcat22DeliveryCacheDirectory4ReadEPiPNS0_27DeliveryCacheDirectoryEntryEi", bcat_dir_read},
+        {"_ZN2nn4bcat22DeliveryCacheDirectory5CloseEv", nop},
+        {"_ZN2nn4bcat17DeliveryCacheFile4OpenEPKc", bcat_not_found},
+        {"_ZN2nn4bcat17DeliveryCacheFile4ReadEPmlPvm", bcat_file_read},
+        {"_ZN2nn4bcat17DeliveryCacheFile7GetSizeEv", bcat_file_size},
+        {"_ZN2nn4bcat17DeliveryCacheFile5CloseEv", nop},
     };
     for (size_t i = 0; i < sizeof entries / sizeof *entries; i++) if (!strcmp(name, entries[i].name)) return entries[i].fn;
     return NULL;

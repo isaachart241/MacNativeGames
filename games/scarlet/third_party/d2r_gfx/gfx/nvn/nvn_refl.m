@@ -62,6 +62,16 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
         NSDictionary *dr = j[@"drv_reads"];
         if ([dr isKindOfClass:[NSDictionary class]]) { o->drv_read[0] = dr[@"0"] != nil; o->drv_read[2] = dr[@"2"] != nil; }
         NSArray *uf = j[@"drv_unfillable"];
+        if ([uf isKindOfClass:[NSArray class]] && uf.count && [j[@"stage"] isEqual:@"vs"]) {
+            // Scarlet: the replay now fills NVN's draw parameters in the vertex stage's c0 (nvn_mtl.m g_draw_params),
+            // which the prebuilt translator still lists as unfillable. The draw index is always 0 (single draws).
+            NSMutableArray *rest = [NSMutableArray array];
+            for (NSString *at in uf) {
+                if ([at isEqual:@"c0+0x648"]) { static int once; if (!once++) fprintf(stderr, "[totk-gfx] [refl] a vertex shader reads the draw index (c0+0x648): filled with 0 (%s)\n", [j[@"key"] UTF8String]); }
+                if (![at isEqual:@"c0+0x640"] && ![at isEqual:@"c0+0x644"] && ![at isEqual:@"c0+0x648"]) [rest addObject:at];
+            }
+            uf = rest;
+        }
         if ([uf isKindOfClass:[NSArray class]] && uf.count) FAIL("运行时读驱动段的回放层填不了的位置：%s", [[uf componentsJoinedByString:@" "] UTF8String]);
         NSString *c1 = j[@"c1"];
         if (c1.length % 2 || c1.length / 2 > sizeof o->c1) FAIL("c1 长 %lu 字节，超上限或不成对", (unsigned long)c1.length / 2);

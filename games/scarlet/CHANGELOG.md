@@ -11,7 +11,7 @@ result. Game data, keys and saves are never committed.
 | 0 | Feasibility: does the game fit the by3 architecture? | done 2026-10-25 |
 | 1 | Code and data out of the dump; code rewritten for Apple silicon | done 2026-10-25 |
 | 2 | The runtime fork boots to `nnMain` | done 2026-10-25 |
-| 3 | Every unknown service / NVN call answered until the first `nvnQueuePresentTexture` | in progress |
+| 3 | Every unknown service / NVN call answered until the first `nvnQueuePresentTexture` | done 2026-10-25 (submission off) |
 | 4 | Picture, audio, input, saves; frame-rate patches | |
 | 5 | Performance, shaders, packaging as an app | |
 
@@ -155,10 +155,48 @@ Then, answered by name:
   style).
 - `nn::pl::RequestSharedFontLoad`: the fonts load on first use.
 
-**Where it stops now**: a null dereference at main+0x2151bc0 during PokemonEngine's component setup (main+0x11acb4c
-names `pe_FlatbuffersDataComponent`, `pe_TextComponent`, `pe_InputEventTriggerComponent`, `message/grammar/`).
-main+0x788704 looks an entry up in a table by (0x3f, 0x20, n); n = 1 is found, n = 2 is not, and the caller does not
-check. Next: find what fills that table.
+**Fonts (fixed).** The null dereference at main+0x2151bc0 was the game's font manager: a glyph lookup for `?` in font
+slot 2 found nothing. Slot 2 is `beluga_font` (an icon font, no ASCII) plus a font with an empty name: every system
+shared font failed `nn::fontll::ScalableFontEngine::LoadFont` with 0x193, while the game's own fonts
+(`RodinNTLGPro-DB`, `UDKakugoC80Pro-DB`, `beluga_font`) loaded. The game passes `nn::pl::GetSharedFontAddress` straight
+to the low-level font engine, which takes plain TrueType; the host handed it the XORed BFTTF payload (the data after the
+header starts 0x49631806: 0x00010000 XORed with the key 0x49621806). `runtime/shared_font.c` now decodes the payload in
+place after the integrity check (key = header word ^ 0x7f9a0218) and checks for the TrueType magic. Games that use
+NintendoWare's font library decode BFTTF themselves, which is why TotK and Bayonetta never showed it.
+
+Answered by name after that, each the first time the game asked:
+
+- `nn::bcat` (news and distributions) as a console that never connected: the delivery cache mounts and is empty, a sync
+  is refused as unavailable, nothing opens. Constructors and destructors stay the SDK's.
+- `nn::crypto::GenerateCryptographicallyRandomBytes`: `arc4random_buf` (csrng on the console).
+- `nn::bluetooth` LE (the Pokemon GO Plus + accessory) as no device in range: `InitializeBle` succeeds (the game ignores
+  its result), the five BLE events are created and never signalled.
+- NVN multisample coverage modulation / coverage-to-color / sample-location grid, stored in the fields `ms_st` reserved;
+  a non-default value is reported once (not drawn).
+
+**The first draws.** The game then records command buffers and submits them. Its vertex shaders read NVN's draw
+parameters from the driver constant buffer, c0 + 0x640 (Ryujinx's NvnBaseVertexByteOffset; 0x644 base instance,
+0x648 draw index), which the replay did not fill and the prebuilt translator lists as unfillable. The replay now writes
+them per draw for the vertex stage (`g_draw_params`, `driver_bank_fill`, included in the optional driver-bank cache
+key), and `nvn_refl.m` accepts exactly those three offsets for vertex shaders. A SPIRV-Cross pixel shader declares the
+function constant `spvLinearTextureAlignmentOverride` (65535), which Metal will not build unspecialized:
+`shader_fn` specializes with no values, keeping SPIRV-Cross's default.
+
+### 2026-10-25: milestone, the main loop runs
+
+With GPU submission still off (the host's default), the game ran until the 2-minute limit stopped it: frame 3,500 at
+about 30 fps (present interval 2, the main thread on a 33.33 ms real-time period), about 73 render passes and 53
+distinct NVN functions a frame, audio output running without underruns (silent so far). Nothing reaches the screen:
+the work is encoded and dropped.
+
+Seen in that run, not fatal yet:
+
+- 12 render pipelines refused by Metal: the vertex shader writes `render_target_array_index` (layered rendering, e.g.
+  shadow cascades or cube maps), which needs the pipeline's input primitive topology set. Those draws are skipped.
+- A texture-to-texture copy that scales (1920x1080 to 480x270) is not implemented.
+- One draw sets different scissors per viewport; one pre-swizzled texture is not in a memory pool (CPU fallback).
+
+Next: GPU submission (`TOTK_GPU_ALLOW_SUBMIT=1`) for a first picture, then those four.
 
 Tools for the next step: `TOTK_FS_LOG=1` (every RomFS open), `TOTK_INPUT_FILE` with `hletrace 2` (first call of each
 host function, in order), and lldb `--batch` with the inspection commands as `-k` (they run when the process stops on

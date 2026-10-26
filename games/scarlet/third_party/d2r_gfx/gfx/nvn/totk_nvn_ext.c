@@ -197,6 +197,19 @@ NVN(nvnMultisampleStateGetAlphaToCoverageEnable, NVNboolean, const NVNmultisampl
 NVN(nvnMultisampleStateGetRasterSamples, int, NVNmultisampleState *s) { return CS(ms_st, s)->raster_samples; }
 NVN(nvnMultisampleStateSetRasterSamples, void, NVNmultisampleState *s, int n) { if (n < 0 || n > 16) die("raster samples %d", n); MS(ms_st, s)->raster_samples = (uint8_t)n; }
 NVN(nvnMultisampleStateSetAlphaToCoverageDither, void, NVNmultisampleState *s, uint32_t e) { MS(ms_st, s)->a2c_dither = (e & 0xff) != 0; }
+// Scarlet: coverage modulation / coverage-to-color (NV mixed samples) and the sample-location grid, stored in the fields
+// ms_st reserves; the replay does not read them, so a non-default value is reported once (it would not be drawn).
+static void ms_unsupported(const char *what, int v) { static int seen; if (v && !seen++) LOG("[nvn] multisample %s = %d is stored but not drawn (no Metal equivalent)", what, v); }
+NVN(nvnMultisampleStateSetCoverageModulationMode, void, NVNmultisampleState *s, NVNcoverageModulationMode m) { MS(ms_st, s)->cov_mod = (uint8_t)m; ms_unsupported("coverage modulation", (int)m); }
+NVN(nvnMultisampleStateGetCoverageModulationMode, NVNcoverageModulationMode, const NVNmultisampleState *s) { return (NVNcoverageModulationMode)CS(ms_st, s)->cov_mod; }
+NVN(nvnMultisampleStateSetCoverageToColorEnable, void, NVNmultisampleState *s, uint32_t e) { MS(ms_st, s)->cov2color_en = (e & 0xff) != 0; ms_unsupported("coverage to color", (e & 0xff) != 0); }
+NVN(nvnMultisampleStateGetCoverageToColorEnable, NVNboolean, const NVNmultisampleState *s) { return CS(ms_st, s)->cov2color_en; }
+NVN(nvnMultisampleStateSetCoverageToColorOutput, void, NVNmultisampleState *s, int o) { MS(ms_st, s)->cov2color_out = (uint8_t)o; }
+NVN(nvnMultisampleStateGetCoverageToColorOutput, int, const NVNmultisampleState *s) { return CS(ms_st, s)->cov2color_out; }
+NVN(nvnMultisampleStateGetAlphaToCoverageDither, NVNboolean, const NVNmultisampleState *s) { return CS(ms_st, s)->a2c_dither; }
+NVN(nvnMultisampleStateGetSampleLocationsEnable, NVNboolean, const NVNmultisampleState *s) { return CS(ms_st, s)->sl_en; }
+NVN(nvnMultisampleStateSetSampleLocationsGridEnable, void, NVNmultisampleState *s, uint32_t e) { MS(ms_st, s)->sl_grid = (e & 0xff) != 0; }
+NVN(nvnMultisampleStateGetSampleLocationsGridEnable, NVNboolean, const NVNmultisampleState *s) { return CS(ms_st, s)->sl_grid; }
 NVN(nvnPolygonStateGetCullFace, NVNface, const NVNpolygonState *s) { return (NVNface)CS(poly_st, s)->cull; }
 NVN(nvnPolygonStateGetFrontFace, NVNfrontFace, const NVNpolygonState *s) { return (NVNfrontFace)CS(poly_st, s)->front; }
 NVN(nvnPolygonStateGetPolygonMode, NVNpolygonMode, const NVNpolygonState *s) { return (NVNpolygonMode)CS(poly_st, s)->mode; }

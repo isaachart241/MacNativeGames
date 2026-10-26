@@ -1,6 +1,7 @@
 /* nn::pl shared fonts: the verified system BFTTF files laid out back to back as in the pl shared memory.
    GetSharedFontAddress points 8 bytes past each file start (after the BFTTF header), as the SDK adds the
-   service-provided offset to the shared memory base; the size is the decoded font size. */
+   service-provided offset to the shared memory base; the size is the decoded font size. Scarlet decodes the payload
+   to plain TrueType after the integrity check (see load). */
 #include "runtime.h"
 #include "shared_fonts_config.h"
 #include <CommonCrypto/CommonDigest.h>
@@ -27,6 +28,12 @@ static void load(void){
   need(fread(region+at,1,rows[i].file_bytes,f)==rows[i].file_bytes&&fgetc(f)==EOF,"shared font size");fclose(f);
   uint8_t d[32];char hex[65];CC_SHA256(region+at,(CC_LONG)rows[i].file_bytes,d);for(int k=0;k<32;k++)snprintf(hex+k*2,3,"%02x",d[k]);
   need(!strcmp(hex,rows[i].sha256),"shared font integrity mismatch");
+  /* Scarlet: the game hands GetSharedFontAddress straight to nn::fontll::ScalableFontEngine::LoadFont, which takes
+     plain TrueType (it rejected the XORed payload with 0x193). The payload is decoded in place, as the console's
+     shared memory holds it: big-endian words XORed with key = header word ^ 0x7f9a0218. The header stays as stored. */
+  uint8_t *p=region+at;uint32_t key=((uint32_t)p[0]<<24|(uint32_t)p[1]<<16|(uint32_t)p[2]<<8|p[3])^0x7f9a0218u;
+  for(uint64_t k=8;k+4<=rows[i].file_bytes;k+=4){p[k]^=(uint8_t)(key>>24);p[k+1]^=(uint8_t)(key>>16);p[k+2]^=(uint8_t)(key>>8);p[k+3]^=(uint8_t)key;}
+  need(p[8]==0&&p[9]==1&&p[10]==0&&p[11]==0,"decoded shared font is not TrueType");
   offsets[i]=at+8;at+=rows[i].file_bytes;
  }
  fprintf(stderr,"[totk] shared fonts loaded: %d fonts, %llu bytes\n",SHARED_FONT_COUNT,(unsigned long long)total);
