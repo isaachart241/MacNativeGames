@@ -520,3 +520,42 @@ AAudio now share its ring pull); Scarlet sends it silence. `SCARLET_AUDIO_MUTE=1
 (tests at night). Checked on the Thor, muted: AudioOut level in the house rms 0.011 to 0.018 (the Mac's was 0.024),
 481,280 samples per 5 s (48 kHz stereo) with almost all of them nonzero, no stalls, 30 fps held. Music the game decodes
 with Opus stays silent until libopus is built for Android (`opus_silent.h`).
+
+### 2026-10-26: Thor port, T3: an APK, on the Thor's screen, with its controls
+
+**The app.** `make -f android/Makefile APK=1 GFX=vk install` builds the runtime as `libscarlet.so` and packs it into
+`scarlet.apk` (4 MB) with no Android SDK, Gradle or Java: Android's own `NativeActivity` loads the library
+(`android:hasCode="false"`), and `android/tools/build_apk.py` compiles `android/app/AndroidManifest.xml` to Android's
+binary XML (attribute IDs checked against the Thor's `framework-res.apk`) and signs the APK with an APK Signature
+Scheme v2 block made with openssl (a debug key in `SCARLET_build/apk-key`). The APK holds no game code or data: the app
+reads `extracted/`, `rewritten/v400-android/` and `user-data/` from its files folder
+(`/sdcard/Android/data/org.macnativegames.scarlet/files`), where `env.txt` sets test switches and `logs/run.log` is
+the game's log (`runtime/activity_android.c`). The game data were copied there on the device as the app's own user
+(`run-as`), since files that `adb shell` creates there belong to the shell user and the app cannot read them.
+
+**The window.** The Vulkan backend presents to the activity's window (`front_vk_surface`: `vkCreateAndroidSurfaceKHR`).
+The Thor's top panel is portrait (1080x1920); the swapchain is made in the game's landscape with the identity transform
+and the compositor rotates it, and Android's `VK_SUBOPTIMAL_KHR` for that mismatch no longer remakes the swapchain at
+every present. When the window goes (Home, recent apps), the backend destroys its swapchain and surface before the
+window is released (`nvn_vk_window_lost`), renders offscreen meanwhile, and makes them again for the next window.
+Focus loss is passed to the game as on the Mac (nn::oe message 15) and silences the sound until focus returns.
+
+**The controls.** The Thor's pad ("Odin Controller", `Vendor_2020_Product_0111.kl`) sends Android gamepad keys and
+joystick motion: sticks on X / Y and Z / RZ, triggers on BRAKE / GAS, the d-pad as HAT_X / HAT_Y and d-pad keys.
+`runtime/gamepad_android.c` turns them into the Mac's physical buttons (face buttons by position: the right one is the
+Switch's A; `TOTK_FACE_BUTTONS=label` maps them by label) and applies the player's layout and its modes
+(`TOTK_CONTROLS`). The back key is taken so it does not close the game; home, volume and recent apps stay with Android.
+
+**Fixes the app needed.** In an app `/proc/self/exe` is Android's `app_process64`, so the section lookup behind the
+graphics layer's HLE table (`android/compat/elf_sections.c`) found nothing and the game stopped at `nvdrv`; it now reads
+the file `dladdr` names (the library, or the program). The Mac's one-game-at-a-time slot is skipped in the app, as on
+iOS. `exit()` in an app runs the framework's destructors under its running threads (FORTIFY aborts), so the app saves
+the Vulkan pipeline cache and calls `_exit`.
+
+**Checked on the Thor:** the title screen fills the screen (screencap 1920x1080, the right way up); a gamepad button
+injected with `input gamepad keyevent BUTTON_B` (the right face button) passes the title and Continue into the house;
+the left stick, injected into the controller's own input device (`sendevent` on `/dev/input/event9`), walks the
+character down the stairs. Frame time p50 33.33 ms, p95 35.0 ms; NVN replay 11.2 ms; 2.4 GB PSS. Home and back: the
+window and swapchain are remade, the game kept running, focus out and in was reported and the sound was silent in
+between. Not checked: the face buttons pressed by hand (whether the Thor sends BUTTON_A for its bottom button), and
+sound through the speaker (the tests ran muted at night). The Mac runtime still builds.

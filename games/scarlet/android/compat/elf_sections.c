@@ -1,6 +1,7 @@
-/* Thor port: getsectiondata over the running executable's ELF section headers, and proc_pidinfo over /proc.
-   The section headers are not loaded at run time, so /proc/self/exe is read once; a section's address is its sh_addr
-   plus the executable's load bias (AT_PHDR minus the program headers' file offset). */
+/* Thor port: getsectiondata over the ELF section headers of the file this code is in (the command-line program, or
+   libscarlet.so in the APK, where /proc/self/exe is Android's app_process), and proc_pidinfo over /proc. The section
+   headers are not loaded at run time, so the file dladdr names is read once; a section's address is its sh_addr plus
+   the load bias (dladdr's base minus the first PT_LOAD's address). */
 #define _GNU_SOURCE
 #include <elf.h>
 #include <errno.h>
@@ -13,6 +14,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <ctype.h>
 #include "mach-o/getsect.h"
 #include "libproc.h"
@@ -25,15 +27,21 @@ static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 
 static int read_at(int fd, void *p, size_t n, off_t off) { return pread(fd, p, n, off) == (ssize_t)n; }
 static void load_sections(void) {
-    int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC); if (fd < 0) return;
+    Dl_info self; if (!dladdr((void *)load_sections, &self) || !self.dli_fname) return;
+    int fd = open(self.dli_fname, O_RDONLY | O_CLOEXEC); if (fd < 0) return;
     Elf64_Ehdr eh;
     if (!read_at(fd, &eh, sizeof eh, 0) || memcmp(eh.e_ident, ELFMAG, SELFMAG) || eh.e_shentsize != sizeof(Elf64_Shdr) || eh.e_shstrndx >= eh.e_shnum) { close(fd); return; }
+    uintptr_t first = 0;
+    for (int i = 0; i < eh.e_phnum; i++) {
+        Elf64_Phdr ph; if (!read_at(fd, &ph, sizeof ph, (off_t)(eh.e_phoff + (uint64_t)i * eh.e_phentsize))) { close(fd); return; }
+        if (ph.p_type == PT_LOAD) { first = (uintptr_t)(ph.p_vaddr - ph.p_offset); break; }
+    }
     Elf64_Shdr *sh = calloc(eh.e_shnum, sizeof *sh);
     if (!sh || !read_at(fd, sh, (size_t)eh.e_shnum * sizeof *sh, (off_t)eh.e_shoff)) { free(sh); close(fd); return; }
     char *names = malloc(sh[eh.e_shstrndx].sh_size + 1);
     if (!names || !read_at(fd, names, sh[eh.e_shstrndx].sh_size, (off_t)sh[eh.e_shstrndx].sh_offset)) { free(names); free(sh); close(fd); return; }
     names[sh[eh.e_shstrndx].sh_size] = 0;
-    uintptr_t bias = (uintptr_t)getauxval(AT_PHDR) - (uintptr_t)eh.e_phoff;   /* PIE: the first PT_LOAD maps file offset 0 at vaddr 0 + bias */
+    uintptr_t bias = (uintptr_t)self.dli_fbase - first;   /* the first PT_LOAD maps file offset 0 at the base */
     g_sections = calloc(eh.e_shnum, sizeof *g_sections);
     for (int i = 0; g_sections && i < eh.e_shnum; i++) {
         if (!sh[i].sh_addr || sh[i].sh_name >= sh[eh.e_shstrndx].sh_size) continue;

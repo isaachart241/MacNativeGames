@@ -30,17 +30,31 @@ else
 GFX_SRC := $(filter-out $(VK_SRC),$(ALL_GFX))
 GFX_LIBS :=
 endif
+# APK=1 (stage T3): the same runtime as libscarlet.so for the app (runtime/activity_android.c), with the Vulkan backend
+# presenting to the activity's window; no Java, no Gradle (android/tools/build_apk.py packs and signs it):
+#   make -f android/Makefile APK=1 GFX=vk apk       # SCARLET_build/build-android-apk/scarlet.apk
+#   make -f android/Makefile APK=1 GFX=vk install   # adb install -r (the game data: runtime/activity_android.c)
+APK ?= 0
+ifeq ($(APK),1)
+ifneq ($(GFX),vk)
+$(error APK=1 needs GFX=vk)
+endif
+OUT := $(WORK)/build-android-apk
+PIC := -fPIC -DSCARLET_APK
+else
+PIC :=
+endif
 SRC := $(wildcard runtime/*.c runtime/*.S) $(GFX_SRC) \
   android/compat/darwin_compat.c android/compat/elf_sections.c android/compat/sha256.c
 OBJECTS := $(patsubst %,$(OUT)/obj/%.o,$(SRC))
 HEADERS := $(wildcard runtime/*.h third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h android/compat/*.h android/compat/*/*.h)
 GEN := $(WORK)/build-android
 GENERATED := $(GEN)/runtime_tables.h $(GEN)/romfs_config.h $(GEN)/shared_fonts_config.h
-CFLAGS := -std=gnu11 $(NATIVE_OPT) -g -Wall -Wextra -Wno-unused-function -Wno-unused-parameter -Wno-sign-compare \
+CFLAGS := -std=gnu11 $(NATIVE_OPT) $(PIC) -g -Wall -Wextra -Wno-unused-function -Wno-unused-parameter -Wno-sign-compare \
   -include android/compat/android_prelude.h -Iandroid/compat -Iandroid/compat/vk -I$(GEN) -Iruntime \
   -Ithird_party/d2r_gfx/gfx/nvn/include -Ithird_party/d2r_gfx/gfx/nvn -Ithird_party/d2r_gfx/gfx/tex -Ithird_party/d2r_gfx/third_party
 
-.PHONY: all push boot clean
+.PHONY: all push boot clean apk install
 all: $(OUT)/scarlet-native
 
 $(GENERATED):
@@ -53,10 +67,20 @@ $(OUT)/obj/%.c.o: %.c $(HEADERS) $(GENERATED) android/Makefile
 # Assembly: the same include paths, without the C prelude
 $(OUT)/obj/%.S.o: %.S $(HEADERS) android/Makefile
 	@mkdir -p "$(dir $@)"
-	"$(CC)" -Iruntime -Ithird_party/d2r_gfx/gfx/nvn -I$(GEN) -c "$<" -o "$@"
+	"$(CC)" $(PIC) -Iruntime -Ithird_party/d2r_gfx/gfx/nvn -I$(GEN) -c "$<" -o "$@"
 
 $(OUT)/scarlet-native: $(OBJECTS)
 	"$(CC)" $(OBJECTS) $(GFX_LIBS) -laaudio -lm -ldl -llog -o "$@"
+
+# The app's library: -Bsymbolic binds the runtime's own symbols inside it (the assembly reaches them PC-relative).
+$(OUT)/libscarlet.so: $(OBJECTS)
+	"$(CC)" -shared -Wl,-soname,libscarlet.so -Wl,-Bsymbolic -Wl,--no-undefined $(OBJECTS) $(GFX_LIBS) -landroid -laaudio -lm -ldl -llog -o "$@"
+
+APK_KEY ?= $(WORK)/apk-key
+apk: $(OUT)/libscarlet.so android/app/AndroidManifest.xml android/tools/build_apk.py
+	python3 android/tools/build_apk.py --manifest android/app/AndroidManifest.xml --lib "$<" --key "$(APK_KEY)" -o "$(OUT)/scarlet.apk"
+install: apk
+	"$(ADB)" install -r "$(OUT)/scarlet.apk"
 
 push: $(OUT)/scarlet-native
 	"$(ADB)" shell mkdir -p $(DEVICE_DIR)/logs
@@ -71,4 +95,4 @@ boot: push
 	"$(ADB)" shell "cd $(DEVICE_DIR) && TOTK_HEADLESS=1 $(THOR_ENV) ./scarlet-native rewritten/v400-android boot" > "$(THOR_LOG)" 2>&1; echo "exit $$?; log: $(THOR_LOG)"
 
 clean:
-	rm -rf "$(OUT)/obj" "$(OUT)/scarlet-native"
+	rm -rf "$(OUT)/obj" "$(OUT)/scarlet-native" "$(OUT)/libscarlet.so" "$(OUT)/scarlet.apk"

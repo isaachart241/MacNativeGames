@@ -80,7 +80,7 @@ static aaudio_data_callback_result_t aaudio_play(AAudioStream *st, void *user, v
             o->rd += k; o->head_played += k; done += (int32_t)k;
         }
     }
-    float vol = o->volume; int mute = o->mute;
+    float vol = o->volume; int mute = o->mute || !runtime_front_focus();   /* the app out of focus: silent, still paced */
     pthread_mutex_unlock(&o->lock);
     if (done < want) memset(out + 2 * done, 0, (size_t)(want - done) * 4);
     if (mute) memset(out, 0, (size_t)want * 4);

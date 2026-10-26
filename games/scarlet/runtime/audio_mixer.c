@@ -161,15 +161,15 @@ static void output_open(Mixer *m, int rate) {
     m->unit_ok = 1; fprintf(stderr, "[totk-audio] CoreAudio output %d Hz stereo\n", rate);
 }
 #else
-/* Android (Thor port): no output device yet (AAudio comes with the app stage); the mixer runs and paces as without a device */
 /* Android (Thor port): AAudio, float stereo at the renderer's rate, pulled from the same ring as Core Audio.
    TOTK_AUDIO_OFF: mixing without a device, as on the Mac. SCARLET_AUDIO_MUTE=1 (tests): the stream runs and is fed but
-   plays silence. A disconnected device (headphones unplugged) reopens the stream on the default one. */
+   plays silence; so does the app while it is not in focus (runtime_front_focus). A disconnected device (headphones
+   unplugged) reopens the stream on the default one. */
 #include <aaudio/AAudio.h>
 static int g_audio_mute = -1;
 static aaudio_data_callback_result_t aaudio_pull(AAudioStream *st, void *ud, void *data, int32_t frames) {
     (void)st; ring_pull(ud, data, (uint32_t)frames);
-    if (g_audio_mute) memset(data, 0, (size_t)frames * 2 * sizeof(float));
+    if (g_audio_mute || !runtime_front_focus()) memset(data, 0, (size_t)frames * 2 * sizeof(float));
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 static int g_aaudio_rate;

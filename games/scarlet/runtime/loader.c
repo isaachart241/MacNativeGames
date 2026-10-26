@@ -52,7 +52,12 @@ void runtime_slot_set(unsigned i, void *v) { if (pthread_setspecific(runtime_key
 void *runtime_slot_get(unsigned i) { return pthread_getspecific(runtime_keys[i]); }
 #endif
 static uint64_t timer_calls, svc_calls;
+#ifdef SCARLET_APK
+_Noreturn void runtime_android_exit(int code);   /* runtime/frontend_android.c */
+_Noreturn void runtime_fail(const char *message) { fprintf(stderr,"[totk] FAIL: %s\n",message); runtime_android_exit(1); }
+#else
 _Noreturn void runtime_fail(const char *message) { fprintf(stderr,"[totk] FAIL: %s\n",message); exit(1); }
+#endif
 static void need(bool c,const char *m) { if(!c) runtime_fail(m); }
 static size_t page_up(size_t x) { return (x+0x3fff)&~(size_t)0x3fff; }
 static unsigned hash_name(const char *s) { unsigned h=2166136261u; for(;*s;s++)h=(h^(uint8_t)*s)*16777619u;return h; }

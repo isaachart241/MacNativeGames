@@ -507,6 +507,10 @@ void vk_oneoff_end(VkCommandBuffer cb) {   // ordered after all earlier submissi
 
 // ---------- present ----------
 static uint64_t g_swap_gen;   /* bumped when the swapchain is recreated (the overlay remakes its image views) */
+/* The swapchain is made with the identity transform and the compositor rotates it (Android: the Thor's top panel is
+   portrait, the game landscape). Android reports VK_SUBOPTIMAL_KHR at every present while the transform differs from
+   the display's, so that result does not remake the swapchain then. */
+static int g_swap_rotated;
 int overlay_vk_draw(const overlay_vk_frame *f) __attribute__((weak));
 static int swap_create(void) {
     if (!V.surface_fn) return 0;
@@ -522,7 +526,7 @@ static int swap_create(void) {
     VkSwapchainKHR old = V.swap;
     VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, NULL, 0, V.surface, n, pick.format, pick.colorSpace, caps.currentExtent, 1,
         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT),   /* SRC: "oshot" */
-        VK_SHARING_MODE_EXCLUSIVE, 0, NULL, caps.currentTransform,
+        VK_SHARING_MODE_EXCLUSIVE, 0, NULL, (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : caps.currentTransform,
         VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, getenv("TOTK_VK_VSYNC_OFF") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR, VK_TRUE, old};
     if (ci.presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
         uint32_t npm = 0; VkPresentModeKHR pm[16]; vkGetPhysicalDeviceSurfacePresentModesKHR(V.phys, V.surface, &npm, NULL); if (npm > 16) npm = 16;
@@ -532,14 +536,25 @@ static int swap_create(void) {
     if (vkCreateSwapchainKHR(V.dev, &ci, NULL, &V.swap) != VK_SUCCESS) { V.swap = VK_NULL_HANDLE; return 0; }
     if (old) { vkDeviceWaitIdle(V.dev); vkDestroySwapchainKHR(V.dev, old, NULL); }
     V.sfmt = pick.format; V.sext = caps.currentExtent;
-    g_swap_gen++;
+    g_swap_gen++; g_swap_rotated = ci.preTransform != caps.currentTransform;
     V.nsimg = 8; vkGetSwapchainImagesKHR(V.dev, V.swap, &V.nsimg, V.simg);
     VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (uint32_t i = 0; i < 8; i++) { if (!V.s_acq[i]) vkCreateSemaphore(V.dev, &sci, NULL, &V.s_acq[i]); if (!V.s_done[i]) vkCreateSemaphore(V.dev, &sci, NULL, &V.s_done[i]); }
-    VKLOG("swapchain %ux%u format %d, %u images", V.sext.width, V.sext.height, V.sfmt, V.nsimg);
+    VKLOG("swapchain %ux%u format %d, %u images%s", V.sext.width, V.sext.height, V.sfmt, V.nsimg, g_swap_rotated ? " (rotated by the compositor)" : "");
     return 1;
 }
 int mtl_has_window(void) { return V.surface_fn != NULL; }
+/* The frontend's window is going away (Android: the app left the screen). The swapchain and the surface are destroyed
+   before it returns, so the window can be released; the next present after a new window makes them again. */
+void nvn_vk_window_lost(void) {
+    if (!V.ok) return;
+    vk_big_lock();
+    pthread_mutex_lock(&V.qmu); vkDeviceWaitIdle(V.dev); pthread_mutex_unlock(&V.qmu);
+    if (V.swap) { vkDestroySwapchainKHR(V.dev, V.swap, NULL); V.swap = VK_NULL_HANDLE; }
+    if (V.surface) { vkDestroySurfaceKHR(V.inst, V.surface, NULL); V.surface = VK_NULL_HANDLE; }
+    vk_big_unlock();
+    VKLOG("window lost: swapchain and surface destroyed");
+}
 /* A texture's level 0 / layer 0 converted to RGBA8 by a blit (any colour format), read back synchronously. */
 static uint8_t *read_rgba8_(const tex_t *t, uint32_t *w, uint32_t *h);
 uint8_t *nvn_vk_read_rgba8(const tex_t *t, uint32_t *w, uint32_t *h) { if (!V.ok) return NULL; vk_big_lock(); uint8_t *r = read_rgba8_(t, w, h); vk_big_unlock(); return r; }
@@ -726,7 +741,7 @@ static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
         else VKLOG("screenshot with overlay %s failed", p);
         vmaDestroyBuffer(V.vma, obuf, oal);
     }
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || swap_reset) swap_create();   /* swap_reset: VSync changed in the menu */
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || (r == VK_SUBOPTIMAL_KHR && !g_swap_rotated) || swap_reset) swap_create();   /* swap_reset: VSync changed in the menu */
     return ticket;
 }
 void mtl_present_wait(uint64_t ticket) { (void)ticket; }

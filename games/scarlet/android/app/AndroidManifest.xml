@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Thor port, stage T3. No Java: android:hasCode="false" and the framework's NativeActivity, which loads
+  lib/arm64-v8a/libscarlet.so (android.app.lib_name) and calls its ANativeActivity_onCreate (runtime/activity_android.c).
+  No resources either (no resources.arsc): the label is a plain string and the theme is the framework's.
+  android/tools/build_apk.py compiles this file to Android's binary XML; it knows the attributes used here.
+  INTERNET: the shader translator bridge on the Mac (android/tools/shader_bridge.py) over adb reverse on localhost.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.macnativegames.scarlet"
+    android:versionCode="1"
+    android:versionName="0.1-thor">
+
+    <uses-sdk android:minSdkVersion="33" android:targetSdkVersion="33" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:label="Scarlet"
+        android:hasCode="false"
+        android:debuggable="true"
+        android:extractNativeLibs="true"
+        android:allowBackup="false"
+        android:isGame="true"
+        android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+
+        <activity
+            android:name="android.app.NativeActivity"
+            android:label="Scarlet"
+            android:exported="true"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|fontScale|locale|layoutDirection|colorMode|touchscreen"
+            android:launchMode="singleTask"
+            android:resizeableActivity="false">
+
+            <meta-data android:name="android.app.lib_name" android:value="scarlet" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
