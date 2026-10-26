@@ -113,16 +113,19 @@ static void *input_thread(void *arg) {
     for (;;) ALooper_pollOnce(-1, NULL, NULL, NULL);
     return NULL;
 }
+int bottom_input_created(AInputQueue *q, ALooper *looper), bottom_input_destroyed(AInputQueue *q);   /* runtime/bottom_android.c */
+void bottom_focus(ANativeActivity *a, int on), bottom_destroy(ANativeActivity *a);
 static void input_created(ANativeActivity *a, AInputQueue *q) {
     (void)a; pthread_mutex_lock(&inputLock);
-    inputQueue = q; if (inputLooper) AInputQueue_attachLooper(q, inputLooper, 1, on_input, NULL);
+    if (!bottom_input_created(q, inputLooper)) { inputQueue = q; if (inputLooper) AInputQueue_attachLooper(q, inputLooper, 1, on_input, NULL); }
     pthread_mutex_unlock(&inputLock);
 }
 static void input_destroyed(ANativeActivity *a, AInputQueue *q) {
     (void)a; pthread_mutex_lock(&inputLock);
-    AInputQueue_detachLooper(q); if (inputQueue == q) inputQueue = NULL;
+    int bottom = bottom_input_destroyed(q);
+    if (!bottom) { AInputQueue_detachLooper(q); if (inputQueue == q) inputQueue = NULL; }
     pthread_mutex_unlock(&inputLock);
-    runtime_input_clear();
+    if (!bottom) runtime_input_clear();
 }
 
 /* Text entry (the game's keyboard applet, runtime/swkbd_host.c, through runtime_front_text_input): an Android dialog
@@ -295,10 +298,10 @@ void runtime_android_rumble(int level) {
 
 static void window_created(ANativeActivity *a, ANativeWindow *w) { (void)a; runtime_android_window(w); }
 static void window_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; runtime_android_window(NULL); }
-static void focus_changed(ANativeActivity *a, int on) { if (on) immersive(a); runtime_android_focus(on); }
+static void focus_changed(ANativeActivity *a, int on) { if (on) immersive(a); runtime_android_focus(on); bottom_focus(a, on); }
 static void on_resume(ANativeActivity *a) { (void)a; ALOG("resume"); }
 static void on_pause(ANativeActivity *a) { (void)a; ALOG("pause"); }
-static void on_destroy(ANativeActivity *a) { if (activity == a) activity = NULL; ALOG("activity destroyed (the game keeps running)"); }
+static void on_destroy(ANativeActivity *a) { bottom_destroy(a); if (activity == a) activity = NULL; ALOG("activity destroyed (the game keeps running)"); }
 
 __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActivity *a, void *saved, size_t saved_size) {
     (void)saved; (void)saved_size;

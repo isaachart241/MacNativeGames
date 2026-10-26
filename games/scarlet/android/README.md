@@ -42,6 +42,10 @@ typed in a dialog with the on-screen keyboard.
 The game's rumble drives the Thor's vibration motor. It has one motor, so it gets the stronger of the game's two;
 `TOTK_RUMBLE=0` turns rumble off, and `SCARLET_RUMBLE_TEST=<1-255>` buzzes once at start to check the motor.
 
+The bottom screen shows a map while the game is in focus (drag to look around, pinch to zoom; it follows you again a
+few seconds after the last touch); leaving the game gives the screen back to whatever was there. Work in progress: the
+map is a grid for now (`runtime/bottom_android.c`). `SCARLET_BOTTOM=0` leaves the bottom screen alone.
+
 ## Shaders
 
 The game's shaders are translated to SPIR-V on the Thor itself, the first time each one is drawn, and kept in the app's

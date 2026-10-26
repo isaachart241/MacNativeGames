@@ -794,3 +794,23 @@ late: its threshold (34 ms) was below the old build's measured intervals, which 
 
 Not checked: the pictures beyond Cabo Poco with fixed-format images (a view needing another format would show its
 image wrong for one frame, then be fixed; none was logged here).
+
+### 2026-10-26: Thor port: the bottom screen (first step of the map)
+
+The user's choices for the Thor's second screen (1080x1240, display 4, where their launcher shows otherwise): a full
+region map drawn by the port, north up and following the player, with what the in-game map marks; drag and pinch-zoom,
+snapping back to the player; the game's minimap gone from the top screen; the bottom screen taken only while the game
+is open and in focus.
+
+`runtime/bottom_android.c`, the first step: while the game has focus a Presentation on the presentation display shows a
+SurfaceView, drawn on the CPU by a thread of its own when something changes. With no Java code in the app, the surface
+is polled (no callback object for surfaceCreated), and the window's input queue is taken by the activity itself
+(NativeActivity is an InputQueue.Callback): its touches arrive as a second AInputQueue in onInputQueueCreated and are
+read on the input thread (one finger drags, two pinch around their midpoint; 4 s after the last touch the view glides
+back). The window is not focusable, so touching it neither pauses the game nor takes the pad's keys. The map is a grid
+with the player's arrow at the origin for now (`bottom_map_set_player` is the hook for the position).
+
+Checked on the Thor: the grid and arrow on the bottom screen (1240x1080 surface) with the game in focus on the top;
+injected touches on the bottom panel (`/dev/input/event5`, raw panel coordinates, so a drag along the panel's x moves
+the map along the display's y) dragged and zoomed it and it came back after 4 s; Home gave the bottom screen back to
+the launcher and returning showed the map again; the game kept focus throughout. Not checked: real fingers.
