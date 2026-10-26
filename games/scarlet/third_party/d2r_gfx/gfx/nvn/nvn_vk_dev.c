@@ -127,6 +127,7 @@ int nvn_vk_device_init(void) {
     for (uint32_t i = 0; i < nq; i++) if ((qp[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) { V.qfam = i; break; }
     free(qp);
     if (V.qfam == UINT32_MAX) { VKLOG("no graphics+compute queue"); return 0; }
+    { uint32_t vb = qp[V.qfam].timestampValidBits; V.ts_mask = vb >= 64 ? ~0ull : vb ? (1ull << vb) - 1 : 0; }
 
     uint32_t nde = 0; vkEnumerateDeviceExtensionProperties(V.phys, NULL, &nde, NULL);
     VkExtensionProperties *dex = calloc(nde ? nde : 1, sizeof *dex); vkEnumerateDeviceExtensionProperties(V.phys, NULL, &nde, dex);
@@ -276,6 +277,19 @@ void vk_arena_free(vk_arena *a) { vk_arena_reset(a); if (a->head) { vmaDestroyBu
    GPU is done with it (retire). Resetting the two command buffers one by one at the next begin cost the render thread
    about 3 ms a frame outdoors on the Thor. */
 static vk_sub *g_free_subs;   // under g_done_mu
+/* Thor port: GPU time per game frame (the timing line's GPU column and the long-frame notes, hle_nvn.c): the summed
+   timestamp spans of the frame's submissions, known once none of them is in flight. mtl_set_frame gives the frame that
+   the following submissions belong to. */
+static _Atomic uint64_t g_gpu_frame;
+static struct { uint64_t frame, ns; int pending; } g_gpu_ring[64];   // under g_gpu_mu
+static pthread_mutex_t g_gpu_mu = PTHREAD_MUTEX_INITIALIZER;
+static void gpu_frame_add(uint64_t f, uint64_t ns, int pending) {
+    pthread_mutex_lock(&g_gpu_mu);
+    __typeof__(g_gpu_ring[0]) *e = &g_gpu_ring[f % 64];
+    if (e->frame != f) { e->frame = f; e->ns = 0; e->pending = 0; }
+    e->ns += ns; e->pending += pending;
+    pthread_mutex_unlock(&g_gpu_mu);
+}
 static vk_sub *sub_new(void) {
     pthread_mutex_lock(&g_done_mu);
     vk_sub *s = g_free_subs; if (s) g_free_subs = s->next;
@@ -287,12 +301,17 @@ static vk_sub *sub_new(void) {
         VkCommandBuffer cbs[2];
         VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, s->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 2};
         VKCHECK(vkAllocateCommandBuffers(V.dev, &ai, cbs)); s->pre = cbs[0]; s->cb = cbs[1];
+        if (V.ts_mask && V.props.limits.timestampPeriod > 0) {
+            VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2, 0};
+            VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &s->qp));
+        }
     }
     static uint64_t seq; s->seq = ++seq;
     s->next = NULL; s->npost = s->nrb = 0; s->dcur = 0; s->defer = NULL;
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     VKCHECK(vkBeginCommandBuffer(s->pre, &bi));   // both in the initial state: new, or their pool reset by retire
     VKCHECK(vkBeginCommandBuffer(s->cb, &bi));
+    if (s->qp) { vkCmdResetQueryPool(s->pre, s->qp, 0, 2); vkCmdWriteTimestamp(s->pre, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s->qp, 0); }
     {   // everything submitted before (earlier submissions, presents that blit a rendering) completes its memory accesses first:
         // nothing waits on the CPU for the GPU between submissions any more
         VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
@@ -351,6 +370,9 @@ static void retire(vk_sub *s) {
     }
     while (s->defer) { vk_defer *d = s->defer; s->defer = d->next; d->fn(d->arg); free(d); }
     for (int i = 0; i < s->ndpool; i++) vkResetDescriptorPool(V.dev, s->dpool[i], 0);
+    uint64_t ts[2];
+    s->gpu_ns = s->qp && vkGetQueryPoolResults(V.dev, s->qp, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS
+        ? (uint64_t)((double)((ts[1] - ts[0]) & V.ts_mask) * V.props.limits.timestampPeriod) : 0;
     VKCHECK(vkResetCommandPool(V.dev, s->pool, 0));
     vk_arena_reset(&s->arena);
 }
@@ -369,6 +391,7 @@ static void *comp_main(void *arg) {
         pthread_mutex_lock(&g_done_mu);
         g_pend_head = s->next; if (!g_pend_head) g_pend_tail = NULL;
         atomic_store(&g_done, s->fence);
+        gpu_frame_add(s->frame, s->gpu_ns, -1);
         s->next = g_free_subs; g_free_subs = s;
         for (int i = 0; i < g_nlate;) if (g_late[i].after <= s->fence) { late_t l = g_late[i]; g_late[i] = g_late[--g_nlate]; pthread_mutex_unlock(&g_done_mu); l.fn(l.arg); pthread_mutex_lock(&g_done_mu); } else i++;
         pthread_cond_broadcast(&g_done_cv);
@@ -402,6 +425,7 @@ void mtl_sub_begin(void) {
     atomic_store(&g_recording, 1);
     g_sub = sub_new();
     vk_pools_sync(g_sub);
+    vk_tex_upgrade_pending(g_sub);
     vk_exec_sub_begin();
 }
 vk_sub *vk_sub_current(void) {
@@ -433,8 +457,10 @@ uint64_t mtl_sub_commit(void) {
                                VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT};
         di.pMemoryBarriers = &hb; vkCmdPipelineBarrier2(s->cb, &di);
     }
+    if (s->qp) vkCmdWriteTimestamp(s->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->qp, 1);
     VKCHECK(vkEndCommandBuffer(s->pre)); VKCHECK(vkEndCommandBuffer(s->cb));
     s->fence = ++g_fence;
+    s->frame = atomic_load(&g_gpu_frame); gpu_frame_add(s->frame, 0, 1);
     VkCommandBufferSubmitInfo cbi[2] = {{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, NULL, s->pre}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, NULL, s->cb}};
     VkSemaphoreSubmitInfo ssi = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, NULL, V.timeline, s->fence, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, NULL, 0, 0, NULL, 2, cbi, 1, &ssi};
@@ -632,7 +658,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
 }
 static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
     present_shot(t, ticket);
-    { void vk_rt_dump_flush(void); vk_rt_dump_flush(); }
+    { void vk_rt_dump_flush(void); vk_rt_dump_flush(); void vk_pass_times_flush(void); vk_pass_times_flush(); }
     { void vk_pcache_tick(uint64_t); vk_pcache_tick(ticket); }
     { void vk_pipe_budget_reset(void); vk_pipe_budget_reset(); }
     if (ticket % 600 == 0) { void vk_pipe_stats(uint64_t *, uint64_t *, int *); uint64_t made, ns; int pend; vk_pipe_stats(&made, &ns, &pend);
@@ -760,9 +786,15 @@ uint64_t mtl_udc_saved_bytes(void) { return 0; }
 int mtl_warm_wait(int timeout_ms) { (void)timeout_ms; return 0; }
 int mtl_link_active(void) { return 0; }
 int mtl_link_wait_tick(uint64_t timeout_ns, unsigned frame_ticks) { (void)timeout_ns; (void)frame_ticks; return 0; }
-void mtl_set_frame(uint64_t f) { (void)f; }
+void mtl_set_frame(uint64_t f) { atomic_store(&g_gpu_frame, f); }
 void mtl_ub_present(double iv_ms) { (void)iv_ms; }
-double mtl_gpu_ms(uint64_t f) { (void)f; return -1; }
+double mtl_gpu_ms(uint64_t f) {
+    if (!V.ts_mask) return -1;
+    pthread_mutex_lock(&g_gpu_mu);
+    double ms = g_gpu_ring[f % 64].frame == f && g_gpu_ring[f % 64].pending == 0 ? g_gpu_ring[f % 64].ns / 1e6 : -1;
+    pthread_mutex_unlock(&g_gpu_mu);
+    return ms;
+}
 int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) { (void)f; (void)t0; (void)t1; return 0; }
 void mtl_pkg_stats(uint64_t *u, uint64_t *r) { *u = atomic_load(&g_stat_uploads); *r = 0; }
 uint64_t mtl_pkg_miss(void) { return 0; }

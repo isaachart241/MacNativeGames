@@ -87,6 +87,73 @@ static void image_barrier_general(VkCommandBuffer cb, VkImage img, VkImageAspect
 }
 
 static uint32_t mipd(uint32_t s, unsigned l) { s >>= l; return s ? s : 1; }
+
+/* Thor port: images are made without VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, or with a format list of just their format and
+   its sRGB / linear twin (tex_create): a mutable image without a list loses the Adreno's framebuffer compression. At the
+   start of Cabo Poco, standing still, the GPU needed 28.1 ms a frame with every image mutable and 21.9 ms without.
+   nvn_mtl.m does the same with PixelFormatView. A view in a format the image does not allow is made in the image's own
+   format for the moment, and the image is queued: at the next submission's start it is made again, mutable with no
+   list, and its contents are copied over in `pre`, before anything of that submission uses it (TOTK_VK_MUTABLE=1: every
+   image mutable, as before). */
+static VkFormat srgb_twin(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB; case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+        case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB; case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+        case VK_FORMAT_A8B8G8R8_UNORM_PACK32: return VK_FORMAT_A8B8G8R8_SRGB_PACK32; case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+        case VK_FORMAT_R8_UNORM: return VK_FORMAT_R8_SRGB; case VK_FORMAT_R8_SRGB: return VK_FORMAT_R8_UNORM;
+        case VK_FORMAT_R8G8_UNORM: return VK_FORMAT_R8G8_SRGB; case VK_FORMAT_R8G8_SRGB: return VK_FORMAT_R8G8_UNORM;
+        default: return VK_FORMAT_UNDEFINED;
+    }
+}
+static uint64_t g_upq[64]; static int g_nupq;   // serials of images to make mutable; under g_upmu
+static pthread_mutex_t g_upmu = PTHREAD_MUTEX_INITIALIZER;
+static void upgrade_queue(vk_tex *x, VkFormat want) {
+    pthread_mutex_lock(&g_upmu);
+    int i = 0; while (i < g_nupq && g_upq[i] != x->serial) i++;
+    if (i == g_nupq && g_nupq < 64) {
+        g_upq[g_nupq++] = x->serial;
+        static int said; if (said++ < 16) VKLOG("image %ux%u in format %d viewed as format %d: made mutable at the next submission", x->w, x->h, (int)x->fmt, (int)want);
+    }
+    pthread_mutex_unlock(&g_upmu);
+}
+typedef struct { VkImage img; VmaAllocation al; vk_view *views; } old_image;
+static void old_image_free(void *arg) {
+    old_image *o = arg;
+    for (vk_view *w = o->views; w;) { vk_view *n = w->next; vkDestroyImageView(V.dev, w->v, NULL); free(w); w = n; }
+    vmaDestroyImage(V.vma, o->img, o->al); free(o);
+}
+void vk_tex_upgrade_pending(vk_sub *s) {
+    /* This may run inside tex_create, which opens a submission while holding g_tmu: then (or while another thread holds
+       it) the queue waits for a later submission. A texture released meanwhile is no longer in the table. */
+    if (!g_nupq || pthread_mutex_trylock(&g_tmu)) return;
+    vk_tex *xs[64]; int nx = 0;
+    pthread_mutex_lock(&g_upmu);
+    while (g_nupq) { vk_tex *x = tab_get(g_upq[--g_nupq]); if (x) xs[nx++] = x; }
+    pthread_mutex_unlock(&g_upmu);
+    pthread_mutex_unlock(&g_tmu);
+    for (int i = 0; i < nx; i++) {
+        vk_tex *x = xs[i];
+        if (!x->img || !x->fmt_mode) continue;   // done already
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, x->cflags | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, x->type, x->fmt, {x->w, x->h, x->d}, x->levels,
+            x->layers, x->samples, VK_IMAGE_TILING_OPTIMAL, x->usage, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+        VmaAllocationCreateInfo ai = {0}; ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+        VkImage ni; VmaAllocation na;
+        if (vmaCreateImage(V.vma, &ci, &ai, &ni, &na, NULL) != VK_SUCCESS) { VKONCE("mutable image for a format view: vkCreateImage failed"); continue; }
+        image_barrier_general(s->pre, ni, x->aspect, VK_IMAGE_LAYOUT_UNDEFINED);
+        VkImageCopy rg[2 * 16]; uint32_t n = 0;
+        VkImageAspectFlags asps[2] = {x->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT, x->aspect & VK_IMAGE_ASPECT_STENCIL_BIT};
+        for (uint32_t l = 0; l < x->levels && l < 16; l++) for (int k = 0; k < 2; k++) if (asps[k]) {
+            uint32_t nl = x->type == VK_IMAGE_TYPE_3D ? 1 : x->layers;
+            rg[n++] = (VkImageCopy){{asps[k], l, 0, nl}, {0, 0, 0}, {asps[k], l, 0, nl}, {0, 0, 0},
+                                    {mipd(x->w, l), mipd(x->h, l), x->type == VK_IMAGE_TYPE_3D ? mipd(x->d, l) : 1}};
+        }
+        vkCmdCopyImage(s->pre, x->img, VK_IMAGE_LAYOUT_GENERAL, ni, VK_IMAGE_LAYOUT_GENERAL, n, rg);
+        image_barrier_general(s->pre, ni, x->aspect, VK_IMAGE_LAYOUT_GENERAL);
+        old_image *o = malloc(sizeof *o); o->img = x->img; o->al = x->al; o->views = x->views;
+        vk_sub_defer(s, old_image_free, o);
+        x->img = ni; x->al = na; x->views = NULL; x->fmt_mode = 0; x->cflags = ci.flags;
+    }
+}
 /* Uploads every level / layer of x from the pool bytes into the image, through the arena of submission s (pre cb). */
 static int tex_upload(vk_tex *x, vk_sub *s) {
     const tex_t *t = &x->t; const nvn_texdesc *d = &t->d;
@@ -190,13 +257,22 @@ static vk_tex *tex_create(const tex_t *t) {
         if ((d->flags & NVN_TEXTURE_FLAGS_IMAGE) && (ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && x->samples == VK_SAMPLE_COUNT_1_BIT) us |= VK_IMAGE_USAGE_STORAGE_BIT;
     } else fl |= VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
     if (x->type == VK_IMAGE_TYPE_3D) fl &= ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    VkImageFormatListCreateInfo fli = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, 2, x->pair};
+    {   static int mut = -1; if (mut < 0) { const char *e = getenv("TOTK_VK_MUTABLE"); mut = e && !strcmp(e, "1"); }
+        if (!mut && !fmt_compressed(x->fmt)) {
+            x->twin = srgb_twin(x->fmt);
+            if (x->twin) { x->fmt_mode = 2; x->pair[0] = x->fmt; x->pair[1] = x->twin; }
+            else { x->fmt_mode = 1; fl &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT; }
+        }
+    }
     /* A 3D render target (the colour-grading LUT behind the menus) is drawn slice by slice through 2D-array views */
     if (x->type == VK_IMAGE_TYPE_3D && (us & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) fl |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     uint32_t maxdim = x->w > x->h ? x->w : x->h; if (x->d > maxdim) maxdim = x->d;
     uint32_t maxlv = 1; while ((maxdim >> maxlv) > 0) maxlv++;
     if (x->levels > maxlv) x->levels = maxlv;
-    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, fl, x->type, x->fmt, {x->w, x->h, x->d}, x->levels, x->layers, x->samples,
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, x->fmt_mode == 2 ? &fli : NULL, fl, x->type, x->fmt, {x->w, x->h, x->d}, x->levels, x->layers, x->samples,
         VK_IMAGE_TILING_OPTIMAL, us, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    x->cflags = fl; x->usage = us;
     VmaAllocationCreateInfo ai = {0}; ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     VkResult r = vmaCreateImage(V.vma, &ci, &ai, &x->img, &x->al, NULL);
     if (r != VK_SUCCESS) { VKLOG("vkCreateImage %ux%ux%u fmt %d levels %u layers %u failed: %d", x->w, x->h, x->d, x->fmt, x->levels, x->layers, r); free(x); return NULL; }
@@ -281,6 +357,7 @@ VkImageView vk_tex_view_typed(vk_tex *x, const view_t *v, int has_v, VkImageView
     if (l0 + nly > nslice) nly = nslice - l0;
     VkFormat f = x->fmt;
     if (has_v && v->set_format && !x->decoded) { VkFormat vf = vk_format_of(v->format); if (vf) f = vf; }
+    if ((x->fmt_mode == 1 && f != x->fmt) || (x->fmt_mode == 2 && f != x->fmt && f != x->twin)) { upgrade_queue(x, f); f = x->fmt; }
     int target = has_v && v->set_target ? v->target : x->t.d.target;
     VkImageViewType vt = want != VK_IMAGE_VIEW_TYPE_MAX_ENUM ? want : default_view_type(x, target);
     if (usage == 2) { vt = x->type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : (nly > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D); nl = 1; }

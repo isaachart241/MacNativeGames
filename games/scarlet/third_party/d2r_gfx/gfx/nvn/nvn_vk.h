@@ -40,6 +40,7 @@ typedef struct {
         f_dual_src, f_aniso, f_storage_wo_fmt, f_border_color, f_fill_mode_non_solid, f_shader_draw_params, f_ballot;
     VkDeviceSize ext_host_align;
     VkSemaphore timeline;
+    uint64_t ts_mask;      // timestamp bits the queue keeps (0: no GPU timing); with props.limits.timestampPeriod
     VkCommandPool cpool;   // used only on the submit thread (and under V.mu for one-off command buffers)
     pthread_mutex_t qmu;   // queue access (submit thread, present, one-off)
     // swapchain
@@ -76,10 +77,12 @@ typedef struct vk_sub {
     vk_defer *defer;
     struct vk_sub *next;
     VkCommandPool pool;              // Thor port: the submission's own command pool (see sub_new)
+    VkQueryPool qp; uint64_t frame, gpu_ns;   // GPU timestamps at the start of pre and the end of cb; the game frame it belongs to
 } vk_sub;
 extern _Thread_local vk_sub *g_sub;               // the submission being recorded (submit thread), NULL outside begin/commit
 vk_sub *vk_sub_current(void);       // g_sub, or an implicit one (begun on demand)
 void vk_sub_defer(vk_sub *s, void (*fn)(void *), void *arg);   // run after the GPU finished this submission
+void vk_tex_upgrade_pending(vk_sub *s);   // at a submission's start: recreate images a view needed in another format
 void vk_defer_free(void (*fn)(void *), void *arg);             // after everything submitted so far completes
 VkDescriptorSet vk_desc_alloc(VkDescriptorSetLayout l);
 void vk_add_readback(vk_sub *s, uint64_t addr, uint64_t n);   // copy GPU pool contents back to guest memory at completion
@@ -118,6 +121,8 @@ typedef struct vk_tex {
     VkImageType type; uint32_t w, h, d, levels, layers; VkSampleCountFlagBits samples;
     VkBufferView bview; uint64_t bview_addr;   // TARGET_BUFFER
     int mirrored, decoded;           // mirrored: uploaded from pool bytes; decoded: CPU-transcoded (BC / ASTC fallback)
+    int fmt_mode; VkFormat twin, pair[2];   // views allowed: 0 any format, 1 fmt only, 2 fmt or its sRGB / linear twin (nvn_vk_tex.c)
+    VkImageCreateFlags cflags; VkImageUsageFlags usage;   // as created (for vk_tex_upgrade_pending)
     uint32_t up_gen; uint64_t up_hash; uint64_t up_sub; int uploaded, gpu_written;
     uint8_t cswz[4];                 // component mapping of the format substitution
     vk_view *views;

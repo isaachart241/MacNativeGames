@@ -741,3 +741,56 @@ focus. A thread attached to the VM renews a 100 ms one-shot vibration every 50 m
 haptics setting turns off). The manifest asks for `VIBRATE`. `SCARLET_RUMBLE_TEST=<1-255>` buzzes once at start:
 `dumpsys vibrator_manager` showed the app's vibrations at amplitude 0.094 (24), renewed every 50 ms and cancelled after
 300 ms, usage MEDIA. Not checked: rumble from the game itself (none came during the walks).
+
+### 2026-10-26: Thor port: GPU time, a doubled draw, framebuffer compression
+
+**Measuring the GPU.** The Vulkan backend now times its submissions with timestamps (`mtl_gpu_ms`): the timing line's
+GPU column and the long-frame notes have real numbers. `TOTK_VK_PASS_TIMES=<present>` times every render pass and
+dispatch of one frame and logs them. A benchmark that loads the save and stands still (the same view each time) gave
+comparable numbers where walking runs did not (what is on screen decides the GPU time). Before the changes below the
+GPU needed 29-33 ms of the 33.3 ms a frame: it was the limit.
+
+**A doubled draw.** In `6fea144` (transform feedback) the capture bookkeeping went between the plain draw and its
+`else`, so every non-indexed, non-quad draw of 4 or more vertices was drawn a second time through the quad path, with
+generated indices, and one of fewer vertices returned there (which is why the pass timer first saw dozens of passes
+"without draws"). Restored as one chain.
+
+**Clears as load operations.** A render pass now begins at its first draw: clears of a whole attachment before that
+become the attachment's load operation instead of a load followed by a clear command, and a pass with neither is not
+recorded (`TOTK_VK_CLEAR_LOAD=0`: as before). 59 of a frame's ~110 passes outdoors start with a clear. Standing still:
+GPU 29.3 -> 28.1 ms.
+
+**Framebuffer compression.** Every image was created with `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT` and no format list; the
+Adreno then keeps it uncompressed (UBWC off). Without the flag: GPU 28.1 -> 21.9 ms a frame, GPU busy 85 % at 680 MHz ->
+66 % at 615 MHz (the clock steps down). Images are now made fixed-format, or, for formats with an sRGB / linear twin,
+mutable with a list of just that pair (21.7 ms: the list keeps the compression); compressed formats stay mutable. The
+one reinterpretation seen at Cabo Poco is such a pair (an R8G8B8A8 sRGB image read as UNORM). A view in a format an
+image does not allow is made in the image's own format for the moment and the image is queued; at the next
+submission's start it is made again, mutable without a list, with its contents copied in `pre` before anything of that
+submission uses it, as `nvn_mtl.m` upgrades a texture to PixelFormatView (`TOTK_VK_MUTABLE=1`: everything mutable). The
+first version of that queue deadlocked at start (a texture creation opens a submission while holding the texture table
+lock; the queue took it again): the queue has its own lock now and the table lock is only tried there.
+
+Standing still, all changes: GPU 21.7 ms (p95 22.2), NVN replay 16.3 ms (was 20.2: the driver does less work too),
+frame shown every 33.33 ms at p50, p90 and p95 (`DM_NVN_TSV` per-frame file; the "frame time p95" of about 38 ms in the
+timing line is the game's own work jitter before the present, not a late frame). 2 of 831 frames were shown late,
+both in one stall: `mprotect` (the dirty tracker) waited ~75 ms behind Android's periodic read of
+`/proc/<pid>/smaps_rollup` (70-79 ms with this process's 17,000 mappings and 2.4 GB resident). Not addressed.
+
+The same 5-minute walk outdoors (stick injected, muted, save restored) on the build before this entry and after it:
+
+| | before | after |
+|---|---|---|
+| frames shown 3 or more refreshes late | 18 of 9,009 (0.20 %) | 27 of 9,112 (0.30 %) |
+| NVN replay a frame, p50 / p95 | 24.6 / 28.4 ms | 13.6 / 21.9 ms |
+| GPU a frame, p50 / p95 | not timed | 18.3 / 25.5 ms |
+| GPU busy, clock | 91 %, 670 MHz | 59 %, 615 MHz |
+| CPU temperature, mean (max) | 94.8 (96.0) °C | 91.4 (94.4) °C |
+| GPU temperature, mean | 83.8 °C | 77.7 °C |
+
+The picture was already a steady 30 fps on screen before (both builds show almost every frame after two 60 Hz
+refreshes); what changed is the headroom under it and the heat. A first count put the old build at a third of its frames
+late: its threshold (34 ms) was below the old build's measured intervals, which sit just above 33.3 ms.
+
+Not checked: the pictures beyond Cabo Poco with fixed-format images (a view needing another format would show its
+image wrong for one frame, then be fixed; none was logged here).

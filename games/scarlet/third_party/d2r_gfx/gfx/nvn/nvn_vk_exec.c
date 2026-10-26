@@ -47,9 +47,12 @@ static uint64_t tf_misalign(int b) {
 }
 int vk_exec_tf_active(void) { return S.tf_active; }
 static struct { p_set_rt rt; int has_rt; p_scissor sc; int has_sc; } R;
+/* The render pass: open = its attachments are chosen; begun = vkCmdBeginRendering was recorded (Thor port: the begin waits
+   for the first draw, so clears of whole attachments before it become load operations; see pass_open). */
 static struct {
-    int open; uint32_t w, h, layers, ncolor; VkFormat cfmt[8], dfmt, sfmt; VkSampleCountFlagBits samples;
+    int open, begun, cleared; uint32_t w, h, layers, ncolor; VkFormat cfmt[8], dfmt, sfmt; VkSampleCountFlagBits samples;
     VkImageView cview[8], dview; vk_tex *ctex[8], *dtex;
+    VkRenderingAttachmentInfo ca[8], da, sa;
 } P;
 static int g_inited; static uint32_t g_dispatch_grid[3];
 static VkBuffer g_support; static VmaAllocation g_support_al;
@@ -144,16 +147,56 @@ void vk_rt_dump_flush(void) {   /* nvn_vk_dev.c, at the present after the dumped
     VKLOG("render-target dump: %d attachments of %d passes -> %s", g_nrtd, g_rtd_pass, g_rtd_dir);
     g_nrtd = 0; g_rtd_at = 0;
 }
+/* Pass timing (diagnostics): TOTK_VK_PASS_TIMES=<present number> writes GPU timestamps around every render pass and
+   dispatch of that frame and, at the present after it, logs one line each (kind, size, attachments, draws, GPU ms). */
+typedef struct { int kind; uint32_t w, h, layers, ncolor, samples, draws, cleared; VkFormat c0, d; } pt_rec;
+static VkQueryPool g_ptq; static pt_rec g_pt[1024]; static int g_npt, g_pt_open = -1; static long g_pt_at = -1;
+static int pt_armed(void) {
+    if (g_pt_at == -1) { const char *e = getenv("TOTK_VK_PASS_TIMES"); g_pt_at = e && *e ? atol(e) : 0; }
+    return g_pt_at > 0 && mtl_present_count() + 1 == (uint64_t)g_pt_at && g_npt < 1024 && V.ts_mask;
+}
+static void pt_begin(VkCommandBuffer cb, int kind) {   // outside a render pass
+    if (!pt_armed()) return;
+    if (!g_ptq) { VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2048, 0}; VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &g_ptq)); }
+    vkCmdResetQueryPool(cb, g_ptq, 2 * (uint32_t)g_npt, 2);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_ptq, 2 * (uint32_t)g_npt);
+    g_pt[g_npt] = (pt_rec){kind, P.w, P.h, P.layers, P.ncolor, (uint32_t)P.samples, 0, (uint32_t)P.cleared, P.cfmt[0], P.dfmt};
+    g_pt_open = g_npt++;
+}
+static void pt_end(VkCommandBuffer cb) {
+    if (g_pt_open < 0) return;
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_ptq, 2 * (uint32_t)g_pt_open + 1);
+    g_pt_open = -1;
+}
+void vk_pass_times_flush(void) {   /* nvn_vk_dev.c, at the present after the timed frame */
+    if (!g_npt) return;
+    mtl_finish();
+    uint64_t *ts = calloc((size_t)g_npt * 2, 8); double sum[2] = {0, 0};
+    if (ts && vkGetQueryPoolResults(V.dev, g_ptq, 0, 2 * (uint32_t)g_npt, (size_t)g_npt * 16, ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+        for (int i = 0; i < g_npt; i++) {
+            const pt_rec *r = &g_pt[i]; double ms = (double)((ts[2 * i + 1] - ts[2 * i]) & V.ts_mask) * V.props.limits.timestampPeriod / 1e6;
+            sum[r->kind] += ms;
+            if (r->kind) VKLOG("pass times %3d: dispatch %.3f ms", i + 1, ms);
+            else VKLOG("pass times %3d: pass %ux%u x%u, %u colour (first vk %d), depth vk %d, %u samples, %u draws%s: %.3f ms", i + 1, r->w, r->h, r->layers, r->ncolor, (int)r->c0, (int)r->d, r->samples, r->draws, r->cleared ? ", load-cleared" : "", ms);
+        }
+        VKLOG("pass times: %d passes and dispatches, render passes %.2f ms, dispatches %.2f ms", g_npt, sum[0], sum[1]);
+    }
+    free(ts); g_npt = 0; g_pt_at = 0;
+}
+static void pass_start(void);
 static void pass_end(void) {
     if (!P.open) return;
-    vkCmdEndRendering(CB()); P.open = 0;
+    if (!P.begun && !P.cleared) { P.open = 0; barrier_full(CB()); return; }   // nothing drawn or cleared: no pass at all
+    if (!P.begun) pass_start();
+    vkCmdEndRendering(CB()); P.open = P.begun = 0;
+    pt_end(CB());
     barrier_full(CB());
     if (rtd_armed()) rtd_capture(CB());
 }
 void vk_exec_end_all(void) { pass_end(); }
 void vk_exec_sub_begin(void) {
     if (!g_inited) { g_inited = 1; state_reset(); }
-    P.open = 0;
+    P.open = P.begun = 0;
 }
 static VkBuffer support_buf(void) {
     if (!g_support) {
@@ -170,11 +213,15 @@ static VkBuffer support_buf(void) {
 // ---------- render passes ----------
 static uint32_t mipd(uint32_t s, unsigned l) { s >>= l; return s ? s : 1; }
 static int rt_has_any(void) { if (!R.has_rt) return 0; if (R.rt.depth) return 1; for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i]) return 1; return 0; }
-static void pass_begin(void) {
+/* Thor port: a pass that loads its attachments and then clears them reads the old contents for nothing (59 of a frame's
+   ~110 passes outdoors start with a clear; GPU 29.3 -> 28.1 ms a frame standing still at Cabo Poco). pass_open chooses
+   the attachments; clears of a whole attachment before the first draw become its load operation (pass_clear_whole), and
+   pass_start records the begin at the first draw or other use. A pass that ends with neither is not recorded. */
+static void pass_open(void) {
     if (P.open) return;
     memset(&P, 0, sizeof P);
-    VkRenderingAttachmentInfo ca[8]; memset(ca, 0, sizeof ca);
-    VkRenderingAttachmentInfo da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, sa = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    VkRenderingAttachmentInfo *ca = P.ca, *da = &P.da, *sa = &P.sa;
+    *da = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; *sa = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     uint32_t w = 16384, h = 16384, layers = 1; int any = 0;
     P.samples = VK_SAMPLE_COUNT_1_BIT;
     int n = R.has_rt ? (R.rt.n > 8 ? 8 : R.rt.n) : 0;
@@ -201,8 +248,8 @@ static void pass_begin(void) {
             unsigned lv = v && v->set_levels ? v->base_level : 0;
             uint32_t aw = mipd(x->w, lv), ah = mipd(x->h, lv); if (aw < w) w = aw; if (ah < h) h = ah;
             VkImageAspectFlags asp = x->aspect;
-            if (asp & VK_IMAGE_ASPECT_DEPTH_BIT) { da.imageView = iv; da.imageLayout = VK_IMAGE_LAYOUT_GENERAL; da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; da.storeOp = VK_ATTACHMENT_STORE_OP_STORE; P.dfmt = x->fmt; }
-            if (asp & VK_IMAGE_ASPECT_STENCIL_BIT) { sa.imageView = iv; sa.imageLayout = VK_IMAGE_LAYOUT_GENERAL; sa.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; sa.storeOp = VK_ATTACHMENT_STORE_OP_STORE; P.sfmt = x->fmt; }
+            if (asp & VK_IMAGE_ASPECT_DEPTH_BIT) { da->imageView = iv; da->imageLayout = VK_IMAGE_LAYOUT_GENERAL; da->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; da->storeOp = VK_ATTACHMENT_STORE_OP_STORE; P.dfmt = x->fmt; }
+            if (asp & VK_IMAGE_ASPECT_STENCIL_BIT) { sa->imageView = iv; sa->imageLayout = VK_IMAGE_LAYOUT_GENERAL; sa->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; sa->storeOp = VK_ATTACHMENT_STORE_OP_STORE; P.sfmt = x->fmt; }
             P.dtex = x; P.dview = iv; P.samples = x->samples; any = 1;
         }
     }
@@ -213,12 +260,28 @@ static void pass_begin(void) {
         w = x1 < 1 ? 1 : x1 > 16384 ? 16384 : (uint32_t)x1; h = y1 < 1 ? 1 : y1 > 16384 ? 16384 : (uint32_t)y1;
     }
     P.w = w; P.h = h; P.layers = layers;
-    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, {w, h}}, layers, 0, P.ncolor, ca,
-                          da.imageView ? &da : NULL, sa.imageView ? &sa : NULL};
-    vkCmdBeginRendering(CB(), &ri);
     P.open = 1;
+}
+static void pass_start(void) {
+    if (!P.open) pass_open();
+    if (P.begun) return;
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, {P.w, P.h}}, P.layers, 0, P.ncolor, P.ca,
+                          P.da.imageView ? &P.da : NULL, P.sa.imageView ? &P.sa : NULL};
+    pt_begin(CB(), 0);
+    vkCmdBeginRendering(CB(), &ri);
+    P.begun = 1;
     atomic_fetch_add(&g_stat_passes, 1);
 }
+static void pass_begin(void) { pass_open(); pass_start(); }
+/* A clear of the whole render area before the pass has begun: the attachment's load operation (its clear value as the
+   clear command would have written it). Returns 0 when the clear has to be recorded as a command. */
+static int pass_clear_whole(VkRect2D r, VkRenderingAttachmentInfo *a, VkClearValue v) {
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_VK_CLEAR_LOAD"); on = !(e && !strcmp(e, "0")); }   // =0: clear commands, as before
+    if (!on || P.begun || r.offset.x || r.offset.y || r.extent.width != P.w || r.extent.height != P.h || !a->imageView) return 0;
+    a->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; a->clearValue = v; P.cleared = 1;
+    return 1;
+}
+
 
 // ---------- pipelines ----------
 typedef struct {
@@ -630,6 +693,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) return;
     if (!rt_has_any() && !S.has_vp && !R.has_sc) { VKONCE("draw without render targets or viewport skipped"); return; }
     pass_begin();
+    if (g_pt_open >= 0) g_pt[g_pt_open].draws++;   // draw calls in the pass, recorded or not
     VkCommandBuffer cb = CB();
     int quads; VkPrimitiveTopology topo = topo_of(dw ? dw->prim : di->prim, &quads);
     VkPipeline pipe = pso_get(pr, topo); if (!pipe) { atomic_fetch_add(&g_stat_skip_pipe, 1); return; }
@@ -681,10 +745,14 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (need_dummy) { VkBuffer z = vk_zero_buffer(); VkDeviceSize zo = 0; vkCmdBindVertexBuffers(cb, 16, 1, &z, &zo); }
     uint32_t inst = dw ? (dw->instances > 0 ? (uint32_t)dw->instances : 1) : (di->instances > 0 ? (uint32_t)di->instances : 1);
     vk_sub *sub = vk_sub_current();
-    if (dw && !quads) vkCmdDraw(cb, (uint32_t)dw->count, inst, (uint32_t)dw->first, (uint32_t)dw->base_instance);
-    if (tf) {   // the next capture continues after this one's vertices
-        for (int k = 0; k < pr->sh[0]->tf_n; k++) S.tf_off[k] += (uint64_t)dw->count * inst * pr->sh[0]->tf_stride[k];
-        static int said; if (!said++) VKLOG("[tf] first capture draw: %d vertices x %u instances into %d buffers", dw->count, inst, pr->sh[0]->tf_n);
+    /* Thor port: one chain. The capture bookkeeping once sat between the plain draw and its "else", so every plain draw of
+       4 or more vertices was drawn again through the quad path (and one of fewer returned there), 2026-10-26. */
+    if (dw && !quads) {
+        vkCmdDraw(cb, (uint32_t)dw->count, inst, (uint32_t)dw->first, (uint32_t)dw->base_instance);
+        if (tf) {   // the next capture continues after this one's vertices
+            for (int k = 0; k < pr->sh[0]->tf_n; k++) S.tf_off[k] += (uint64_t)dw->count * inst * pr->sh[0]->tf_stride[k];
+            static int said; if (!said++) VKLOG("[tf] first capture draw: %d vertices x %u instances into %d buffers", dw->count, inst, pr->sh[0]->tf_n);
+        }
     }
     else if (dw) {   // quads: generated triangle indices 0,1,2 0,2,3 per quad
         uint32_t nq = (uint32_t)dw->count / 4; if (!nq) return;
@@ -723,7 +791,9 @@ static void dispatch(const p_dispatch *dp) {
     g_dispatch_grid[0] = (uint32_t)dp->x; g_dispatch_grid[1] = (uint32_t)dp->y; g_dispatch_grid[2] = (uint32_t)dp->z;
     vkCmdBindPipeline(CB(), VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     bind_descriptors(pr, VK_PIPELINE_BIND_POINT_COMPUTE);
+    pt_begin(CB(), 1);
     vkCmdDispatch(CB(), (uint32_t)dp->x, (uint32_t)dp->y, (uint32_t)dp->z);
+    pt_end(CB());
     barrier_full(CB());
     atomic_fetch_add(&g_stat_dispatches, 1);
 }
@@ -743,10 +813,12 @@ static void clear_color(const p_clear_color *c) {
     if (S.render_disabled || c->index < 0 || c->index >= 8 || !R.has_rt || c->index >= R.rt.n || !R.rt.color[c->index]) return;
     if (!(c->mask & 0xf)) return;
     if ((c->mask & 0xf) != 0xf) VKONCE("colour clear with a partial channel mask clears all channels");
-    pass_begin();
+    pass_open();
     if (!P.cview[c->index]) return;
     VkRect2D r = clear_rect(); if (!r.extent.width) return;
     VkClearAttachment a = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)c->index, {{{c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3]}}}};
+    if (pass_clear_whole(r, &P.ca[c->index], a.clearValue)) return;
+    pass_start();
     VkFormat f = P.cfmt[c->index];
     int isint = (f >= VK_FORMAT_R8_UINT && f <= VK_FORMAT_R8_SINT && (f == VK_FORMAT_R8_UINT || f == VK_FORMAT_R8_SINT));
     (void)isint;   // integer targets receive the float bits converted by the driver as NVN does (ClearColor takes floats)
@@ -755,7 +827,7 @@ static void clear_color(const p_clear_color *c) {
 }
 static void clear_ds(const p_clear_ds *c) {
     if (S.render_disabled || !R.has_rt || !R.rt.depth) return;
-    pass_begin();
+    pass_open();
     VkImageAspectFlags asp = 0;
     if (c->depth_mask && P.dfmt) asp |= VK_IMAGE_ASPECT_DEPTH_BIT;
     if ((c->stencil_mask & 255) && P.sfmt) asp |= VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -763,6 +835,9 @@ static void clear_ds(const p_clear_ds *c) {
     if ((c->stencil_mask & 255) && (c->stencil_mask & 255) != 255) VKONCE("stencil clear with a partial mask clears all bits");
     VkRect2D r = clear_rect(); if (!r.extent.width) return;
     VkClearAttachment a = {asp, 0, {.depthStencil = {c->depth, (uint32_t)c->stencil}}};
+    if ((!(asp & VK_IMAGE_ASPECT_DEPTH_BIT) || pass_clear_whole(r, &P.da, a.clearValue)) &&   // whole: load operations
+        (!(asp & VK_IMAGE_ASPECT_STENCIL_BIT) || pass_clear_whole(r, &P.sa, a.clearValue))) return;
+    pass_start();
     VkClearRect cr = {r, 0, P.layers};
     vkCmdClearAttachments(CB(), 1, &a, 1, &cr);
 }
