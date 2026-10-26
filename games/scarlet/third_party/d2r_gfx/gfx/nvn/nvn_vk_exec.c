@@ -183,6 +183,47 @@ void vk_pass_times_flush(void) {   /* nvn_vk_dev.c, at the present after the tim
     }
     free(ts); g_npt = 0; g_pt_at = 0;
 }
+/* Thor port: the camera for the bottom screen's map (runtime/bottom_android.c). Scarlet's scene constants are a 544-byte
+   uniform buffer at slot 2 of the vertex stage, the same for most draws of a view; its bytes 0x100-0x13f are the camera's
+   world matrix (right, up, back, position). Shadow and interface views have one of their own, with fewer draws: the
+   frame's buffer with the most draws is the main camera. Its matrix is copied when the buffer is first bound (the game
+   may refill the memory for the next frame before the present) and handed over at the present: the player is about four
+   units in front of the camera. */
+#define CAM_UBO_SIZE 0x220
+static struct { uint64_t addr; int n; float m[16]; } g_cam[16]; static int g_ncam;
+static void cam_seen(uint64_t addr, uint64_t size) {
+    if (size != CAM_UBO_SIZE) return;
+    for (int i = 0; i < g_ncam; i++) if (g_cam[i].addr == addr) { g_cam[i].n++; return; }
+    if (g_ncam == 16) return;
+    g_cam[g_ncam].addr = addr; g_cam[g_ncam].n = 1; memcpy(g_cam[g_ncam].m, (const void *)(uintptr_t)(addr + 0x100), 64); g_ncam++;
+}
+void bottom_map_set_player(double x, double y, double dir) __attribute__((weak));
+void vk_camera_frame_end(void) {   /* nvn_vk_dev.c, at each present */
+    int best = -1; for (int i = 0; i < g_ncam; i++) if (best < 0 || g_cam[i].n > g_cam[best].n) best = i;
+    if (best >= 0 && g_cam[best].n >= 50 && bottom_map_set_player) {
+        const float *m = g_cam[best].m;   /* rows: right, up, back, position */
+        float fx = -m[8], fz = -m[10], h = sqrtf(fx * fx + fz * fz);
+        if (h > 0.01f && isfinite(m[12]) && isfinite(m[14])) {
+            fx /= h; fz /= h;
+            bottom_map_set_player(m[12] + 4 * fx, m[14] + 4 * fz, atan2f(fx, -fz));   /* map: x east, y = world z; 0 = up */
+        }
+    }
+    g_ncam = 0;
+}
+/* Uniform buffer log (diagnostics): TOTK_VK_UBO_LOG=<present> logs every distinct uniform buffer binding of that frame
+   (stage, slot, guest address, size, draws), to find which buffer carries what (the camera, for the bottom map). */
+static struct { int st, reg; uint64_t addr, size; int n; } g_ul[1024]; static int g_nul; static long g_ul_at = -1;
+static void ubo_log(int st, int reg, uint64_t addr, uint64_t size) {
+    if (g_ul_at == -1) { const char *e = getenv("TOTK_VK_UBO_LOG"); g_ul_at = e && *e ? atol(e) : 0; }
+    if (g_ul_at <= 0 || mtl_present_count() + 1 != (uint64_t)g_ul_at) return;
+    for (int i = 0; i < g_nul; i++) if (g_ul[i].st == st && g_ul[i].reg == reg && g_ul[i].addr == addr && g_ul[i].size == size) { g_ul[i].n++; return; }
+    if (g_nul < 1024) { g_ul[g_nul].st = st; g_ul[g_nul].reg = reg; g_ul[g_nul].addr = addr; g_ul[g_nul].size = size; g_ul[g_nul++].n = 1; }
+}
+void vk_ubo_log_flush(void) {
+    if (!g_nul) return;
+    for (int i = 0; i < g_nul; i++) VKLOG("ubo log: stage %d slot %d %#llx +%#llx, %d draws", g_ul[i].st, g_ul[i].reg, (unsigned long long)g_ul[i].addr, (unsigned long long)g_ul[i].size, g_ul[i].n);
+    g_nul = 0; g_ul_at = 0;
+}
 static void pass_start(void);
 static void pass_end(void) {
     if (!P.open) return;
@@ -597,7 +638,9 @@ static void write_stage(wset *ws, VkDescriptorSet sets[2], vk_shader *sh, int st
     for (int i = 0; i < sh->nb; i++) {
         const vk_bind *b = &sh->b[i]; VkDescriptorSet ds = sets[b->set > 1 ? 1 : b->set]; int reg = b->reg;
         switch (b->kind) {
-            case NVN_RB_CBUF: { const p_bind_buf *u = reg < 16 ? &S.ubo[st][reg] : NULL; bind_ubo_range(ws, ds, b, u ? u->addr : 0, u ? u->size : 0); break; }
+            case NVN_RB_CBUF: { const p_bind_buf *u = reg < 16 ? &S.ubo[st][reg] : NULL; bind_ubo_range(ws, ds, b, u ? u->addr : 0, u ? u->size : 0);
+                if (u && u->addr) { ubo_log(st, reg, u->addr, u->size); if (st == 0 && reg == 2) cam_seen(u->addr, u->size); }
+                break; }
             case NVN_RB_SUPPORT: w_buf(ws, ds, b, support_buf(), 0, 65536); break;
             case NVN_RB_C1: if (sh->c1buf) w_buf(ws, ds, b, sh->c1buf, 0, (sh->c1_len + 255) & ~255u); else w_buf(ws, ds, b, vk_zero_buffer(), 0, 65536); break;
             case NVN_RB_DRV0: case NVN_RB_DRV2: {

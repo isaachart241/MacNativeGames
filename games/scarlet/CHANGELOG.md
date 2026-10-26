@@ -814,3 +814,20 @@ Checked on the Thor: the grid and arrow on the bottom screen (1240x1080 surface)
 injected touches on the bottom panel (`/dev/input/event5`, raw panel coordinates, so a drag along the panel's x moves
 the map along the display's y) dragged and zoomed it and it came back after 4 s; Home gave the bottom screen back to
 the launcher and returning showed the map again; the game kept focus throughout. Not checked: real fingers.
+
+### 2026-10-26: Thor port: the bottom map follows the player
+
+Where the player is: a memory scan (a tool reading the game's memory through `run-as`; snapshot, walk with the injected
+stick, keep the float triples that moved as a walk, stand, keep the ones that did not, repeat) found the position
+(about x 2323, height 49, z -741 at Cabo Poco's start) in dozens of places, all on the heap; a pointer search found no
+static path to them within two levels. The camera is easier to find every frame: `TOTK_VK_UBO_LOG=<present>` (new,
+diagnostics) lists one frame's uniform buffer bindings, and the vertex stage's slot 2, a 544-byte buffer bound for 952
+of the frame's draws, holds the scene constants, with the camera's world matrix at 0x100-0x13f (right, up, back,
+position; the forward direction again at 0x200). The player stood 3.7 units in front of the camera.
+
+`nvn_vk_exec.c` copies that matrix when such a buffer is first bound in a frame (the game may refill it before the
+present) and, at the present, hands the position four units ahead of the camera and the camera's heading to the bottom
+map (`bottom_map_set_player`); the frame's buffer with the most draws is taken, as shadow and interface views have
+their own. The map's units are metres (3 pixels each by default, about 400 m across the screen); it redraws at most 20
+times a second unless a finger is down. Checked on the Thor: the arrow turns with the camera and the grid scrolls as
+the player walks. Not done: the map's picture (the game's map art) and its markers, and the minimap on the top screen.

@@ -658,7 +658,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
 }
 static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
     present_shot(t, ticket);
-    { void vk_rt_dump_flush(void); vk_rt_dump_flush(); void vk_pass_times_flush(void); vk_pass_times_flush(); }
+    { void vk_rt_dump_flush(void); vk_rt_dump_flush(); void vk_pass_times_flush(void); vk_pass_times_flush(); void vk_ubo_log_flush(void); vk_ubo_log_flush(); }
     { void vk_pcache_tick(uint64_t); vk_pcache_tick(ticket); }
     { void vk_pipe_budget_reset(void); vk_pipe_budget_reset(); }
     if (ticket % 600 == 0) { void vk_pipe_stats(uint64_t *, uint64_t *, int *); uint64_t made, ns; int pend; vk_pipe_stats(&made, &ns, &pend);
@@ -675,6 +675,7 @@ static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
         }
         if (ticket % 60 == 0) { last_s = s; last_p = p; }
     }
+    { void vk_camera_frame_end(void); vk_camera_frame_end(); }
     if (ticket == 1 || ticket % 600 == 0) VKLOG("present %llu: draws %llu passes %llu dispatches %llu", (unsigned long long)ticket, (unsigned long long)atomic_load(&g_stat_draws),
                                              (unsigned long long)atomic_load(&g_stat_passes), (unsigned long long)atomic_load(&g_stat_dispatches));
     if (!V.ok || !V.surface_fn) return ticket;

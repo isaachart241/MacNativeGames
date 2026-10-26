@@ -37,11 +37,11 @@ static pthread_mutex_t viewLock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t viewCond = PTHREAD_COND_INITIALIZER;
 static ANativeWindow *win;            /* the bottom surface while shown (render thread draws into it) */
 static int winBusy, dirty = 1;        /* winBusy: the render thread is drawing into win */
-static double camX, camY, zoom = 1;   /* map position at the screen centre; screen pixels per map unit */
+#define SNAP_S 4.0
+#define ZOOM_HOME 3.0   /* screen pixels per map unit (a metre): the bottom screen spans about 400 m */
+static double camX, camY, zoom = ZOOM_HOME;   /* map position at the screen centre; screen pixels per map unit */
 static double playerX, playerY, playerDir;   /* map units; radians, 0 = north (up), clockwise */
 static double lastTouch = -100;       /* time of the last touch; the view follows the player SNAP_S after it */
-#define SNAP_S 4.0
-#define ZOOM_HOME 1.0
 static struct { int id; float x, y; } touch[2]; static int ntouch;
 static double pinchDist, pinchZoom, dragX, dragY, dragCamX, dragCamY;
 
@@ -178,7 +178,7 @@ static void *render_thread(void *arg) {
             ANativeWindow_unlockAndPost(w);
         }
         pthread_mutex_lock(&viewLock); winBusy = 0; pthread_cond_broadcast(&viewCond); pthread_mutex_unlock(&viewLock);
-        usleep(16000);   /* at most ~60 drawings a second */
+        usleep(nt ? 16000 : 50000);   /* ~60 drawings a second under a finger, 20 when only following the player */
     }
     return NULL;
 }
