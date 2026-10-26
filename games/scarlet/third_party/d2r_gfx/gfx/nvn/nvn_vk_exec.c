@@ -299,6 +299,11 @@ static struct { const char *name; uint32_t w, h, fmt; int saved; uint64_t serial
     {"overview", 900, 900, 0x44, -1, 0}, {"background", 800, 840, 0x42, -1, 0},
 };
 static float g_map_ov[6]; static int g_map_ov_seen; static float g_map_marker[2]; static int g_map_marker_seen;
+/* The closer map (map tiles around the player, who is at the screen centre): its rotation and scale, and the quads of
+   what it marks: the objective's pin (120x120, NVN 0x44) and place names (pre-rendered RGBA labels, NVN 0x25). */
+static float g_tile_a, g_tile_c; static int g_tile_seen, g_centre_seen, g_nmk;
+static struct { uint64_t serial; uint32_t w, h, fmt; float tx, ty, rw, rh; } g_mk[64];
+static struct { uint64_t serial; float tx, ty; } g_tl[96]; static int g_ntl;   /* the closer map's tiles this frame */
 static double g_cam_x, g_cam_z;   /* the latest player position from the camera (vk_camera_frame_end) */
 static void map_asset_seen(const vk_tex *x, int st, int reg) {
     if (!x) return;
@@ -309,9 +314,71 @@ static void map_asset_seen(const vk_tex *x, int st, int reg) {
     if (!u->addr || u->size < 136 * 4) return;
     const float *f = (const float *)(uintptr_t)u->addr;
     if (x->w == 900 && x->h == 900 && x->t.d.format == 0x44 && f[132] == 900 && f[133] == 900) { memcpy(g_map_ov, (float[]){f[16], f[19], f[21], f[23], f[134], f[135]}, sizeof g_map_ov); g_map_ov_seen = 1; }
-    if (x->w == 352 && x->h == 352 && x->t.d.format == 0x42 && f[132] == 44 && f[133] == 44) { g_map_marker[0] = f[19]; g_map_marker[1] = f[23]; g_map_marker_seen = 1; }
+    if (x->w == 352 && x->h == 352 && x->t.d.format == 0x42 && f[132] == 44 && f[133] == 44) {
+        g_map_marker[0] = f[19]; g_map_marker[1] = f[23]; g_map_marker_seen = 1;
+        if (fabsf(f[19]) < 0.5f && fabsf(f[23]) < 0.5f) g_centre_seen = 1;
+    }
+    if (((x->w == 700 && x->h == 700) || (x->w == 1 && x->h == 1)) && x->t.d.format == 0x4d && f[132] == 1000 && f[133] == 1000) {   /* 1x1: open sea */
+        g_tile_a = f[16]; g_tile_c = f[20]; g_tile_seen = 1;
+        if (g_ntl < 96) { g_tl[g_ntl].serial = x->serial; g_tl[g_ntl].tx = f[19]; g_tl[g_ntl].ty = f[23]; g_ntl++; }
+    }
+    if (((x->w == 120 && x->h == 120 && x->t.d.format == 0x44) || x->t.d.format == 0x25) && g_nmk < 64)
+        { g_mk[g_nmk].serial = x->serial; g_mk[g_nmk].w = x->w; g_mk[g_nmk].h = x->h; g_mk[g_nmk].fmt = x->t.d.format;
+          g_mk[g_nmk].tx = f[19]; g_mk[g_nmk].ty = f[23]; g_mk[g_nmk].rw = f[132] * hypotf(f[16], f[20]); g_mk[g_nmk].rh = f[133] * hypotf(f[17], f[21]); g_nmk++; }
 }
+/* The closer map's marks, once the view has held for 15 presents: each one's image (map-cache/icon_<hash>.rgba, saved
+   once) and its offset from the player in tile units (the map's rotation and scale undone; x east, y north), one line
+   each in map-cache/marks.txt: "<kind> <player x> <player z> <east> <north> <width> <height> <hash>", kind O for the
+   objective (the bottom map keeps the latest capture's only) and L for place names (kept). */
 void bottom_map_assets_changed(void) __attribute__((weak));
+static uint64_t img_hash(const uint8_t *px, size_t n) { uint64_t h = 1469598103934665603ull; for (size_t i = 0; i < n; i++) h = (h ^ px[i]) * 1099511628211ull; return h; }
+static void marks_capture(void) {
+    static uint64_t sig_c, sig_l; static int held;
+    uint64_t sig = (uint64_t)g_nmk; for (int i = 0; i < g_nmk; i++) sig = sig * 31 + (uint64_t)(int64_t)(g_mk[i].tx * 4) * 7 + (uint64_t)(int64_t)(g_mk[i].ty * 4) + g_mk[i].serial;
+    for (int i = 0; i < g_ntl; i++) sig = sig * 31 + (uint64_t)(int64_t)(g_tl[i].tx * 4) * 7 + (uint64_t)(int64_t)(g_tl[i].ty * 4) + g_tl[i].serial;
+    sig ^= (uint64_t)(int64_t)(g_cam_x * 10) * 131 + (uint64_t)(int64_t)(g_cam_z * 10);
+    if (sig != sig_c) { sig_c = sig; held = 0; }
+    if (++held != 15 || sig == sig_l) return;
+    sig_l = sig;
+    float sc = hypotf(g_tile_a, g_tile_c), cs = g_tile_a / sc, sn = g_tile_c / sc;
+    FILE *out = fopen("map-cache/marks.txt", "a"); if (!out) return;
+    int n = 0;
+    for (int i = 0; i < g_nmk; i++) {
+        vk_tex *x = vk_tex_by_serial(g_mk[i].serial); uint8_t *px = x ? tex_read_rgba(x) : NULL; if (!px) continue;
+        uint64_t h = img_hash(px, (size_t)x->w * x->h * 4);
+        char p[256]; snprintf(p, sizeof p, "map-cache/icon_%016llx.rgba", (unsigned long long)h);
+        if (access(p, F_OK)) { FILE *f = fopen(p, "wb"); if (f) { uint32_t hd[3] = {0x3150414d, x->w, x->h}; fwrite(hd, 4, 3, f); fwrite(px, 4, (size_t)x->w * x->h, f); fclose(f); } }
+        free(px);
+        /* screen offset (the player is at the centre) back through the map's rotation and scale: tile units, y north */
+        float e = (cs * g_mk[i].tx + sn * g_mk[i].ty) / sc, nn = (-sn * g_mk[i].tx + cs * g_mk[i].ty) / sc;
+        fprintf(out, "%c %.3f %.3f %.2f %.2f %.1f %.1f %016llx\n", g_mk[i].fmt == 0x25 ? 'L' : 'O', g_cam_x, g_cam_z, e, nn, g_mk[i].rw, g_mk[i].rh, (unsigned long long)h); n++;
+    }
+    fclose(out);
+    /* The map tiles (1000 tile units a side, 700x700, or 1x1 for open sea): each image once (map-cache/tile_<hash>.rgba), and its centre's
+       offset from the player, in map-cache/tiles.txt: "<player x> <player z> <east> <north> <hash>". A tile read in this
+       session is not read again (BC7 decoding a 700x700 tile on the CPU takes a while). */
+    static uint64_t done[512]; static int ndone;
+    FILE *tl = fopen("map-cache/tiles.txt", "a"); int nt = 0;
+    for (int i = 0; tl && i < g_ntl; i++) {
+        int k = 0; while (k < ndone && done[k] != g_tl[i].serial) k++;
+        static uint64_t hashes[512];
+        uint64_t h;
+        if (k < ndone) h = hashes[k];
+        else {
+            vk_tex *x = vk_tex_by_serial(g_tl[i].serial); uint8_t *px = x ? tex_read_rgba(x) : NULL; if (!px) continue;
+            h = img_hash(px, (size_t)x->w * x->h * 4);
+            char p[256]; snprintf(p, sizeof p, "map-cache/tile_%016llx.rgba", (unsigned long long)h);
+            if (access(p, F_OK)) { FILE *f = fopen(p, "wb"); if (f) { uint32_t hd[3] = {0x3150414d, x->w, x->h}; fwrite(hd, 4, 3, f); fwrite(px, 4, (size_t)x->w * x->h, f); fclose(f); } }
+            free(px);
+            if (ndone < 512) { done[ndone] = g_tl[i].serial; hashes[ndone++] = h; }
+        }
+        float e = (cs * g_tl[i].tx + sn * g_tl[i].ty) / sc, nn = (-sn * g_tl[i].tx + cs * g_tl[i].ty) / sc;
+        fprintf(tl, "%.3f %.3f %.2f %.2f %016llx\n", g_cam_x, g_cam_z, e, nn, (unsigned long long)h); nt++;
+    }
+    if (tl) fclose(tl);
+    VKLOG("map marks: %d noted, %d tiles, around %.2f %.2f", n, nt, g_cam_x, g_cam_z);
+    if (bottom_map_assets_changed) bottom_map_assets_changed();
+}
 static void vk_map_capture(void) {
     static int dir;
     if (!dir) { dir = 1; mkdir("map-cache", 0777); }
@@ -342,7 +409,8 @@ static void vk_map_capture(void) {
             if (bottom_map_assets_changed) bottom_map_assets_changed();
         }
     }
-    g_map_ov_seen = g_map_marker_seen = 0;
+    if (g_tile_seen && g_centre_seen) marks_capture();
+    g_map_ov_seen = g_map_marker_seen = g_tile_seen = g_centre_seen = g_nmk = g_ntl = 0;
 }
 void vk_rtd_poll(uint64_t present) {   /* nvn_vk_dev.c, at each present: the trigger file */
     if (present % 15) return;
@@ -790,7 +858,7 @@ static void write_stage(wset *ws, VkDescriptorSet sets[2], vk_shader *sh, int st
                     const view_t *v = NULL; int hv = 0; vk_tex *x = tid ? vk_tex_by_id(tid, &v, &hv) : NULL;
                     if (x && x->img) iv = vk_tex_view_typed(x, v, hv, want_vt(b), 0);
                     if (rtd_armed()) rtd_tex(x);
-                    if (x && x->w >= 352) map_asset_seen(x, st, reg);
+                    if (x && P.cfmt[0] == VK_FORMAT_R8G8B8A8_SRGB) map_asset_seen(x, st, reg);   /* the interface pass */
                     if (rtd_armed())
                         VKLOG("rtdump pass %d stage %d slot %d (dim %d arr %d): %s %ux%ux%u layers %u levels %u nvn %#x vk %d decoded %d", g_rtd_pass + 1, st, reg, b->dim, b->arrayed,
                               !tid ? "no texture" : !x ? "texture id not found" : !iv ? "NO VIEW (dummy)" : "ok", x ? x->w : 0, x ? x->h : 0, x ? x->d : 0, x ? x->layers : 0, x ? x->levels : 0,

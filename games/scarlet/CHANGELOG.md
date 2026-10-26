@@ -882,3 +882,29 @@ Checked on the Thor: the top screen without the minimap in play, the map screen 
 bottom right), the bottom screen showing the region map with the player at Cabo Poco's southern tip. Not checked:
 battles and menus with the minimap rule (no masked quad there in theory). Not done: the game's markers (Pokémon Centers,
 the objective) on the bottom map, and its detailed tiles for zooming in (the region map is soft beyond about 2x).
+
+### 2026-10-26: Thor port: the bottom map's detail, place names and objective
+
+Zoomed in, the 900-texel region map is too coarse (Cabo Poco's tip is a few texels; the player and the place names
+landed just offshore). The game's closer map is drawn from tiles, so those are taken too:
+
+- **When.** Whenever the game's closer map (Y) has held for 15 presents: its tiles (1000 tile units a side; 700x700
+  BC7 textures, or 1x1 for open sea, several cells sharing one), the objective's pin (120x120) and the place names
+  (pre-rendered labels, NVN format 0x25: a 428x106 backdrop and a 364x42 name). The player is at the screen's centre
+  there, so each quad's translation, with the map's rotation and scale (from a tile's matrix) undone, is its offset
+  from the player in tile units, east and north. Images go to `map-cache/` once each (tile_/icon_<hash>.rgba, by
+  content; a tile read in the session is not decoded again) and the offsets with the player's position to `tiles.txt`
+  and `marks.txt`.
+- **Drawing.** The bottom map places each at the player's position then plus its offset (12 tile units an overview
+  texel), so tiles, names, pin and the live player all agree with each other wherever the map was last opened. It
+  draws the tiles over the region map from 0.45 pixels a unit (skipping the region map where tiles cover the screen),
+  names from 0.6, the objective always (only the latest capture's pin). Default zoom: 1 pixel a unit, the closer
+  map's detail; pinch out for all of Paldea.
+- **Two mistakes on the way.** The capture hook first saw only textures of 352 pixels or more (no pin, no sea tiles),
+  and the bottom map kept one tile per image, so six of seven open-sea cells sharing an image were missing.
+- **Cost.** A drawing took 22.5 ms (region map and tiles, 20 a second while following); now 15 ms, at most 10 a second
+  while only following (60 under a finger) and only when the player moved half a pixel or turned a degree.
+
+Checked on the Thor (Cabo Poco): the bottom map matches the game's closer map (Cabo Poco, Poco Path, Inlet Grotto,
+Los Platos, the objective's pin, the open sea and the map's edge), north up, following the player while walking.
+Not done: the follower icons and other marks the game adds later (they need the same treatment once they appear).

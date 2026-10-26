@@ -38,16 +38,17 @@ static pthread_cond_t viewCond = PTHREAD_COND_INITIALIZER;
 static ANativeWindow *win;            /* the bottom surface while shown (render thread draws into it) */
 static int winBusy, dirty = 1;        /* winBusy: the render thread is drawing into win */
 #define SNAP_S 4.0
-#define ZOOM_HOME 0.42   /* screen pixels per world unit: about half of Paldea across the screen (2.4 screen pixels a map texel) */
+#define ZOOM_HOME 1.0   /* screen pixels per world unit: the closer map's detail (its tiles at about 1.5 texels a pixel); pinch out for all of Paldea */
 static double camX, camY, zoom = ZOOM_HOME;   /* map position at the screen centre; screen pixels per map unit */
 static double playerX, playerY, playerDir;   /* map units; radians, 0 = north (up), clockwise */
 static double lastTouch = -100;       /* time of the last touch; the view follows the player SNAP_S after it */
 static struct { int id; float x, y; } touch[2]; static int ntouch;
 static double pinchDist, pinchZoom, dragX, dragY, dragCamX, dragCamY;
 
-void bottom_map_set_player(double x, double y, double dir) {
+void bottom_map_set_player(double x, double y, double dir) {   /* a new drawing only for half a pixel or a degree */
     pthread_mutex_lock(&viewLock);
-    if (x != playerX || y != playerY || dir != playerDir) { playerX = x; playerY = y; playerDir = dir; dirty = 1; pthread_cond_broadcast(&viewCond); }
+    double d = fabs(dir - playerDir); if (d > M_PI) d = 2 * M_PI - d;
+    if (hypot(x - playerX, y - playerY) * zoom >= 0.5 || d >= M_PI / 180) { playerX = x; playerY = y; playerDir = dir; dirty = 1; pthread_cond_broadcast(&viewCond); }
     pthread_mutex_unlock(&viewLock);
 }
 
@@ -73,7 +74,7 @@ static int bottom_motion(const AInputEvent *e) {
             double mx = ntouch == 2 ? (touch[0].x + touch[1].x) / 2 : touch[0].x, my = ntouch == 2 ? (touch[0].y + touch[1].y) / 2 : touch[0].y;
             if (ntouch == 2 && pinchDist > 20) {
                 double z = pinchZoom * hypot(touch[0].x - touch[1].x, touch[0].y - touch[1].y) / pinchDist;
-                zoom = z < 0.1 ? 0.1 : z > 4 ? 4 : z;
+                zoom = z < 0.1 ? 0.1 : z > 6 ? 6 : z;
             }
             camX = dragCamX - (mx - dragX) / zoom; camY = dragCamY - (my - dragY) / zoom;
         }
@@ -168,6 +169,54 @@ static void load_calibration(void) {
     fprintf(stderr, "[totk] bottom map: %d calibration samples, %.4f texels a unit, origin %.2f %.2f\n", n, mapScale, mapU0, mapV0);
 }
 
+/* The game's marks (map-cache/marks.txt, noted by the backend from the closer map): the objective's pin (the latest
+   capture's only) and place names (each kept once, by image), at the player's position then plus their offset in tile
+   units (one overview texel is 12 of them). */
+typedef struct { char kind; double x, z; float w, h; uint64_t hash; image img; } mark;
+static mark *marks; static int nmarks;
+static void load_marks(void) {
+    for (int i = 0; i < nmarks; i++) free(marks[i].img.px);
+    free(marks); marks = NULL; nmarks = 0;
+    FILE *f = fopen("map-cache/marks.txt", "r"); if (!f) return;
+    char k; double px, pz, e, n; float w, h; unsigned long long hash; int cap = 0;
+    double lastOx = 1e30, lastOz = 1e30;
+    while (fscanf(f, " %c %lf %lf %lf %lf %f %f %llx", &k, &px, &pz, &e, &n, &w, &h, &hash) == 8) {
+        double t = 12 * mapScale;   /* tile units a world unit */
+        if (k == 'O' && (px != lastOx || pz != lastOz)) {   /* a newer capture: the older objective pins go */
+            int j = 0; for (int i = 0; i < nmarks; i++) if (marks[i].kind != 'O') marks[j++] = marks[i]; nmarks = j;
+            lastOx = px; lastOz = pz;
+        }
+        int i = 0; if (k == 'L') while (i < nmarks && !(marks[i].kind == 'L' && marks[i].hash == hash)) i++; else i = nmarks;
+        if (i == nmarks) { if (nmarks == cap) { cap = cap ? 2 * cap : 32; marks = realloc(marks, sizeof *marks * (size_t)cap); } memset(&marks[nmarks++], 0, sizeof *marks); }
+        marks[i].kind = k; marks[i].x = px + e / t; marks[i].z = pz - n / t; marks[i].w = w; marks[i].h = h; marks[i].hash = hash;
+    }
+    fclose(f);
+    for (int i = 0; i < nmarks; i++) { char p[64]; snprintf(p, sizeof p, "map-cache/icon_%016llx.rgba", (unsigned long long)marks[i].hash); load_image(&marks[i].img, p); }
+    fprintf(stderr, "[totk] bottom map: %d marks\n", nmarks);
+}
+static void blit(canvas *c, const image *im, double cx, double cy, double w, double h) {   /* scaled, alpha blended */
+    if (!im->px || w < 1 || h < 1) return;
+    int x0 = (int)(cx - w / 2), y0 = (int)(cy - h / 2), x1 = (int)(cx + w / 2), y1 = (int)(cy + h / 2);
+    for (int y = y0 < 0 ? 0 : y0; y < y1 && y < c->h; y++) {
+        int sy = (int)((y - (cy - h / 2)) * im->h / h); if (sy < 0 || sy >= im->h) continue;
+        uint32_t *o = c->px + (size_t)y * c->stride;
+        for (int x = x0 < 0 ? 0 : x0; x < x1 && x < c->w; x++) {
+            int sx = (int)((x - (cx - w / 2)) * im->w / w); if (sx < 0 || sx >= im->w) continue;
+            const uint8_t *t = im->px + 4 * ((size_t)sy * im->w + (size_t)sx); uint32_t a = t[3]; if (!a) continue;
+            uint32_t d = o[x], na = 255 - a;
+            o[x] = rgb((int)((t[0] * a + (d & 255) * na) / 255), (int)((t[1] * a + (d >> 8 & 255) * na) / 255), (int)((t[2] * a + (d >> 16 & 255) * na) / 255));
+        }
+    }
+}
+static void draw_marks(canvas *c, double cx, double cy, double z) {
+    for (int pass = 0; pass < 2; pass++) for (int i = 0; i < nmarks; i++) {   /* names first, pins over them */
+        const mark *m = &marks[i]; if ((m->kind == 'O') != pass) continue;
+        if (m->kind == 'L' && z < 0.6) continue;   /* names only once zoomed in, as on the game's map */
+        double sx = c->w / 2.0 + (m->x - cx) * z, sy = c->h / 2.0 + (m->z - cy) * z, k = m->kind == 'O' ? 0.8 : 0.9;
+        blit(c, &m->img, sx, sy, m->w * k, m->h * k);
+    }
+}
+
 static void draw_grid(canvas *c, double cx, double cy, double z) {   /* before the art has been seen once */
     fill(c, 0, 0, c->w, c->h, rgb(22, 38, 52));
     for (int major = 0; major < 2; major++) {
@@ -178,8 +227,64 @@ static void draw_grid(canvas *c, double cx, double cy, double z) {   /* before t
         for (double gy = floor(y0 / step) * step; gy <= y0 + c->h / z; gy += step) { int sy = (int)((gy - y0) * z); fill(c, 0, sy, c->w, sy + (major ? 2 : 1), col); }
     }
 }
-/* The map screen's look: its patterned navy background, the region map over it (bilinear, with its transparency). */
+/* The map screen's look: its patterned navy background, the region map over it, and once zoomed in the closer map's
+   tiles over that (bilinear, with their transparency: where the art is transparent the background shows, as in the
+   game). */
 static uint32_t *bgFrame; static int bgW, bgH;
+/* im over the canvas within [x0, x1) x [y0, y1): screen pixel (x, y) shows texel (u0 + x du, v0 + y du) */
+static void draw_image(canvas *c, const image *im, double u0, double v0, double du, int x0, int y0, int x1, int y1) {
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > c->w) x1 = c->w; if (y1 > c->h) y1 = c->h;
+    const int W = im->w, H = im->h; const uint8_t *T = im->px;
+    int64_t d = (int64_t)(du * 65536), uu0 = (int64_t)((u0 + x0 * du - 0.5) * 65536), vv = (int64_t)((v0 + y0 * du - 0.5) * 65536);
+    for (int y = y0; y < y1; y++, vv += d) {
+        uint32_t *o = c->px + (size_t)y * c->stride;
+        int64_t ty = vv >> 16; uint32_t fy = (uint32_t)(vv & 0xffff) >> 8;
+        if (ty < -1 || ty >= H) continue;
+        int64_t uu = uu0;
+        for (int x = x0; x < x1; x++, uu += d) {
+            int64_t tx = uu >> 16;
+            if (tx < -1 || tx >= W) continue;
+            uint32_t fx = (uint32_t)(uu & 0xffff) >> 8, acc[4] = {0, 0, 0, 0};
+            for (int j = 0; j < 4; j++) {   /* the four texels, weights in 1/65536 */
+                int64_t sx = tx + (j & 1), sy = ty + (j >> 1);
+                if (sx < 0) sx = 0; if (sy < 0) sy = 0; if (sx >= W) sx = W - 1; if (sy >= H) sy = H - 1;
+                uint32_t w = ((j & 1) ? fx : 256 - fx) * ((j >> 1) ? fy : 256 - fy);
+                const uint8_t *t = T + 4 * ((size_t)sy * W + (size_t)sx);
+                uint32_t wa = w * t[3];
+                acc[0] += t[0] * wa >> 8; acc[1] += t[1] * wa >> 8; acc[2] += t[2] * wa >> 8; acc[3] += wa >> 8;
+            }
+            uint32_t a = acc[3] >> 8;   /* coverage 0..255 */
+            if (!a) continue;
+            uint32_t bg = o[x], na = 255 - a;
+            uint32_t r = (acc[0] >> 16) + ((bg & 255) * na >> 8), g = (acc[1] >> 16) + ((bg >> 8 & 255) * na >> 8), bl = (acc[2] >> 16) + ((bg >> 16 & 255) * na >> 8);
+            o[x] = rgb((int)(r > 255 ? 255 : r), (int)(g > 255 ? 255 : g), (int)(bl > 255 ? 255 : bl));
+        }
+    }
+}
+/* The closer map's tiles (map-cache/tiles.txt, noted by the backend): each image once, at the place of its latest note
+   (the player's position then plus the centre's offset in tile units); 1000 tile units a side. */
+typedef struct { double x, z; uint64_t hash; image img; int shared; } tile;   /* shared: the tile whose image this one uses (-1: its own) */
+static tile *tiles; static int ntiles;
+static void load_tiles(void) {
+    for (int i = 0; i < ntiles; i++) free(tiles[i].img.px);
+    free(tiles); tiles = NULL; ntiles = 0;
+    FILE *f = fopen("map-cache/tiles.txt", "r"); if (!f) return;
+    double px, pz, e, n; unsigned long long hash; int cap = 0;
+    while (fscanf(f, "%lf %lf %lf %lf %llx", &px, &pz, &e, &n, &hash) == 5) {
+        double t = 12 * mapScale, L = 1000 / t, x = px + e / t, z = pz - n / t; int i = 0;   /* the same image in the same place: one tile */
+        while (i < ntiles && !(tiles[i].hash == hash && fabs(tiles[i].x - x) < L / 2 && fabs(tiles[i].z - z) < L / 2)) i++;
+        if (i == ntiles) { if (ntiles == cap) { cap = cap ? 2 * cap : 64; tiles = realloc(tiles, sizeof *tiles * (size_t)cap); } memset(&tiles[ntiles++], 0, sizeof *tiles); }
+        tiles[i].x = x; tiles[i].z = z; tiles[i].hash = hash;
+    }
+    fclose(f);
+    for (int i = 0; i < ntiles; i++) {   /* one copy of each image: open sea repeats one tile */
+        int j = 0; while (j < i && tiles[j].hash != tiles[i].hash) j++;
+        if (j < i) { tiles[i].img = tiles[j].img; tiles[i].img.px = NULL; tiles[i].shared = j; continue; }
+        tiles[i].shared = -1;
+        char p[64]; snprintf(p, sizeof p, "map-cache/tile_%016llx.rgba", (unsigned long long)tiles[i].hash); load_image(&tiles[i].img, p);
+    }
+    fprintf(stderr, "[totk] bottom map: %d tiles\n", ntiles);
+}
 static void draw_art(canvas *c, double cx, double cy, double z) {
     if (!bgFrame || bgW != c->w || bgH != c->h) {   /* the background is screen-fixed: made once */
         free(bgFrame); bgFrame = malloc((size_t)c->w * c->h * 4); bgW = c->w; bgH = c->h;
@@ -188,37 +293,28 @@ static void draw_art(canvas *c, double cx, double cy, double z) {
             bgFrame[(size_t)y * c->w + x] = p ? rgb(p[0], p[1], p[2]) : rgb(26, 43, 74);
         }
     }
-    double k = mapScale / z;   /* texels a screen pixel */
-    double u0 = mapU0 + (cx - c->w / 2.0 / z) * mapScale, v0 = mapV0 + (cy - c->h / 2.0 / z) * mapScale;
-    const int W = overview.w, H = overview.h; const uint8_t *T = overview.px;
-    int64_t du = (int64_t)(k * 65536), uu0 = (int64_t)((u0 - 0.5) * 65536), vv = (int64_t)((v0 - 0.5) * 65536);
-    for (int y = 0; y < c->h; y++, vv += du) {
-        uint32_t *o = c->px + (size_t)y * c->stride; const uint32_t *b = bgFrame + (size_t)y * c->w;
-        int64_t ty = vv >> 16; uint32_t fy = (uint32_t)(vv & 0xffff) >> 8;
-        if (ty < -1 || ty >= H) { memcpy(o, b, (size_t)c->w * 4); continue; }
-        int64_t uu = uu0;
-        for (int x = 0; x < c->w; x++, uu += du) {
-            int64_t tx = uu >> 16;
-            if (tx < -1 || tx >= W) { o[x] = b[x]; continue; }
-            uint32_t fx = (uint32_t)(uu & 0xffff) >> 8, acc[4] = {0, 0, 0, 0};
-            for (int j = 0; j < 4; j++) {   /* the four texels, weights in 1/65536 */
-                int64_t sx = tx + (j & 1), sy = ty + (j >> 1);
-                uint32_t w = ((j & 1) ? fx : 256 - fx) * ((j >> 1) ? fy : 256 - fy);
-                if (sx < 0 || sy < 0 || sx >= W || sy >= H) continue;
-                const uint8_t *t = T + 4 * ((size_t)sy * W + (size_t)sx);
-                uint32_t wa = w * t[3];
-                acc[0] += t[0] * wa >> 8; acc[1] += t[1] * wa >> 8; acc[2] += t[2] * wa >> 8; acc[3] += wa >> 8;
-            }
-            uint32_t a = acc[3] >> 8;   /* coverage 0..255 */
-            if (!a) { o[x] = b[x]; continue; }
-            uint32_t bg = b[x], na = 255 - a;
-            uint32_t r = (acc[0] >> 16) + ((bg & 255) * na >> 8), g = (acc[1] >> 16) + ((bg >> 8 & 255) * na >> 8), bl = (acc[2] >> 16) + ((bg >> 16 & 255) * na >> 8);
-            o[x] = rgb((int)(r > 255 ? 255 : r), (int)(g > 255 ? 255 : g), (int)(bl > 255 ? 255 : bl));
-        }
+    for (int y = 0; y < c->h; y++) memcpy(c->px + (size_t)y * c->stride, bgFrame + (size_t)y * c->w, (size_t)c->w * 4);
+    double wx0 = cx - c->w / 2.0 / z, wz0 = cy - c->h / 2.0 / z;   /* the world at the screen's top left */
+    double L = 1000 / (12 * mapScale);   /* a tile's side in world units */
+    int covered = z >= 0.45 && ntiles;   /* the overview only where the tiles leave gaps (checked every 40 pixels) */
+    for (int y = 0; covered && y <= c->h; y += 40) for (int x = 0; covered && x <= c->w; x += 40) {
+        double wx = wx0 + (x < c->w ? x : c->w - 1) / z, wz = wz0 + (y < c->h ? y : c->h - 1) / z; int hit = 0;
+        for (int i = 0; i < ntiles && !hit; i++) hit = fabs(wx - tiles[i].x) <= L / 2 && fabs(wz - tiles[i].z) <= L / 2;
+        covered = hit;
+    }
+    if (!covered) draw_image(c, &overview, mapU0 + wx0 * mapScale, mapV0 + wz0 * mapScale, mapScale / z, 0, 0, c->w, c->h);
+    if (z < 0.45) return;   /* the tiles once one of their texels spans more than about a third of a screen pixel */
+    for (int i = 0; i < ntiles; i++) {
+        const tile *t = &tiles[i]; const image *im = t->shared >= 0 ? &tiles[t->shared].img : &t->img; if (!im->px) continue;
+        double k = im->w / L, tx0 = t->x - L / 2, tz0 = t->z - L / 2;   /* texels a world unit; the tile's corner */
+        int sx0 = (int)floor((tx0 - wx0) * z), sy0 = (int)floor((tz0 - wz0) * z), sx1 = (int)ceil((tx0 + L - wx0) * z), sy1 = (int)ceil((tz0 + L - wz0) * z);
+        if (sx1 <= 0 || sy1 <= 0 || sx0 >= c->w || sy0 >= c->h) continue;
+        draw_image(c, im, (wx0 - tx0) * k, (wz0 - tz0) * k, k / z, sx0, sy0, sx1, sy1);
     }
 }
 static void draw_map(canvas *c, double cx, double cy, double z, double px, double py, double pdir, const float (*t)[2], int nt) {
     if (overview.px) draw_art(c, cx, cy, z); else draw_grid(c, cx, cy, z);
+    draw_marks(c, cx, cy, z);
     /* The player, in the map screen's colours: a white disc in a dark outline with a yellow pointer the way they face */
     double sx = c->w / 2.0 + (px - cx) * z, sy = c->h / 2.0 + (py - cy) * z, s = sin(pdir), k = cos(pdir);
     double ax[3] = {sx + 40 * s, sx - 16 * k + 20 * s, sx + 16 * k + 20 * s}, ay[3] = {sy - 40 * k, sy - 16 * s - 20 * k, sy + 16 * s - 20 * k};
@@ -247,7 +343,7 @@ static void *render_thread(void *arg) {
         }
         if (assetsChanged) {   /* the backend saved new art or a calibration sample */
             assetsChanged = 0; pthread_mutex_unlock(&viewLock);
-            load_image(&overview, "map-cache/overview.rgba"); load_image(&pattern, "map-cache/background.rgba"); load_calibration();
+            load_image(&overview, "map-cache/overview.rgba"); load_image(&pattern, "map-cache/background.rgba"); load_calibration(); load_marks(); load_tiles();
             free(bgFrame); bgFrame = NULL;
             pthread_mutex_lock(&viewLock);
         }
@@ -258,11 +354,14 @@ static void *render_thread(void *arg) {
         ANativeWindow_Buffer b;
         if (ANativeWindow_lock(w, &b, NULL) == 0) {
             canvas c = {b.bits, b.width, b.height, b.stride};
+            double t0 = now_s();
             draw_map(&c, cx, cy, z, px, py, pd, t, nt);
             ANativeWindow_unlockAndPost(w);
+            static double sum; static int n; sum += now_s() - t0;
+            if (++n == 200) { fprintf(stderr, "[totk] bottom map: %.1f ms a drawing (last 200)\n", sum / n * 1000); sum = 0; n = 0; }
         }
         pthread_mutex_lock(&viewLock); winBusy = 0; pthread_cond_broadcast(&viewCond); pthread_mutex_unlock(&viewLock);
-        usleep(nt ? 16000 : 50000);   /* ~60 drawings a second under a finger, 20 when only following the player */
+        usleep(nt ? 16000 : 100000);   /* ~60 drawings a second under a finger, 10 when only following the player */
     }
     return NULL;
 }
