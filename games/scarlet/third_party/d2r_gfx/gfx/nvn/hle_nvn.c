@@ -782,6 +782,27 @@ NVN(nvnCommandBufferInitialize, NVNboolean, NVNcommandBuffer *c, NVNdevice *d) {
     memset(c, 0, sizeof(cmd_t)); CB(c)->magic = MAGIC('C', 'M', 'D', 'B'); CB(c)->dev = d; CB(c)->inline_cur = ~0ull; CB(c)->inline_end = 0; return 1;
 }
 NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) { free(CB(c)->seg); CB(c)->seg = CB(c)->cur = CB(c)->end = NULL; CB(c)->magic = 0; }
+/* Recording buffers are lent to a command buffer while it records and come back at EndRecording, where the recording
+   is copied out. Scarlet initializes about one command buffer a frame and finalizes almost none (real NVN allocates
+   nothing per command buffer, so it may), and a buffer kept per command buffer leaked 64 KiB or more each time: about
+   6 MB a minute on the Thor (found with Android's malloc debug: 1714 Initialize against 42 Finalize in 1500 frames).
+   Up to 64 returned buffers wait for the next recording; more are freed. */
+static struct { uint8_t *b; size_t cap; } g_segpool[64]; static int g_nsegpool;
+static pthread_mutex_t g_segpool_mu = PTHREAD_MUTEX_INITIALIZER;
+static void seg_return(cmd_t *o) {
+    if (!o->seg) return;
+    uint8_t *b = o->seg; size_t cap = (size_t)(o->end - o->seg);
+    o->seg = o->cur = o->end = NULL;
+    pthread_mutex_lock(&g_segpool_mu);
+    if (g_nsegpool < 64) { g_segpool[g_nsegpool].b = b; g_segpool[g_nsegpool++].cap = cap; b = NULL; }
+    pthread_mutex_unlock(&g_segpool_mu);
+    free(b);
+}
+static void seg_lend(cmd_t *o) {
+    pthread_mutex_lock(&g_segpool_mu);
+    if (g_nsegpool) { g_nsegpool--; o->seg = o->cur = g_segpool[g_nsegpool].b; o->end = o->seg + g_segpool[g_nsegpool].cap; }
+    pthread_mutex_unlock(&g_segpool_mu);
+}
 NVN(nvnCommandBufferSetMemoryCallback, void, NVNcommandBuffer *c, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb) { CB(c)->cb = cb; }
 NVN(nvnCommandBufferSetMemoryCallbackData, void, NVNcommandBuffer *c, void *d) { CB(c)->cb_data = d; }
 static uint8_t *align8(uint8_t *p) { return (uint8_t *)(((uintptr_t)p + 7) & ~(uintptr_t)7); }
@@ -809,6 +830,7 @@ static void put_hdr(uint8_t *p, uint32_t op, uint32_t size) { op_hdr h = {op, si
 // Games hand the same command memory to several command buffers recording concurrently (budgeted for real NVN
 // encodings); our records are larger and would overwrite each other there. The game's memory is accounted only.
 static void cmd_reserve(cmd_t *o, size_t need) {
+    if (!o->seg) seg_lend(o);
     if (o->seg && o->cur + need + OP_RESERVE <= o->end) return;
     size_t used = o->seg ? (size_t)(o->cur - o->seg) : 0;
     size_t cap = o->seg ? (size_t)(o->end - o->seg) : 0; if (!cap) cap = 64 << 10;
@@ -1107,6 +1129,7 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
             g_cbk_used, g_cbk_empty, g_cbk_cap, (unsigned long long)g_cbk_compactions); }
     pthread_mutex_unlock(&g_copy_mu);
     if (cmdlog_env()) LOG("[cmd] EndRecording cb=%p recorded=%p copy=%p ctl=%p", (void *)c, (void *)o->seg, (void *)copy, o->ctl);
+    seg_return(o);   /* the recording lives in its copy now */
     if (totk_life_on() && totk_life_cb_take(c)) { totk_life_log("end cb=%p handle=%p", (void *)c, (void *)copy); totk_life_handle_add((uint64_t)(uintptr_t)copy); }
     if (getenv("TOTK_CHAIN_LOG")) { static int n; if (n++ < 200) guest_chain("EndRecording"); }
 #ifdef GAME_BOTW

@@ -85,25 +85,46 @@ void runtime_front_request_close(void) {
     front_exit(0);
 }
 
-/* Text entry (nn::swkbd, runtime/swkbd_host.c): confirmed at once with SCARLET_TEXT, or the game's initial text, or "Thor".
-   The caller checks the length and character limits again. */
+/* Text entry (nn::swkbd, runtime/swkbd_host.c). The app asks the player in a dialog (runtime/activity_android.c); with
+   SCARLET_TEXT set (scripts), and in the command-line build, it is confirmed at once with SCARLET_TEXT, or the game's
+   initial text, or "Thor". The caller checks the length and character limits again. */
+#ifdef SCARLET_APK
+int runtime_android_text(const RuntimeTextRequest *req, char *out, size_t out_size);
+void runtime_android_text_test(const char *op, const char *text);
+#endif
 int runtime_front_text_input(const RuntimeTextRequest *req, char *out, size_t out_size) {
     const char *t = getenv("SCARLET_TEXT");
+#ifdef SCARLET_APK
+    if (!t || !*t) return runtime_android_text(req, out, out_size);
+#endif
     if (!t || !*t) t = req && req->initial && *req->initial ? req->initial : "Thor";
     if (req && req->digits_only && strspn(t, "0123456789") != strlen(t)) t = "0";
     snprintf(out, out_size, "%s", t);
     fprintf(stderr, "[totk] text entry \"%s\": answered \"%s\" (SCARLET_TEXT)\n", req && req->prompt ? req->prompt : "", out);
     return 1;
 }
+#ifdef SCARLET_APK
+void runtime_front_text_test(const char *op, const char *text) { if (op) runtime_android_text_test(op, text); }
+#else
 void runtime_front_text_test(const char *op, const char *text) { (void)text; fprintf(stderr, "[totk] text entry test \"%s\" ignored: answered from SCARLET_TEXT here\n", op ? op : ""); }
+#endif
 
 /* The display's vsync: 60 Hz on an absolute clock, so late wakeups do not drift. */
+/* In the app the ticks stop while the activity has no window (Home, recent apps, the screen off), and so do the game's
+   presents (nvn_vk_present_hook, below): Scarlet does not pace on the vsync events alone, so its frame loop is held at
+   its next present instead of rendering what nobody sees, and goes on when the window is back. */
+#ifdef SCARLET_APK
+static _Atomic int vsyncPaused = 1;   /* until the first window */
+#else
+static _Atomic int vsyncPaused;
+#endif
 static void *vsync_thread(void *arg) {
     (void)arg; pthread_setname_np("vsync");
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     for (;;) {
         t.tv_nsec += 16666667; if (t.tv_nsec >= 1000000000) { t.tv_nsec -= 1000000000; t.tv_sec++; }
         while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, NULL) == EINTR) {}
+        if (atomic_load(&vsyncPaused)) continue;
         pthread_mutex_lock(&vsyncLock); for (unsigned i = 0; i < vsyncCount; i++) hle_signal_system_event(vsyncEvents[i]); pthread_mutex_unlock(&vsyncLock);
     }
     return NULL;
@@ -150,13 +171,25 @@ void *runtime_front_override(const char *name) {
    its swapchain and surface (nvn_vk_window_lost waits for a present in progress), then the window is released. */
 void nvn_vk_window_lost(void) __attribute__((weak));
 static pthread_mutex_t windowLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t windowCond = PTHREAD_COND_INITIALIZER;
 static ANativeWindow *window;
+/* Called by the Vulkan backend at every present, before it takes its locks: waits while there is no window. */
+void nvn_vk_present_hook(void) {
+    if (!atomic_load(&vsyncPaused)) return;
+    pthread_mutex_lock(&windowLock);
+    while (atomic_load(&vsyncPaused)) pthread_cond_wait(&windowCond, &windowLock);
+    pthread_mutex_unlock(&windowLock);
+}
 void runtime_android_window(ANativeWindow *w) {
     if (w) ANativeWindow_acquire(w);
     pthread_mutex_lock(&windowLock); ANativeWindow *old = window; window = w; pthread_mutex_unlock(&windowLock);
+    if (!w) atomic_store(&vsyncPaused, 1);   /* no new frames for the old window */
     if (old) { if (nvn_vk_window_lost) nvn_vk_window_lost(); ANativeWindow_release(old); }
-    if (w) fprintf(stderr, "[totk] window %dx%d\n", ANativeWindow_getWidth(w), ANativeWindow_getHeight(w));
-    else fprintf(stderr, "[totk] window gone: rendering offscreen until it is back\n");
+    if (w) {
+        pthread_mutex_lock(&windowLock); atomic_store(&vsyncPaused, 0); pthread_cond_broadcast(&windowCond); pthread_mutex_unlock(&windowLock);
+        fprintf(stderr, "[totk] window %dx%d\n", ANativeWindow_getWidth(w), ANativeWindow_getHeight(w));
+    }
+    else fprintf(stderr, "[totk] window gone: the game is paused until it is back\n");
 }
 const char *const *front_vk_instance_extensions(uint32_t *count) {
     static const char *const ext[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME};

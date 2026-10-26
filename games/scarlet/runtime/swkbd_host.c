@@ -136,7 +136,7 @@ static unsigned show_keyboard(void *out_string, const void *arg_ptr) {
         confirmed = strcmp(forced, "<cancel>") != 0;
         snprintf(text, sizeof text, "%s", strcmp(forced, "<initial>") ? forced : initial);
     } else {
-#if TARGET_OS_OSX
+#if TARGET_OS_OSX || defined(__ANDROID__)   /* Android: runtime/frontend_android.c */
         RuntimeTextRequest req = { prompt, initial, max_len, min_len, password != 0, type == KB_TYPE_NUMPAD, disabled };
         int away = runtime_core_away();   /* the other guest threads keep running while the player types */
         confirmed = runtime_front_text_input(&req, text, sizeof text);

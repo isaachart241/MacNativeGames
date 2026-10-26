@@ -121,6 +121,15 @@ void runtime_memory_probe(void);
 
 void runtime_input_key(unsigned code,int down);
 void runtime_input_clear(void);
+/* Start-up work that reads the environment (test switches): a constructor in the programs; the Android app sets its
+   environment from env.txt after its library is loaded, so there they are plain functions it calls then
+   (runtime/activity_android.c). */
+#ifdef SCARLET_APK
+#define RUNTIME_ENV_START(name) void name(void)
+void runtime_env_input_script(void); void runtime_env_input_file(void); void runtime_env_autoload(void); void runtime_env_thread_dumps(void);
+#else
+#define RUNTIME_ENV_START(name) __attribute__((constructor)) static void name(void)
+#endif
 int runtime_handheld_mode(void);   /* TOTK_OPERATION_MODE=handheld (runtime/services.c) */
 void *runtime_input_override(const char *name);
 void *runtime_scarlet_override(const char *name);   /* runtime/system_services.c: Bayonetta 3 network and system functions */

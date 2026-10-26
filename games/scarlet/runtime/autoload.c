@@ -25,7 +25,7 @@ static unsigned env_uint(const char *name, unsigned def, unsigned lo, unsigned h
     if (end == e || *end || v < lo || v > hi) { fprintf(stderr, "[autoload] %s=%s: expected %u..%u\n", name, e, lo, hi); runtime_fail("invalid auto-load setting"); }
     return (unsigned)v;
 }
-__attribute__((constructor)) static void autoload_configure(void) {
+RUNTIME_ENV_START(runtime_env_autoload) {
     const char *e = getenv("TOTK_AUTOLOAD");
     if (!e || !strcmp(e, "0")) return;
     if (strcmp(e, "1")) runtime_fail("TOTK_AUTOLOAD takes 0 or 1");

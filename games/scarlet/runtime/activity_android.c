@@ -4,8 +4,8 @@
    holds what /data/local/tmp/scarlet holds for the command-line build: extracted/, rewritten/v400-android/, user-data/
    (the saves). Two files there are for testing: env.txt (one VAR=value per line, set before the game starts) and
    logs/run.log (the game's stderr; the previous run's is logs/run-prev.log). The window and the input queue go to
-   runtime/frontend_android.c and runtime/gamepad_android.c. Leaving the app keeps the game running without a picture;
-   coming back gives it a new window. */
+   runtime/frontend_android.c and runtime/gamepad_android.c. Leaving the app pauses the game (no vsync without a
+   window); coming back gives it a new window and it goes on. */
 #ifdef SCARLET_APK
 #include <android/input.h>
 #include <android/log.h>
@@ -16,10 +16,12 @@
 #include <fcntl.h>
 #include <jni.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 #include "runtime.h"
 
@@ -72,6 +74,7 @@ static void *game_thread(void *arg) {
     setvbuf(stderr, NULL, _IOLBF, 0);
     fprintf(stderr, "[totk] Scarlet for the Thor: data folder %s\n", dir);
     load_env("env.txt");
+    runtime_env_input_script(); runtime_env_input_file(); runtime_env_autoload(); runtime_env_thread_dumps();
     const char *rewritten = getenv("SCARLET_REWRITTEN"); if (!rewritten || !*rewritten) rewritten = "rewritten/v400-android";
     struct stat st;
     if (stat(rewritten, &st) || stat("extracted", &st)) {
@@ -120,12 +123,133 @@ static void input_destroyed(ANativeActivity *a, AInputQueue *q) {
     runtime_input_clear();
 }
 
+/* Text entry (the game's keyboard applet, runtime/swkbd_host.c, through runtime_front_text_input): an Android dialog
+   with the game's prompt, one text field (the game's initial text, its length limit, digits or hidden when it asks) and
+   an OK button, with the on-screen keyboard. It is made through JNI on the UI thread, which a pipe on the UI thread's
+   looper wakes. The app has no Java code of its own, so the dialog has no listener: it cannot be cancelled, and a 100 ms
+   timer on the same looper notices it has closed and reads the field. The game thread waits meanwhile. */
+static ANativeActivity *activity;   /* the current activity (UI thread), NULL after onDestroy */
+static int uiPipe[2] = {-1, -1}, uiTimer = -1;
+static pthread_mutex_t textLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t textCond = PTHREAD_COND_INITIALIZER;
+static const RuntimeTextRequest *textReq; static char *textOut; static size_t textOutSize;
+static int textState;   /* 0 idle, 1 asked, 2 shown, 3 answered */
+static jobject textDialog, textField;   /* global references while shown */
+static char textTest[256]; static int textTestOp;   /* runtime_front_text_test: 1 type, 2 enter */
+
+static jobject call_obj(JNIEnv *env, jobject o, const char *name, const char *sig, ...) {
+    va_list ap; va_start(ap, sig);
+    jobject r = (*env)->CallObjectMethodV(env, o, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, o), name, sig), ap);
+    va_end(ap); return r;
+}
+static void call_void(JNIEnv *env, jobject o, const char *name, const char *sig, ...) {
+    va_list ap; va_start(ap, sig);
+    (*env)->CallVoidMethodV(env, o, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, o), name, sig), ap);
+    va_end(ap);
+}
+static int jni_failed(JNIEnv *env) {
+    if (!(*env)->ExceptionCheck(env)) return 0;
+    (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); return 1;
+}
+static void text_answer(const char *text, int ok) {   /* UI thread */
+    pthread_mutex_lock(&textLock);
+    if (textState == 1 || textState == 2) { snprintf(textOut, textOutSize, "%s", text); textState = ok ? 3 : 4; pthread_cond_broadcast(&textCond); }
+    pthread_mutex_unlock(&textLock);
+}
+static void text_show(JNIEnv *env, ANativeActivity *a) {
+    const RuntimeTextRequest *r = textReq;
+    (*env)->PushLocalFrame(env, 32);
+    jclass etc = (*env)->FindClass(env, "android/widget/EditText");
+    jobject et = (*env)->NewObject(env, etc, (*env)->GetMethodID(env, etc, "<init>", "(Landroid/content/Context;)V"), a->clazz);
+    call_void(env, et, "setSingleLine", "()V");
+    call_void(env, et, "setText", "(Ljava/lang/CharSequence;)V", (*env)->NewStringUTF(env, r->initial ? r->initial : ""));
+    call_void(env, et, "setSelectAllOnFocus", "(Z)V", JNI_TRUE);
+    call_void(env, et, "setImeOptions", "(I)V", 6);   /* IME_ACTION_DONE. Landscape keyboards take the whole screen with their
+                                                         own field (pinned below instead, the keyboard hid the dialog): Done
+                                                         puts the keyboard away and shows the dialog's OK */
+    /* InputType: TYPE_CLASS_NUMBER, or TYPE_CLASS_TEXT | TYPE_TEXT_VARIATION_PASSWORD */
+    if (r->digits_only) call_void(env, et, "setInputType", "(I)V", 2); else if (r->secure) call_void(env, et, "setInputType", "(I)V", 0x81);
+    if (r->max_units > 0) {
+        jclass lfc = (*env)->FindClass(env, "android/text/InputFilter$LengthFilter"), ifc = (*env)->FindClass(env, "android/text/InputFilter");
+        jobject lf = (*env)->NewObject(env, lfc, (*env)->GetMethodID(env, lfc, "<init>", "(I)V"), r->max_units);
+        call_void(env, et, "setFilters", "([Landroid/text/InputFilter;)V", (*env)->NewObjectArray(env, 1, ifc, lf));
+    }
+    jclass bc = (*env)->FindClass(env, "android/app/AlertDialog$Builder");
+    jobject b = (*env)->NewObject(env, bc, (*env)->GetMethodID(env, bc, "<init>", "(Landroid/content/Context;)V"), a->clazz);
+    call_obj(env, b, "setTitle", "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;", (*env)->NewStringUTF(env, r->prompt ? r->prompt : ""));
+    call_obj(env, b, "setView", "(Landroid/view/View;)Landroid/app/AlertDialog$Builder;", et);
+    call_obj(env, b, "setPositiveButton", "(Ljava/lang/CharSequence;Landroid/content/DialogInterface$OnClickListener;)Landroid/app/AlertDialog$Builder;",
+             (*env)->NewStringUTF(env, "OK"), NULL);
+    call_obj(env, b, "setCancelable", "(Z)Landroid/app/AlertDialog$Builder;", JNI_FALSE);
+    jobject dlg = call_obj(env, b, "create", "()Landroid/app/AlertDialog;");
+    if (!jni_failed(env) && dlg) {
+        call_void(env, call_obj(env, dlg, "getWindow", "()Landroid/view/Window;"), "setSoftInputMode", "(I)V", 5);   /* SOFT_INPUT_STATE_ALWAYS_VISIBLE */
+        call_void(env, dlg, "show", "()V");
+        (*env)->CallBooleanMethod(env, et, (*env)->GetMethodID(env, etc, "requestFocus", "()Z"));
+    }
+    if (jni_failed(env) || !dlg) { fprintf(stderr, "[totk] text entry: the dialog could not be shown; the initial text is used\n"); text_answer(r->initial ? r->initial : "", 1); }
+    else {
+        textDialog = (*env)->NewGlobalRef(env, dlg); textField = (*env)->NewGlobalRef(env, et);
+        pthread_mutex_lock(&textLock); textState = 2; pthread_mutex_unlock(&textLock);
+        struct itimerspec ts = {{0, 100000000}, {0, 100000000}}; timerfd_settime(uiTimer, 0, &ts, NULL);
+        fprintf(stderr, "[totk] text entry dialog shown: \"%s\"\n", r->prompt ? r->prompt : "");
+    }
+    (*env)->PopLocalFrame(env, NULL);
+}
+static int on_ui(int fd, int events, void *data) {   /* UI thread: a request to show the dialog */
+    (void)events; (void)data; char c; while (read(fd, &c, 1) == 1) {}
+    pthread_mutex_lock(&textLock); int show = textState == 1; pthread_mutex_unlock(&textLock);
+    if (show) { if (activity) text_show(activity->env, activity); else text_answer(textReq->initial ? textReq->initial : "", 1); }
+    return 1;
+}
+static int on_timer(int fd, int events, void *data) {   /* UI thread, every 100 ms while the dialog is shown */
+    (void)events; (void)data; uint64_t n; if (read(fd, &n, sizeof n) != sizeof n || !textDialog || !activity) return 1;
+    JNIEnv *env = activity->env;
+    (*env)->PushLocalFrame(env, 16);
+    pthread_mutex_lock(&textLock); int op = textTestOp; char test[sizeof textTest]; memcpy(test, textTest, sizeof test); textTestOp = 0; pthread_mutex_unlock(&textLock);
+    if (op == 1) call_void(env, textField, "setText", "(Ljava/lang/CharSequence;)V", (*env)->NewStringUTF(env, test));
+    if (op == 2) call_void(env, textDialog, "dismiss", "()V");
+    jclass dc = (*env)->GetObjectClass(env, textDialog);
+    if (!(*env)->CallBooleanMethod(env, textDialog, (*env)->GetMethodID(env, dc, "isShowing", "()Z"))) {
+        jobject s = call_obj(env, call_obj(env, textField, "getText", "()Landroid/text/Editable;"), "toString", "()Ljava/lang/String;");
+        const char *u = s ? (*env)->GetStringUTFChars(env, s, NULL) : NULL;
+        fprintf(stderr, "[totk] text entry: \"%s\"\n", u ? u : "");
+        text_answer(u ? u : "", 1);
+        if (u) (*env)->ReleaseStringUTFChars(env, s, u);
+        (*env)->DeleteGlobalRef(env, textDialog); (*env)->DeleteGlobalRef(env, textField); textDialog = textField = NULL;
+        struct itimerspec off = {0}; timerfd_settime(uiTimer, 0, &off, NULL);
+    }
+    jni_failed(env);
+    (*env)->PopLocalFrame(env, NULL);
+    return 1;
+}
+/* Called by runtime/frontend_android.c on a game thread: 1 with the text (UTF-8), the dialog's only answer. */
+int runtime_android_text(const RuntimeTextRequest *req, char *out, size_t out_size) {
+    pthread_mutex_lock(&textLock);
+    while (textState) pthread_cond_wait(&textCond, &textLock);   /* one dialog at a time */
+    textReq = req; textOut = out; textOutSize = out_size; textState = 1;
+    pthread_mutex_unlock(&textLock);
+    char c = 1; if (uiPipe[1] < 0 || write(uiPipe[1], &c, 1) != 1) { pthread_mutex_lock(&textLock); textState = 0; pthread_mutex_unlock(&textLock); return 0; }
+    pthread_mutex_lock(&textLock);
+    while (textState < 3) pthread_cond_wait(&textCond, &textLock);
+    int ok = textState == 3; textState = 0; pthread_cond_broadcast(&textCond);
+    pthread_mutex_unlock(&textLock);
+    return ok;
+}
+/* Scripts (TOTK_INPUT_FILE "type <text>" / "enter"): set the open dialog's text, or close it as OK would. */
+void runtime_android_text_test(const char *op, const char *text) {
+    pthread_mutex_lock(&textLock);
+    if (!strcmp(op, "type")) { snprintf(textTest, sizeof textTest, "%s", text ? text : ""); textTestOp = 1; }
+    else if (!strcmp(op, "enter")) textTestOp = 2;
+    pthread_mutex_unlock(&textLock);
+}
+
 static void window_created(ANativeActivity *a, ANativeWindow *w) { (void)a; runtime_android_window(w); }
 static void window_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; runtime_android_window(NULL); }
 static void focus_changed(ANativeActivity *a, int on) { if (on) immersive(a); runtime_android_focus(on); }
 static void on_resume(ANativeActivity *a) { (void)a; ALOG("resume"); }
 static void on_pause(ANativeActivity *a) { (void)a; ALOG("pause"); }
-static void on_destroy(ANativeActivity *a) { (void)a; ALOG("activity destroyed (the game keeps running)"); }
+static void on_destroy(ANativeActivity *a) { if (activity == a) activity = NULL; ALOG("activity destroyed (the game keeps running)"); }
 
 __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActivity *a, void *saved, size_t saved_size) {
     (void)saved; (void)saved_size;
@@ -139,6 +263,12 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     a->callbacks->onDestroy = on_destroy;
     ANativeActivity_setWindowFlags(a, AWINDOW_FLAG_KEEP_SCREEN_ON | AWINDOW_FLAG_FULLSCREEN, 0);
     immersive(a);
+    activity = a;
+    if (uiPipe[0] < 0) {   /* the text entry dialog's wake-ups on the UI thread's looper (the same looper for every activity) */
+        ALooper *ui = ALooper_forThread();
+        if (pipe2(uiPipe, O_NONBLOCK | O_CLOEXEC) == 0) ALooper_addFd(ui, uiPipe[0], 2, ALOOPER_EVENT_INPUT, on_ui, NULL);
+        if ((uiTimer = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC)) >= 0) ALooper_addFd(ui, uiTimer, 3, ALOOPER_EVENT_INPUT, on_timer, NULL);
+    }
     static int started;
     if (started) { ALOG("activity created again: the game is already running"); return; }
     started = 1;

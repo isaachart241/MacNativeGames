@@ -589,3 +589,45 @@ the long streams (the usual gap between two libopus builds), about 31 dB on the 
 (different resampling paths), the same sample count for every packet. In the game: 1.6 ms per packet on average (worst
 22 ms over 5000), the game's mix in the house at rms 0.018 instead of 0.011 without Opus, frame time p50 33.2 ms.
 Not checked: listening (the tests ran muted at night).
+
+### 2026-10-26: Thor port: two memory leaks, text entry, pausing in the background
+
+**A 30-minute soak in the house grew the app's native heap by 6.5 MB a minute.** Android's malloc debug (the app's
+`wrap.` property with `LIBC_DEBUG_MALLOC_OPTIONS=backtrace_enable_on_signal`, backtraces switched on by a signal once
+in the house, two `am dumpheap -n` dumps compared by backtrace) found two causes:
+
+- **Command recording buffers** (`hle_nvn.c`, shared with the Mac build). Each NVN command buffer kept a host buffer
+  for its records (64 KiB or more) until `nvnCommandBufferFinalize`. Scarlet initializes about one command buffer a
+  frame and finalizes almost none (1,714 Initialize against 42 Finalize over 1,500 frames on the Thor; 1,678 against 18
+  on the Mac), which real NVN allows since it allocates nothing per command buffer. The recording is copied out at
+  EndRecording, so the buffer now goes back to a pool of up to 64 there and is lent again at the next recording. The
+  Mac build reaches the house with it (RSS 244 to 257 MB over four minutes).
+- **Platform Opus codecs** (`android/compat/opus_mediacodec.c`). Scarlet initializes decoders again for new sounds and
+  leaves many unfinalized (512 game decoders after 25 minutes). With libopus that costs nothing; one platform codec
+  per decoder filled the codec process, grew this process's heap and slowed decoding to 7, then 15 ms a packet. A
+  decoder now takes a codec at its first packet from a pool of flushed codecs (per channel count) and gives it back
+  when destroyed or after a second without packets. Over 25 minutes: 4 codecs made in all, 1.6 ms a packet, worst
+  7.5 ms.
+
+After both: native heap 1,129 then 1,128 MB over ten minutes, total 2.46 GB and flat, frame time p50 33.0 ms.
+
+**Text entry.** The keyboard applet (`swkbd_host.c`) cancelled every prompt on Android: it called the front end only on
+macOS. It now asks `runtime_front_text_input` there too, which in the app shows an Android dialog (the game's prompt, a
+text field with its initial text and length limit, OK) made over JNI on the UI thread; the app has no Java code, so a
+timer on the UI thread's looper notices the dialog closing and reads the field. In landscape the keyboard takes the
+screen with its own field; Done puts it away and shows OK (pinned below the dialog instead, it hid the dialog). Checked
+with the keyboard self-test (`kbtest` in the input file): text typed with `input text`, Done, a tap on OK; the game's
+side got `result 0, text "Arven"`. The command-line build answers from `SCARLET_TEXT` as before.
+
+**Away from the app the game pauses.** Without a window the vsync ticks stop and the backend's presents wait
+(`nvn_vk_present_hook`); the vsync ticks alone did not stop Scarlet. Home, 30 s away: no frames, the process at 11 %
+CPU instead of 96 to 169 %; back: the window and swapchain are remade and the frames go on.
+
+**Test switches in the app.** The input file, input script, auto-load and thread dumps started from constructors that
+read the environment when the library loads, before the app reads `env.txt`, so in the app they never started.
+`RUNTIME_ENV_START` (`runtime.h`) keeps them constructors in the programs and makes them functions the app calls after
+`env.txt`.
+
+**Setup.** `android/tools/install_data.sh` copies the game data, fonts, the Android rewrite and (once) the Mac's save
+into the app's folder as the app's user; `android/README.md` describes building, installing, the data folder, the
+controls and the two ways to get shaders.

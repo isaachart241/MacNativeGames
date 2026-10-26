@@ -723,7 +723,7 @@ static void dump_threads(unsigned secs) {
     }
 }
 void runtime_dump_threads(void) { dump_threads(0); }   // TOTK_INPUT_FILE "threads"
-__attribute__((constructor)) static void dump_init(void) {
+RUNTIME_ENV_START(runtime_env_thread_dumps) {
     const char *c = getenv("TOTK_LISTCHECK");
     if (c) { pthread_t th; pthread_create(&th, NULL, list_check, (void *)(uintptr_t)strtoull(c, NULL, 0)); pthread_detach(th); }
     const char *e = getenv("TOTK_DUMP_AFTER"); if (!e) return;
