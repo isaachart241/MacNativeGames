@@ -2,8 +2,10 @@
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
+#ifdef __APPLE__   /* Android (Thor port): no system font here; lines outside the 5x7 font are cut to what it can draw */
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreText/CoreText.h>
+#endif
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -81,6 +83,7 @@ static void draw_text(uint8_t *out, int stride, const char *text, int n, int sca
 /* A line with characters the 5x7 font does not have (Chinese labels, user 2026-10-17: "MetalFX已开启", "新着色器 N / 总计 M")
    in the system font (CoreText), with the same box height, padding and colours as the pixel font at this scale; the
    scale drops until the line fits the texture. */
+#ifdef __APPLE__
 static void raster_line_ct(const char *text, int highlight, int scale, uint8_t *out, int tex_w, int tex_h, int *box_w, int *box_h) {
     memset(out, 0, (size_t)tex_w * tex_h * 4);
     *box_w = *box_h = 0;
@@ -120,6 +123,8 @@ static void raster_line_ct(const char *text, int highlight, int scale, uint8_t *
     CGColorRelease(color); CGColorSpaceRelease(cs); CFRelease(str);
 }
 
+#endif
+
 /* The 5x7 font has only the letters the original labels use: any other character (Chinese, or English words such as
    "New shaders ... / total ...") sends the whole line to the system font instead of drawing blanks. */
 int fps_overlay_line_pixel_font(const char *s) {
@@ -128,7 +133,9 @@ int fps_overlay_line_pixel_font(const char *s) {
 }
 
 void fps_overlay_raster_line_tex(const char *text, int highlight, int scale, uint8_t *out, int tex_w, int tex_h, int *box_w, int *box_h) {
+#ifdef __APPLE__
     if (!fps_overlay_line_pixel_font(text)) { raster_line_ct(text, highlight, scale, out, tex_w, tex_h, box_w, box_h); return; }
+#endif
     int n = (int)strnlen(text, MAX_CHARS);
     if (scale < 1) scale = 1;
     if (scale > FPS_OVERLAY_MAX_SCALE) scale = FPS_OVERLAY_MAX_SCALE;
@@ -162,7 +169,11 @@ void fps_overlay_text(const fps_overlay_info *info, char *text, size_t n) {
 void fps_overlay_raster(const fps_overlay_info *info, int scale, uint8_t *out, int *box_w, int *box_h) {
     char text[MAX_CHARS + 1];
     fps_overlay_text(info, text, sizeof text);
+#ifdef __APPLE__
     raster_line_ct(text, 0, scale, out, FPS_OVERLAY_TEX_W, FPS_OVERLAY_TEX_H, box_w, box_h);
+#else
+    fps_overlay_raster_line(text, 0, scale, out, box_w, box_h);
+#endif
 }
 
 int hud_compact(void) {

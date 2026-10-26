@@ -6,7 +6,11 @@
    SCARLET_AUDIO=0 keeps the silent real-time sink (each buffer held for its duration) for tests without a sound device. */
 #include "runtime.h"
 #include "ipc.h"
+#ifdef __APPLE__
 #include <AudioToolbox/AudioToolbox.h>
+#else
+typedef void *AudioQueueRef;   /* Android (Thor port): the silent real-time sink until the AAudio output (app stage) */
+#endif
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,12 +42,14 @@ static void release_head(AudioOut *o) {
     if (o->nreleased < QUEUE_MAX) o->released[o->nreleased++] = head.tag;
     o->played_samples += head.bytes / (2ull * o->channels);
 }
+#ifdef __APPLE__
 static void played(void *user, AudioQueueRef q, AudioQueueBufferRef b) {   /* Core Audio thread */
     AudioOut *o = user;
     pthread_mutex_lock(&o->lock); release_head(o); pthread_mutex_unlock(&o->lock);
     AudioQueueFreeBuffer(q, b);
     runtime_event_signal(o->event);
 }
+#endif
 static void *silent_playback(void *arg) {
     AudioOut *o = arg; uint64_t due = 0;
     for (;;) {
@@ -61,6 +67,7 @@ static void *silent_playback(void *arg) {
 static void open_device(AudioOut *o) {
     const char *e = getenv("SCARLET_AUDIO");
     o->silent = e && !strcmp(e, "0");
+#ifdef __APPLE__
     if (!o->silent) {
         AudioStreamBasicDescription f = {.mSampleRate = o->rate, .mFormatID = kAudioFormatLinearPCM,
             .mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked, .mBytesPerPacket = 4, .mFramesPerPacket = 1,
@@ -68,6 +75,9 @@ static void open_device(AudioOut *o) {
         OSStatus s = AudioQueueNewOutput(&f, played, o, NULL, kCFRunLoopCommonModes, 0, &o->aq);
         if (s) { fprintf(stderr, "[totk-audio] AudioOut: no Core Audio output (%d); continuing silent\n", (int)s); o->silent = 1; }
     }
+#else
+    o->silent = 1; (void)e;
+#endif
     if (o->silent) need(pthread_create(&o->thread, NULL, silent_playback, o) == 0, "AudioOut playback thread");
 }
 /* Interleaved PCM16 of the client's layout -> stereo PCM16 (the queue's format). */
@@ -98,6 +108,7 @@ static void append(AudioOut *o, const IpcRequest *rq) {
     o->queue[o->nqueue++] = (Queued){tag, d.data_size};
     pthread_mutex_unlock(&o->lock);
     if (o->silent) return;
+#ifdef __APPLE__
     uint64_t frames = d.data_size / (2ull * o->channels);
     AudioQueueBufferRef qb;
     need(AudioQueueAllocateBuffer(o->aq, (UInt32)(frames * 4 ? frames * 4 : 4), &qb) == 0, "AudioOut queue buffer");
@@ -112,6 +123,7 @@ static void append(AudioOut *o, const IpcRequest *rq) {
     }
     if (!frames) { memset(qb->mAudioData, 0, 4); qb->mAudioDataByteSize = 4; }   /* an empty buffer still has to come back */
     need(AudioQueueEnqueueBuffer(o->aq, qb, 0, NULL) == 0, "AudioOut enqueue");
+#endif
 }
 static void released(AudioOut *o, const IpcRequest *rq, IpcResponse *rs) {
     int pointer; const IpcBuffer *b = out_buffer(rq, &pointer); need(b != NULL, "GetReleasedAudioOutBuffers buffer");
@@ -126,7 +138,9 @@ static void released(AudioOut *o, const IpcRequest *rq, IpcResponse *rs) {
 }
 static void set_state(AudioOut *o, uint32_t state) {
     pthread_mutex_lock(&o->lock); o->state = state; pthread_mutex_unlock(&o->lock);
+#ifdef __APPLE__
     if (o->aq) { if (state == STATE_STARTED) AudioQueueStart(o->aq, NULL); else AudioQueuePause(o->aq); }
+#endif
 }
 static void audio_out_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     AudioOut *o = s->state;
@@ -150,11 +164,17 @@ static void audio_out_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *
         pthread_mutex_lock(&o->lock); uint8_t any = o->nqueue != 0;
         while (o->nqueue) release_head(o);
         pthread_mutex_unlock(&o->lock);
+#ifdef __APPLE__
         if (o->aq) AudioQueueReset(o->aq);   /* its callbacks then find nothing left to release */
+#endif
         if (any) runtime_event_signal(o->event);
         IPC_OUT(rs, any); return;
     }
-    case 12: o->volume = IPC_ARG(rq, float, 0); if (o->aq) AudioQueueSetParameter(o->aq, kAudioQueueParam_Volume, o->volume); return;   /* SetAudioOutVolume */
+    case 12: o->volume = IPC_ARG(rq, float, 0);
+#ifdef __APPLE__
+        if (o->aq) AudioQueueSetParameter(o->aq, kAudioQueueParam_Volume, o->volume);
+#endif
+        return;   /* SetAudioOutVolume */
     case 13: { float v = o->volume; IPC_OUT(rs, v); return; }                                   /* GetAudioOutVolume */
     default: ipc_unimplemented(s, rq);
     }
@@ -162,7 +182,9 @@ static void audio_out_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *
 static void audio_out_close(void *p) {
     AudioOut *o = p;
     pthread_mutex_lock(&o->lock); o->running = 0; pthread_mutex_unlock(&o->lock);
+#ifdef __APPLE__
     if (o->aq) AudioQueueDispose(o->aq, true);
+#endif
     if (o->silent) pthread_join(o->thread, NULL);
     pthread_mutex_destroy(&o->lock); free(o);
 }

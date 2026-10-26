@@ -156,6 +156,16 @@ static int busiest_thread(double wall_us, char name[32]) {
 
 /* Ticks (user + system + nice, total) per CPU; returns the CPU count, 0 on failure. */
 static int cpu_ticks(uint64_t busy[SYSLOAD_MAX_CORES], uint64_t total[SYSLOAD_MAX_CORES]) {
+#ifdef __ANDROID__   /* Thor port: /proc/stat (readable from adb shell; an app process may be refused, then 0 as on failure) */
+    FILE *f = fopen("/proc/stat", "re"); char line[256]; int nc = 0;
+    while (f && fgets(line, sizeof line, f) && nc < SYSLOAD_MAX_CORES) {
+        unsigned cpu; unsigned long long u, ni, sy, id;
+        if (sscanf(line, "cpu%u %llu %llu %llu %llu", &cpu, &u, &ni, &sy, &id) != 5 || cpu >= SYSLOAD_MAX_CORES) continue;
+        busy[cpu] = u + ni + sy; total[cpu] = busy[cpu] + id; if ((int)cpu + 1 > nc) nc = (int)cpu + 1;
+    }
+    if (f) fclose(f);
+    return nc;
+#else
     static host_t host; if (!host) host = mach_host_self();
     natural_t n = 0; processor_info_array_t info = NULL; mach_msg_type_number_t cnt = 0;
     if (host_processor_info(host, PROCESSOR_CPU_LOAD_INFO, &n, &info, &cnt) != KERN_SUCCESS || !info) return 0;
@@ -167,6 +177,7 @@ static int cpu_ticks(uint64_t busy[SYSLOAD_MAX_CORES], uint64_t total[SYSLOAD_MA
     }
     vm_deallocate(mach_task_self(), (vm_address_t)info, cnt * sizeof(integer_t));
     return nc;
+#endif
 }
 
 static void *sampler(void *arg) {

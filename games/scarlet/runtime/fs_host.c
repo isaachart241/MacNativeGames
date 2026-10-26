@@ -39,6 +39,14 @@ typedef struct { int kind; char name[32]; char root[1024]; } Mount;
 typedef struct { int fd, mode, save; } File;   /* save: on a save-data mount (counts for runtime_fs_save_busy) */
 /* A RomFS directory is a snapshot of its children taken at open (rom != NULL; dir stays NULL). */
 struct RomEntry; typedef struct { DIR *dir; char path[1024]; int mode; struct RomEntry *rom; int64_t nrom, pos; } Dir;
+/* A flush that reaches the storage: F_FULLFSYNC on Apple (fsync alone may stop at the drive cache), fsync on Android. */
+static void full_fsync(int fd) {
+#ifdef __APPLE__
+    fcntl(fd, F_FULLFSYNC);
+#else
+    fsync(fd);
+#endif
+}
 static Mount mounts[16];
 static File files[NFILES];
 static Dir dirs[NDIRS];
@@ -187,7 +195,7 @@ static unsigned commit(const char *name) {
     for (int i = 0; i < 16; i++) if (mounts[i].kind && !strcmp(mounts[i].name, name)) { found = 1; save = mounts[i].kind == M_SAVE; }
     pthread_mutex_unlock(&lock);
     if (!found) return R_PATH_NOT_FOUND;
-    for (int i = 0; i < NFILES; i++) { pthread_mutex_lock(&lock); int fd = files[i].fd; pthread_mutex_unlock(&lock); if (fd > 0) fcntl(fd, F_FULLFSYNC); }
+    for (int i = 0; i < NFILES; i++) { pthread_mutex_lock(&lock); int fd = files[i].fd; pthread_mutex_unlock(&lock); if (fd > 0) full_fsync(fd); }
     if (save && !(getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 23)) atomic_store(&save_dirty, 0);   /* 23: probe-save's negative control */
     return 0;
 }
@@ -245,7 +253,7 @@ static unsigned write_file(uint64_t h, int64_t offset, const void *buffer, uint6
         if (delay_ms > 0) usleep((useconds_t)delay_ms * 1000);   /* tests only: slow saves down so a window close lands in the middle of one */
     }
     while (done < size) { ssize_t n = pwrite(fd, (const uint8_t *)buffer + done, (size_t)(size - done), offset + (off_t)done); if (n <= 0) runtime_fail("host save write failure"); done += (uint64_t)n; }
-    if (option && (*option & 1)) fcntl(fd, F_FULLFSYNC);
+    if (option && (*option & 1)) full_fsync(fd);
     return 0;
 }
 static unsigned file_size(int64_t *out, uint64_t h) {
@@ -259,7 +267,7 @@ static unsigned set_file_size(uint64_t h, int64_t size) {
     if (files[h - FILE_BASE].save) save_touched();
     return ftruncate(fd, size) ? errno_result() : 0;
 }
-static unsigned flush_file(uint64_t h) { int fd; if (!file_of(h, &fd, NULL)) return R_INVALID_ARGUMENT; fcntl(fd, F_FULLFSYNC); return 0; }
+static unsigned flush_file(uint64_t h) { int fd; if (!file_of(h, &fd, NULL)) return R_INVALID_ARGUMENT; full_fsync(fd); return 0; }
 static void close_file(uint64_t h) {
     if (runtime_romfs_handle(h)) { runtime_romfs_close(h); return; }
     if (!file_of(h, NULL, NULL)) runtime_fail("close invalid file handle");

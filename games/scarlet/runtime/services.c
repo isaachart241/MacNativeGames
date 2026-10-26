@@ -6,7 +6,11 @@
 #include <mach/mach.h>
 #include "mach_vm_compat.h"
 #include <stdio.h>
+#ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
+#else
+#include <sys/system_properties.h>
+#endif
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <ctype.h>
@@ -265,11 +269,18 @@ uint64_t runtime_desired_language(void) {
     if(k==2&&isalpha((unsigned char)p[0])&&isalpha((unsigned char)p[1])){region[0]=(char)toupper((unsigned char)p[0]);region[1]=(char)toupper((unsigned char)p[1]);}
     p+=k;}
   } else {
+#ifndef __APPLE__
+   /* Android (Thor port): the system locale, e.g. "en-US", from persist.sys.locale (ro.product.locale before it is set) */
+   char tag2[PROP_VALUE_MAX]="";if(__system_property_get("persist.sys.locale",tag2)<=0)__system_property_get("ro.product.locale",tag2);
+   size_t n=strcspn(tag2,"-_");if(n<sizeof(language))memcpy(language,tag2,n);
+   const char *rg=tag2+n;rg+=strspn(rg,"-_");if(strlen(rg)>=2&&isalpha((unsigned char)rg[0])&&isalpha((unsigned char)rg[1])){region[0]=(char)toupper((unsigned char)rg[0]);region[1]=(char)toupper((unsigned char)rg[1]);}
+#else
    CFLocaleRef locale=CFLocaleCopyCurrent();
    CFStringRef value=CFLocaleGetValue(locale,kCFLocaleLanguageCode);
    if(value)CFStringGetCString(value,language,sizeof(language),kCFStringEncodingUTF8);
    value=CFLocaleGetValue(locale,kCFLocaleCountryCode);
    if(value)CFStringGetCString(value,region,sizeof(region),kCFStringEncodingUTF8);CFRelease(locale);
+#endif
   }
 #ifdef TOTK_GAME_V143
   const char *portuguese=!strcmp(region,"BR")?"pt-BR":"pt";

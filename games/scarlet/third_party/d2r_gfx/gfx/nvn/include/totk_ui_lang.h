@@ -2,7 +2,11 @@
    Mac's language is Chinese, English otherwise. TOTK_UI_LANG=zh or en overrides it (read on every call, so tests can
    switch). The game's own language is chosen separately (TOTK_LANG, services.c desired_language). */
 #pragma once
+#ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
+#else
+#include <sys/system_properties.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -12,10 +16,16 @@ static inline int totk_ui_zh(void) {
     static int system_zh = -1;
     if (system_zh < 0) {
         char language[16] = {0};
+#ifdef __APPLE__
         CFLocaleRef locale = CFLocaleCopyCurrent();
         CFStringRef value = CFLocaleGetValue(locale, kCFLocaleLanguageCode);
         if (value) CFStringGetCString(value, language, sizeof language, kCFStringEncodingUTF8);
         CFRelease(locale);
+#else
+        char tag[PROP_VALUE_MAX] = "";   /* Android (Thor port): "zh-CN", "en-US", ... */
+        if (__system_property_get("persist.sys.locale", tag) <= 0) __system_property_get("ro.product.locale", tag);
+        memcpy(language, tag, strcspn(tag, "-_") < sizeof language - 1 ? strcspn(tag, "-_") : sizeof language - 1);
+#endif
         system_zh = !strcmp(language, "zh");
     }
     return system_zh;

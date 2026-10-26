@@ -49,6 +49,10 @@ def main():
         'romfs': {'size': romfs['romfs_size'], 'sha256': romfs['romfs_sha256'], 'files': len(romfs['files'])},
     }
     assert set(pin['rewritten_sha256']) == {'main.patched.bin', 'sdk.patched.bin', 'subsdk0.patched.bin'}
+    android = a.work / 'rewritten' / (folder + '-android')   # the Thor port's rewrite (DM_TARGET=android; structck / equiv first)
+    if android.is_dir():
+        pin['rewritten_sha256_android'] = {p.name: sha(p) for p in sorted(android.glob('*.patched.bin'))}
+        assert set(pin['rewritten_sha256_android']) == set(pin['rewritten_sha256'])
     out = HERE / f'assets/expected-v{a.version}.json'
     if out.exists():   # entries verified by hand (prepare_runtime.py module_table) are kept, never regenerated
         for key in ('relative_beyond_image', 'relative_beyond_image_reason'):

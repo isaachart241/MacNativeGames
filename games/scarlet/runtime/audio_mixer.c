@@ -13,7 +13,9 @@
 #include "audio_mixer.h"
 #include "audio_reverb.h"
 #include "audio_effects.h"
+#ifdef __APPLE__
 #include <AudioToolbox/AudioToolbox.h>
+#endif
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -36,7 +38,10 @@ typedef struct Mixer {
     float *buf; int nbuf, frame;
     int *offset;                                   /* first mix buffer of each mix id */
     SplitInfo *split; int nsplit; SplitDest *dest; int ndest;
-    AudioComponentInstance unit; int unit_ok;
+#ifdef __APPLE__
+    AudioComponentInstance unit;
+#endif
+    int unit_ok;
     float ring[RING_FRAMES * 2]; _Atomic uint64_t wr, rd, underruns, overruns;
     _Atomic int playing; int ready; _Atomic uint64_t missing_frames;
     _Atomic uint64_t flush_until; _Atomic unsigned stop_epoch; unsigned callback_epoch;
@@ -106,6 +111,7 @@ static int prefill_blocks(void) {   // read once before the device starts (audio
     }
     return blocks;
 }
+#ifdef __APPLE__
 static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
     (void)flags; (void)ts; (void)bus;
     Mixer *m = ctx; float *out = io->mBuffers[0].mData;
@@ -149,6 +155,10 @@ static void output_open(Mixer *m, int rate) {
     }
     m->unit_ok = 1; fprintf(stderr, "[totk-audio] CoreAudio output %d Hz stereo\n", rate);
 }
+#else
+/* Android (Thor port): no output device yet (AAudio comes with the app stage); the mixer runs and paces as without a device */
+static void output_open(Mixer *m, int rate) { (void)m; (void)rate; fprintf(stderr, "[totk-audio] Android: audio renderer output not connected yet: mixing without sound\n"); }
+#endif
 static void output_push(Mixer *m, const float *lr, int frames) {
     uint64_t wr = atomic_load(&m->wr), rd = atomic_load_explicit(&m->rd, memory_order_acquire);
     if (m->unit_ok && wr + (uint64_t)frames - rd > RING_FRAMES) { atomic_fetch_add(&m->overruns, 1); return; }   /* device stalled: drop this frame */
@@ -198,7 +208,9 @@ void audio_mixer_set_running(AudioRenderer *r,int running){
 }
 void audio_mixer_close(AudioRenderer *r) {
     Mixer *m = r->mixer; if (!m) return;
+#ifdef __APPLE__
     if (m->unit_ok) { AudioOutputUnitStop(m->unit); AudioUnitUninitialize(m->unit); AudioComponentInstanceDispose(m->unit); }
+#endif
     if(m->capture_worker){
         pthread_mutex_lock(&m->capture_lock);m->capture_closing=1;pthread_cond_signal(&m->capture_cond);pthread_mutex_unlock(&m->capture_lock);
         pthread_join(m->capture_thread,NULL);pthread_cond_destroy(&m->capture_cond);pthread_mutex_destroy(&m->capture_lock);free(m->capture_buf);

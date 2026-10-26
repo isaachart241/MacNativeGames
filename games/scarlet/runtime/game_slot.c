@@ -238,7 +238,11 @@ static void holder_write(void) {
     char exe[PROC_PIDPATHINFO_MAXSIZE] = "", cwd[PATH_MAX] = "", log[PATH_MAX] = "", text[4096];
     proc_pidpath(getpid(), exe, sizeof exe);
     if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0;
+#ifdef __APPLE__
     if (fcntl(2, F_GETPATH, log) == -1) log[0] = 0;
+#else
+    { ssize_t k = readlink("/proc/self/fd/2", log, sizeof log - 1); log[k > 0 ? k : 0] = 0; }   /* Android (Thor port) */
+#endif
     const char *w = getenv("TOTK_SLOT_WRAPPER_PID"), *ex = getenv("TOTK_SLOT_EXPECT_S"), *si = getenv("TOTK_SLOT_SINCE");
     snprintf(text, sizeof text,
              "owner=%s\npurpose=%s\ntoken=%s\ngame_pid=%d\ngame_start=%llu\nwrapper_pid=%s\nsince=%lld\nexpect_s=%s\nmode=%s\nexe=%s\ncwd=%s\nlog=%s\n",

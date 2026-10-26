@@ -18,6 +18,7 @@ sys.path.insert(0, str(HERE / 'third_party/d2r'))   # Bayonetta 3's own copy of 
 from relr import decode_relr
 
 VERSION = 'v400'
+REWRITE, PIN = VERSION, 'rewritten_sha256'   # --target android: the Thor port's rewrite (rewritten/v400-android)
 EXPECTED = json.loads((HERE / 'assets/expected-v4.0.0.json').read_text())
 
 
@@ -26,13 +27,13 @@ def sha(path):
 
 
 def module_table(work, name):
-    path = work / f'rewritten/{VERSION}/{name}.patched.bin'
+    path = work / f'rewritten/{REWRITE}/{name}.patched.bin'
     image = path.read_bytes()
     digest = hashlib.sha256(image).hexdigest()
-    assert digest == EXPECTED['rewritten_sha256'][f'{name}.patched.bin'], f'Unverified rewrite: {name}'
+    assert digest == EXPECTED[PIN][f'{name}.patched.bin'], f'Unverified rewrite: {name}'
     assert sha(work / f'extracted/{VERSION}/exefs/{name}') == EXPECTED['exefs_sha256'][name], f'Unverified ExeFS: {name}'
     layout = {}
-    for line in (work / f'rewritten/{VERSION}/{name}.fixups.tsv').read_text().splitlines():
+    for line in (work / f'rewritten/{REWRITE}/{name}.fixups.tsv').read_text().splitlines():
         _, key, value = line.split()
         layout[key] = int(value, 0)
     mod0 = struct.unpack_from('<I', image, 4)[0]
@@ -80,7 +81,7 @@ def module_table(work, name):
     pinned = EXPECTED.get('relative_beyond_image', {}).get(name, [])
     assert beyond == pinned, f'{name}: relative relocations outside the image {beyond}, pinned {pinned}'
     gates = []
-    for line in (work / f'rewritten/{VERSION}/{name}.gates.tsv').read_text().splitlines():
+    for line in (work / f'rewritten/{REWRITE}/{name}.gates.tsv').read_text().splitlines():
         ret, kind, arg, original = line.split()
         assert kind in ['cntpct', 'cntvct', 'svc']
         gates.append(dict(ret=int(ret, 0), timer=kind != 'svc', arg=int(arg), original=int(original, 0)))
@@ -115,7 +116,7 @@ def runtime_tables(work, out):
     main = modules[0]
     target = '_ZN2nn2os13GetSystemTickEv'
     slot = next(r['where'] for r in main['relocs'] if main['symbols'][r['symbol']]['name'] == target and r['kind'] == 1026)
-    image = (work / f'rewritten/{VERSION}/main.patched.bin').read_bytes()
+    image = (work / f'rewritten/{REWRITE}/main.patched.bin').read_bytes()
     plt = []
     for address in range(main['layout']['TEXT_END'] - 0x10000, main['layout']['TEXT_END'] - 12, 4):
         a, b, c, d = struct.unpack_from('<IIII', image, address)
@@ -185,7 +186,8 @@ def shared_fonts_config(work, out):
         for f in manifest['fonts']:
             path = folder / f"{f['type']}-{f['name']}.bfttf"
             assert path.stat().st_size == f['bfttf_bytes'] == f['font_bytes'] + 8
-            rows.append(f'{{"{path}",{f["bfttf_bytes"]}ULL,{f["font_bytes"]}ULL,"{f["sha256"]}"}}')
+            shown = path.relative_to(work) if REWRITE != VERSION else path   # Android: relative to the work folder on the device (the runtime's cwd)
+            rows.append(f'{{"{shown}",{f["bfttf_bytes"]}ULL,{f["font_bytes"]}ULL,"{f["sha256"]}"}}')
         state = 'loaded from ' + str(folder)
     (out / 'shared_fonts_config.h').write_text('#define SHARED_FONT_COUNT 6\n#define SHARED_FONT_ROWS ' + ','.join(rows) + '\n')
     return state
@@ -194,8 +196,11 @@ def shared_fonts_config(work, out):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--work', type=Path, default=HERE / 'SCARLET_build')
-    work = parser.parse_args().work.resolve()
-    out = work / 'build'
+    parser.add_argument('--target', choices=('apple', 'android'), default='apple', help='android: tables for the Thor port (build-android/)')
+    args = parser.parse_args(); work = args.work.resolve()
+    global REWRITE, PIN
+    if args.target == 'android': REWRITE, PIN = VERSION + '-android', 'rewritten_sha256_android'
+    out = work / ('build-android' if args.target == 'android' else 'build')
     out.mkdir(parents=True, exist_ok=True)
     print(json.dumps(dict(runtime=runtime_tables(work, out), romfs=romfs_config(work, out),
                           shared_fonts=shared_fonts_config(work, out))))

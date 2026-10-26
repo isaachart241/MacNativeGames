@@ -13,6 +13,9 @@ typedef struct {
  uint8_t *base; unsigned relative, symbolic, cross, weak;
 } Module;
 extern pthread_key_t runtime_keys[8];
+uint64_t runtime_slot_offset(unsigned i);   /* loader.c: thread slot i is at <thread pointer> + this */
+void runtime_slot_set(unsigned i, void *v);
+void *runtime_slot_get(unsigned i);
 _Noreturn void runtime_fail(const char *message);
 void *runtime_symbol(const char *name);
 void *runtime_override(const char *name);

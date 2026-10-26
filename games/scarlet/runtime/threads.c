@@ -707,6 +707,7 @@ static void dump_threads(unsigned secs) {
     }
     if (locked) pthread_mutex_unlock(&G);
     for (int i = 0; i < nrun; i++) { thr_t *t = run[i]; fprintf(stderr, "[totk-dump] live h=%#x\n", t->handle);
+#ifdef __APPLE__   /* sampling another thread's registers needs Mach thread control (not available on Android) */
             for (int k = 0; k < 3; k++) {
                 arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
                 thread_suspend(t->mport);
@@ -718,6 +719,7 @@ static void dump_threads(unsigned secs) {
                 dump_chain(arm_thread_state64_get_lr(st), arm_thread_state64_get_fp(st));
                 usleep(20000);
             }
+#endif
     }
 }
 void runtime_dump_threads(void) { dump_threads(0); }   // TOTK_INPUT_FILE "threads"

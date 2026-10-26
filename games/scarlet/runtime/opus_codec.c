@@ -4,7 +4,13 @@
    recorded value: none of the 280,723 packets in 1.4.3's English voice streams has it, while a fan dub's encoder
    writes 0 into every packet (all 186,758 of the PKG PT-BR dub, which decode without error). Those are not checked. */
 #include "runtime.h"
+#if __has_include(<opus.h>)
 #include <opus.h>
+#define OPUS_SILENT 0
+#else
+#include "opus_silent.h"   /* Android without libopus (Thor port): exact sample counts, silent output */
+#define OPUS_SILENT 1
+#endif
 #include <pthread.h>
 #include <limits.h>
 #include <stdio.h>
@@ -127,7 +133,7 @@ static unsigned decode(void *guest, size_t *consumed, int *samples, int16_t *out
     int got = opus_decode(d->dec, in + 8, (opus_int32)n, out, max, 0);
     if (got < 0) { fprintf(stderr, "[totk] opus_decode: %s\n", opus_strerror(got)); release(d); return R_INVALID; }
     opus_uint32 final = 0; opus_decoder_ctl(d->dec, OPUS_GET_FINAL_RANGE(&final));
-    if (n && range && final != range) { fprintf(stderr, "[totk] Opus final range %#x != stream %#x\n", final, range); runtime_fail("Opus stream integrity"); }
+    if (!OPUS_SILENT && n && range && final != range) { fprintf(stderr, "[totk] Opus final range %#x != stream %#x\n", final, range); runtime_fail("Opus stream integrity"); }
     *consumed = 8 + n; *samples = got; release(d); return 0;
 }
 
