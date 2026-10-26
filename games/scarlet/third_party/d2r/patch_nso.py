@@ -279,8 +279,15 @@ def STRX(t, n, imm12=0): return 0xF9000000 | (imm12 << 10) | (n << 5) | t
 # writes those offsets to the key page. Every emitted block keeps its length: only this one instruction differs.
 TARGET = os.environ.get('DM_TARGET', 'apple')
 assert TARGET in ('apple', 'android'), f'DM_TARGET must be apple or android, not {TARGET}'
-THREAD_REG = 1 if TARGET == 'android' else 0
+# THREAD_REG 2 (2026-10-26): the slots are no longer at a fixed offset from tpidr_el0 (static TLS works only in an
+# executable, not in a library an app loads) but in a per-thread block whose address Bionic's TLS_SLOT_APP holds (slot 2,
+# byte 16 of the thread pointer, offered to apps since Android 10): every thread-pointer read is followed by
+# ldr xt, [xt, #16]. Blocks grow by that one instruction; the key-page sequence after it is unchanged.
+THREAD_REG = 2 if TARGET == 'android' else 0
 def MRS_TPIDRRO(t): return (0xD53BD040 if THREAD_REG else 0xD53BD060) | t   # mrs xt, tpidr_el0 | mrs xt, tpidrro_el0
+def emit_tp(t):
+    emit(MRS_TPIDRRO(t))
+    if THREAD_REG == 2: emit(LDRX(t, t, 2))   # ldr xt, [xt, #16]: TLS_SLOT_APP
 def ADRP(dd, pc, target):
     imm = ((target & ~0xFFF) - (pc & ~0xFFF)) >> 12; assert -(1 << 20) <= imm < (1 << 20)
     return 0x90000000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7FFFF) << 5) | dd
@@ -340,7 +347,7 @@ def site_plain(ins):
     save = -16 if dlt == 0 else -112          # 改 sp 的指令会写到 sp 下方，暂存放到保留区深处 | Instructions that modify sp write below sp, so the scratch save is placed deep in the reserved area
     assert dlt == 0 or dlt >= -96, f'sp delta {dlt} at {ins.address:x}'
     start = here()
-    emit(STP(S, T, 31, save)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
+    emit(STP(S, T, 31, save)); emit_tp(T); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
     emit(subst(ins, S))
     emit(STRX(S, T))                 # 一律写回：capstone 会漏报写入（adds w18 实例） | Always write back: capstone can miss reporting a write (the adds w18 instance)
     emit(LDP(S, T, 31, save - dlt)); emit(B(here(), ins.address + 4))
@@ -353,7 +360,7 @@ def site_spset(ins):
     below the old sp and the old sp is kept in T, so they are restored from T after the instruction. x18 is only read; the slot is not written back."""
     S, T = pick(regs_in(ins))
     start = here()
-    emit(STP(S, T, 31, -16)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
+    emit(STP(S, T, 31, -16)); emit_tp(T); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
     emit(ADDI(T, 31, 0))             # mov xT, sp
     emit(subst(ins, S))
     emit(LDP(S, T, T, -16)); emit(B(here(), ins.address + 4))
@@ -364,7 +371,7 @@ def site_cond(ins):
     S, T = pick(regs_in(ins))
     tgt = ins.operands[-1].imm
     start = here()
-    emit(STP(S, T, 31, -16)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
+    emit(STP(S, T, 31, -16)); emit_tp(T); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
     m = ins.mnemonic
     taken = here() + 4 * 3
     off = (taken - here()) >> 2
@@ -380,7 +387,7 @@ def site_pcrel(ins):
     tgt = ins.operands[1].imm
     S, T = pick(set())
     start = here()
-    emit(STP(S, T, 31, -16)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18')   # S 先作键页偏移暂存，下一条再装目标值 | S first serves as a temporary for the key page offset; the next instruction then loads the target value
+    emit(STP(S, T, 31, -16)); emit_tp(T); emit_slot_addr(T, S, 'K18')   # S 先作键页偏移暂存，下一条再装目标值 | S first serves as a temporary for the key page offset; the next instruction then loads the target value
     pc = here(); emit(ADRP(S, pc, tgt))
     if ins.mnemonic == 'adr': emit(ADDI(S, S, tgt & 0xFFF))
     emit(STRX(S, T))
@@ -391,7 +398,7 @@ def site_br(ins, base, count):
     """跳转表 br x18：目标 = base + 4i。x16 暂存红区 → 等距落地垫 → 恢复 x16 → 原目标。 | Jump table br x18: target = base + 4i. Stash x16 in the red zone → equally spaced landing pads → restore x16 → original target."""
     start = here()
     emit(STUR(16, 31, -16)); emit(STUR(17, 31, -24))   # x16 / x17 是函数内可存活的临时寄存器，借用前存红区 | x16 / x17 are temporary registers that can stay live within a function; save them to the red zone before borrowing
-    emit(MRS_TPIDRRO(16)); emit_slot_addr(16, 17, 'K18'); emit(LDRX(16, 16)); emit(LDUR(17, 31, -24))
+    emit_tp(16); emit_slot_addr(16, 17, 'K18'); emit(LDRX(16, 16)); emit(LDUR(17, 31, -24))
     padbase = start + 4 * 24
     delta = padbase - base
     op = ADDI if delta >= 0 else SUBI; dl = abs(delta)
@@ -414,7 +421,7 @@ def site_sysreg_read(ins, kind):
     N = ins.bytes[0] & 31
     tmp = 16 if N != 16 else 17
     start = here()
-    emit(STUR(tmp, 31, -16)); emit(MRS_TPIDRRO(N)); emit_slot_addr(N, tmp, kind); emit(LDRX(N, N)); emit(LDUR(tmp, 31, -16))   # tmp 存红区借用 | tmp is saved by borrowing the red zone
+    emit(STUR(tmp, 31, -16)); emit_tp(N); emit_slot_addr(N, tmp, kind); emit(LDRX(N, N)); emit(LDUR(tmp, 31, -16))   # tmp 存红区借用 | tmp is saved by borrowing the red zone
     emit(B(here(), ins.address + 4))
     return start
 
@@ -424,7 +431,7 @@ def site_tpidr_write(ins):
     start = here()
     emit(0xF81F0000 | (31 << 5) | T)           # stur xT,[sp,#-16]
     tmp = next(x for x in (16, 17) if x not in (N, T))
-    emit(STUR(tmp, 31, -24)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, tmp, 'KTLS'); emit(STRX(N, T)); emit(LDUR(tmp, 31, -24))
+    emit(STUR(tmp, 31, -24)); emit_tp(T); emit_slot_addr(T, tmp, 'KTLS'); emit(STRX(N, T)); emit(LDUR(tmp, 31, -24))
     emit(0xF85F0000 | (31 << 5) | T)           # ldur xT,[sp,#-16]
     emit(B(here(), ins.address + 4))
     return start
@@ -438,7 +445,7 @@ def emit_gate_call():
         Fetching the slot through the key page needs a second register to be borrowed; x29 is borrowed and then immediately restored from the stack: the x29 saved by _dm_gate must be the guest's original value --
         the host identifies the caller by [x29+8] (skill binding observation gate 6, private aiming gate svc86), and the crash backtrace also walks the x29 chain
         (since r24 plan C it was borrowed and not returned, the x29 the host got was the slot offset from the key page, and skill icons fell back to placeholder text)."""
-    emit(MRS_TPIDRRO(30)); emit_slot_addr(30, 29, 'KGATE'); emit(LDRX(30, 30)); emit(LDRX(29, 31))
+    emit_tp(30); emit_slot_addr(30, 29, 'KGATE'); emit(LDRX(30, 30)); emit(LDRX(29, 31))
 
 def site_gate(ins, kind, arg):
     """svc / mrs cntpct_el0 → 宿主门。门地址取自线程槽 KGATE；门按返回点（本块 ldp 的地址）查 gates.tsv。 | svc / mrs cntpct_el0 → host gate. The gate address is taken from thread slot KGATE; the gate looks up gates.tsv by return point (the address of this block's ldp)."""
@@ -528,7 +535,7 @@ def site_window_group(segments):
     entries = {}; entry_branches = []
     for seg in segments:
         entries[seg[0].address] = here()
-        emit(STP(S, T, 31, -16)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
+        emit(STP(S, T, 31, -16)); emit_tp(T); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
         entry_branches.append((len(patch), seg[0].address)); emit(NOP)
     copied = {}; cursor = here()
     for seg in segments:
@@ -573,7 +580,7 @@ def site_window(seg):
     S, T = pick(used)
     lo, hi = seg[0].address, seg[-1].address + 4
     start = here()
-    emit(STP(S, T, 31, -16)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
+    emit(STP(S, T, 31, -16)); emit_tp(T); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
     copy0 = here(); n = len(seg)
     exits = copy0 + 4 * n
     # The copied body falls through to the first exit stub. That stub MUST be
@@ -1026,7 +1033,7 @@ for oa, wa, ob_, wb, r, key, why in params:
         assert r not in regs_in(ins), f'参数位中间用到 x{r}：{o:#x} {ins.mnemonic} {ins.op_str}'
     start = here()
     tmp = 16 if r != 16 else 17
-    emit(STUR(tmp, 31, -16)); emit(MRS_TPIDRRO(r)); emit_slot_addr(r, tmp, key); emit(LDRX(r, r)); emit(LDUR(tmp, 31, -16)); emit(B(here(), oa + 4))
+    emit(STUR(tmp, 31, -16)); emit_tp(r); emit_slot_addr(r, tmp, key); emit(LDRX(r, r)); emit(LDUR(tmp, 31, -16)); emit(B(here(), oa + 4))
     struct.pack_into('<I', IMG, oa, B(oa, start)); struct.pack_into('<I', IMG, ob_, NOP); stat('param')
 
 # 既有三块原生规则跳板均只使用后继覆盖的死临时w8，不改w0/stat返回、sp或NZCV。
@@ -1089,7 +1096,7 @@ elif os.path.exists(P('rules.tsv')):
 with open(P('fixups.tsv'), 'w') as f:
     f.write(f'# PATCH_OFF\t{PATCH_OFF:#x}\n# KEY_PAGE_OFF\t{KEY_PAGE_OFF:#x}\n# KEY_PAGE_SIZE\t0x4000\n# TEXT_END\t{TEXT_END:#x}\n# RO_OFF\t{RO_OFF:#x}\n# DATA_OFF\t{DATA_OFF:#x}\n')
     for k in KEY_INDEX: f.write(f'# KEY_{k}_IDX\t{KEY_INDEX[k]}\n')
-    if THREAD_REG: f.write(f'# THREAD_REG\t{THREAD_REG}\n')   # 1: thread slots are based on tpidr_el0 (DM_TARGET=android)
+    if THREAD_REG: f.write(f'# THREAD_REG\t{THREAD_REG}\n')   # 2: thread slots in the block TLS_SLOT_APP holds (DM_TARGET=android)
 with open(P('gates.tsv'), 'w') as f:
     for ret, k, arg, orig in gates: f.write(f'{ret:#x}\t{k}\t{arg}\t{orig:#x}\n')
 with open(P('sites.tsv'), 'w') as f:

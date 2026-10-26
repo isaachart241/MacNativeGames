@@ -24,15 +24,27 @@
 #include "game_version.h"
 #define NM (sizeof(modules)/sizeof(modules[0]))
 pthread_key_t runtime_keys[8];
-/* Thread slots the rewritten code reaches as <thread pointer> + runtime_slot_offset(i) (the offsets are written to each
-   module's key page). Apple: Darwin TSD keys, the thread pointer being tpidrro_el0. Android (Thor port): a local-exec
-   TLS array of this executable, whose offset from tpidr_el0 (Bionic's thread pointer) is the same in every thread. */
+/* Thread slots the rewritten code reaches as <slot base> + runtime_slot_offset(i) (the offsets are written to each
+   module's key page). Apple: Darwin TSD keys, the base being tpidrro_el0. Android (Thor port): a 64-byte block per guest
+   thread whose address Bionic's TLS_SLOT_APP holds (slot 2 of the thread pointer, offered to apps since Android 10);
+   the rewritten code reads it as mrs xN, tpidr_el0 / ldr xN, [xN, #16] (patch_nso.py DM_TARGET=android). Unlike a static
+   TLS array this also works in a library an app loads. */
 #ifdef __ANDROID__
-static __thread uint64_t guest_slots[8] __attribute__((tls_model("local-exec"), aligned(64)));
-static uintptr_t thread_pointer(void) { uintptr_t t; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(t)); return t; }
-uint64_t runtime_slot_offset(unsigned i) { return (uint64_t)((uintptr_t)&guest_slots[i] - thread_pointer()); }
-void runtime_slot_set(unsigned i, void *v) { guest_slots[i] = (uint64_t)(uintptr_t)v; }
-void *runtime_slot_get(unsigned i) { return (void *)(uintptr_t)guest_slots[i]; }
+_Noreturn void runtime_fail(const char *message);
+static void need_block(void *b) { if(!b) runtime_fail("thread slot block"); }
+#define TLS_SLOT_APP 2
+static uint64_t **app_slot(void) { uint64_t **tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp)); return tp + TLS_SLOT_APP; }
+static uint64_t *slot_block(int create) {
+ uint64_t **s=app_slot();
+ if(!*s&&create){uint64_t *b=aligned_alloc(64,64);need_block(b);memset(b,0,64);*s=b;}
+ return *s;
+}
+static uintptr_t thread_pointer(void) { return (uintptr_t)slot_block(1); }
+uint64_t runtime_slot_offset(unsigned i) { return (uint64_t)i * 8; }
+void runtime_slot_set(unsigned i, void *v) { uint64_t *b=slot_block(v!=NULL); if(b)b[i]=(uint64_t)(uintptr_t)v; }
+void *runtime_slot_get(unsigned i) { uint64_t *b=slot_block(0); return b?(void *)(uintptr_t)b[i]:NULL; }
+static void slot_block_free(void) { uint64_t **s=app_slot(); free(*s); *s=NULL; }
+static void *tp_slot_check(void) { return slot_block(0); }
 #else
 static uintptr_t thread_pointer(void) { uintptr_t t; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(t)); return t; }
 uint64_t runtime_slot_offset(unsigned i) { return (uint64_t)runtime_keys[i] * 8; }
@@ -310,12 +322,15 @@ void runtime_thread_init(void) {
  need((tp&7)==0,"unaligned thread pointer incompatible with patches");
  for(unsigned i=0;i<4;i++){void *raw;memcpy(&raw,(void *)(tp+runtime_slot_offset(i)),8);need(raw==runtime_slot_get(i),"thread slot layout");}
 #ifdef __ANDROID__
- {static uint64_t first;uint64_t off=runtime_slot_offset(0);if(!first)first=off;need(off==first&&off>=64,"thread slots not at one fixed offset from tpidr_el0 (static TLS)");}
+ {uint64_t **tp;__asm__ volatile("mrs %0, tpidr_el0":"=r"(tp));need(tp[TLS_SLOT_APP]==(uint64_t *)tp_slot_check(),"TLS_SLOT_APP does not hold this thread's slot block");}
 #endif
 }
 static void thread_cleanup(void) {
  ThreadEnvironment *e=pthread_getspecific(environment_key);pthread_setspecific(environment_key,NULL);
  for(unsigned i=0;i<4;i++)runtime_slot_set(i,NULL);environment_destroy(e);
+#ifdef __ANDROID__
+ slot_block_free();
+#endif
 }
 uint64_t runtime_now_ns(void) {mach_timebase_info_data_t tb;mach_timebase_info(&tb);return (uint64_t)((__uint128_t)mach_absolute_time()*tb.numer/tb.denom);}
 void runtime_dispatch(uint64_t ret,uint64_t *regs) {

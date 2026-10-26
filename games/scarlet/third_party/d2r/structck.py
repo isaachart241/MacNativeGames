@@ -40,7 +40,7 @@ out_dir, mod, nso = sys.argv[1:4]
 orig = nsoimg.load(nso)
 h = nsoimg.header(out_dir, mod)
 PO, TE = h['PATCH_OFF'], h['TEXT_END']
-TREG = h.get('THREAD_REG', 0)                 # 1: Android rewrite, thread slots based on tpidr_el0 instead of tpidrro_el0
+TREG = h.get('THREAD_REG', 0)                 # 1: Android rewrite, thread slots based on tpidr_el0 instead of tpidrro_el0; 2: the slot block in TLS_SLOT_APP ([tpidr_el0 + 16])
 TREG_NAME, TREG_WORD, TREG_KIND = ('tpidr_el0', 0xD53BD040, 'tpidr_r') if TREG else ('tpidrro_el0', 0xD53BD060, 'tpidrro_r')
 pat = open(f'{out_dir}/{mod}.patched.bin', 'rb').read()
 W = lambda b, o: struct.unpack_from('<I', b, o)[0]
@@ -244,9 +244,13 @@ KEY = {k[4:-4]: v for k, v in h.items() if k.startswith('KEY_') and k.endswith('
 from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
 _md = Cs(CS_ARCH_ARM64, CS_MODE_ARM); _md.detail = True
 def keyseq(at):
-    q = list(_md.disasm(pat[at:at + 20], at))
-    if len(q) < 5 or q[0].mnemonic != 'mrs' or q[0].op_str.split(', ')[-1] != TREG_NAME \
-            or q[1].mnemonic != 'adrp' or q[1].operands[1].imm != h['KEY_PAGE_OFF'] \
+    q = list(_md.disasm(pat[at:at + 24], at))
+    if len(q) < 5 or q[0].mnemonic != 'mrs' or q[0].op_str.split(', ')[-1] != TREG_NAME: return None
+    if TREG == 2:   # ldr xT, [xT, #16]: the slot block Bionic's TLS_SLOT_APP holds
+        t = q[0].operands[0].reg; m = q[1].operands[1].mem if len(q[1].operands) > 1 else None
+        if q[1].mnemonic != 'ldr' or q[1].operands[0].reg != t or not m or m.base != t or m.index or m.disp != 16 or q[1].writeback: return None
+        q = [q[0]] + q[2:]
+    if len(q) < 4 or q[1].mnemonic != 'adrp' or q[1].operands[1].imm != h['KEY_PAGE_OFF'] \
             or q[2].mnemonic != 'ldr' or q[2].operands[1].mem.base != q[1].operands[0].reg \
             or q[3].mnemonic != 'add' or q[3].operands[0].reg != q[0].operands[0].reg \
             or q[3].operands[1].reg != q[0].operands[0].reg:
@@ -255,7 +259,9 @@ def keyseq(at):
     return (q[3].address + 4, d // 8) if d % 8 == 0 and 0 <= d // 8 < 8 else None
 # C windows intentionally change the call word as well as the preceding head.
 # Inspect the actual decoded sequence, including the original link-producing PC.
+if TREG == 2 and calls: bad(f'call windows ({len(calls)}) are not checked for the TLS_SLOT_APP template')
 for prefix, call in calls.items():
+    if TREG == 2: break
     start = btarget(prefix)
     if start is None or not PO <= start < len(pat):
         bad(f'call preparation has no trampoline {prefix:#x}'); continue

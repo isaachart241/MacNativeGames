@@ -496,3 +496,27 @@ All on the Thor, offscreen, checked with screenshots in the house after Continue
 Checked: four consecutive screenshots (presents 3000 to 3450) show the character animating correctly in the house;
 the run held 30 fps (frame time median 33.3 ms, NVN replay about 8 ms a frame); no crash in the last two runs (one with
 170 variants translated during it).
+
+### 2026-10-26: Thor port: thread slots through TLS_SLOT_APP; sound through AAudio
+
+**Thread slots for an app.** The Android rewrite found its thread slots at a fixed offset from `tpidr_el0`, the
+executable's static TLS. A library an app loads cannot have that (the T0 probe: Bionic refuses initial-exec TLS in a
+`dlopen`ed library), so the APK stage could not have used it. As THOR_SCOPE.md decision 1 planned, the slots are now in a
+64-byte block per guest thread whose address Bionic's `TLS_SLOT_APP` holds (slot 2, offset 16 on arm64 in Android 13's
+`tls_defines.h`, "available for use by apps in Android Q and later"): every thread-pointer read the rewriter emits is
+followed by `ldr xN, [xN, #16]` (`patch_nso.py`, `# THREAD_REG 2`), and the gates' `LOAD_TP` does the same. `structck.py`
+and `equiv.py` know the template (the emulator's thread pointer points at a block whose slot 2 holds the slot page; the
+block and the slot must be unchanged after every patch block). Checked: the Apple rewrites of all three modules are
+byte-identical to the pinned ones; the Android rewrite passes the structural check and the equivalence check for sdk
+(13,993 sites), subsdk0 (10,541) and main (25,330) with 0 divergent sites; `expected-v4.0.0.json` pins the new Android
+hashes. On the Thor the game boots, continues the save and renders the house and the character as before; the Mac
+regression run reaches the house as before. The previous rewrite stays as `rewritten/v400-android-static`.
+
+**Sound.** Scarlet's Wwise mixes on its own and plays through AudioOut (`audout:u`), which on Android was a silent sink.
+`audio_out.c` now opens an AAudio stream per AudioOut: appended buffers go into a ring the stream's callback plays from,
+and a buffer is given back (and the buffer event signalled) once its last frame has played, so the game is paced by
+the real device as on the Mac. The audio renderer's mixer (`audio_mixer.c`) has an AAudio output too (Core Audio and
+AAudio now share its ring pull); Scarlet sends it silence. `SCARLET_AUDIO_MUTE=1` keeps the streams running but silent
+(tests at night). Checked on the Thor, muted: AudioOut level in the house rms 0.011 to 0.018 (the Mac's was 0.024),
+481,280 samples per 5 s (48 kHz stereo) with almost all of them nonzero, no stalls, 30 fps held. Music the game decodes
+with Opus stays silent until libopus is built for Android (`opus_silent.h`).

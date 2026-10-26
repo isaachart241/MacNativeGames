@@ -36,6 +36,7 @@ KEY_SLOT = {k: 300 + i for i, k in enumerate(sorted(KEY_IDX, key=KEY_IDX.get))}
 SLOT18, SLOTTLS, SLOTTLR = (KEY_SLOT[k] for k in ('K18', 'KTLS', 'KTLR'))
 KEY_PAGE_OFF = hdr['KEY_PAGE_OFF']
 TREG = hdr.get('THREAD_REG', 0)               # 1: Android rewrite, slots based on tpidr_el0 (tpidrro_el0 then reads as Linux leaves it: 0)
+TPB = TSD + 0x8000                             # TREG 2: the thread pointer; [TPB + 16] (TLS_SLOT_APP) holds TSD, the slot block
 pat = bytearray(open(f'{DIR}/{MOD}.patched.bin', 'rb').read())
 orig = nsoimg.load(A.nso)
 ncut = sum(1 for l in open(f'{DIR}/{MOD}.cuts.tsv') if not l.startswith('#'))
@@ -146,12 +147,13 @@ def state(u, st, patched):
     g = [u.reg_read(r) for r in GP]
     tp = u.reg_read(UC_ARM64_REG_TPIDR_EL0)
     if patched: g[18] = struct.unpack('<Q', u.mem_read(TSD + 8 * SLOT18, 8))[0]; tp = struct.unpack('<Q', u.mem_read(TSD + 8 * SLOTTLS, 8))[0]
-    if patched and TREG and u.reg_read(UC_ARM64_REG_TPIDR_EL0) != TSD: tp = ('tpidr_el0 changed by the patch block', u.reg_read(UC_ARM64_REG_TPIDR_EL0))   # the host's thread pointer must survive
+    if patched and TREG and u.reg_read(UC_ARM64_REG_TPIDR_EL0) != (TPB if TREG == 2 else TSD): tp = ('tpidr_el0 changed by the patch block', u.reg_read(UC_ARM64_REG_TPIDR_EL0))   # the host's thread pointer must survive
+    if patched and TREG == 2 and struct.unpack('<Q', u.mem_read(TPB + 16, 8))[0] != TSD: tp = ('TLS_SLOT_APP changed by the patch block',)
     g = g + [tp]
     # Only the runtime's actual TLS slots are private. A guest register-offset
     # store may legitimately land elsewhere in the mapped TSD page (v1.1.2
     # main+0x24dd68 did so in the fixed random corpus). Do not hide that write.
-    private_slots = {TSD + 8 * slot for slot in KEY_SLOT.values()}
+    private_slots = {TSD + 8 * slot for slot in KEY_SLOT.values()} | ({TPB + 16} if TREG == 2 else set())
     w = [x for x in st['w'] if not (patched and x[0] in private_slots and x[1] == 8)]
     return g, u.reg_read(UC_ARM64_REG_SP), u.reg_read(UC_ARM64_REG_NZCV), [u.reg_read(r) for r in VR], w, st['fault']
 
@@ -160,12 +162,13 @@ def run(u, st, start, patched, init):
     for r, v in zip(GP, init['g']): u.reg_write(r, v)
     for r, v in zip(VR, init['v']): u.reg_write(r, v)
     u.reg_write(UC_ARM64_REG_SP, SP0); u.reg_write(UC_ARM64_REG_NZCV, init['nzcv'])
-    u.reg_write(UC_ARM64_REG_TPIDR_EL0, TSD if patched and TREG else init['tls'])
+    u.reg_write(UC_ARM64_REG_TPIDR_EL0, (TPB if TREG == 2 else TSD) if patched and TREG else init['tls'])
     if not patched: u.reg_write(UC_ARM64_REG_TPIDRRO_EL0, init['tlr'])
     elif TREG: u.reg_write(UC_ARM64_REG_TPIDRRO_EL0, 0)
     if patched:
         for key, idx in KEY_IDX.items():
             u.mem_write(IB + KEY_PAGE_OFF + 8 * idx, struct.pack('<Q', KEY_SLOT[key] * 8))
+        if TREG == 2: u.mem_write(TPB + 16, struct.pack('<Q', TSD))
         u.mem_write(TSD + 8 * SLOT18, struct.pack('<Q', init['g'][18]))
         u.mem_write(TSD + 8 * SLOTTLS, struct.pack('<Q', init['tls']))
         u.mem_write(TSD + 8 * SLOTTLR, struct.pack('<Q', init['tlr']))

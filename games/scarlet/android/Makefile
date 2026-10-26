@@ -56,7 +56,7 @@ $(OUT)/obj/%.S.o: %.S $(HEADERS) android/Makefile
 	"$(CC)" -Iruntime -Ithird_party/d2r_gfx/gfx/nvn -I$(GEN) -c "$<" -o "$@"
 
 $(OUT)/scarlet-native: $(OBJECTS)
-	"$(CC)" $(OBJECTS) $(GFX_LIBS) -lm -ldl -llog -o "$@"
+	"$(CC)" $(OBJECTS) $(GFX_LIBS) -laaudio -lm -ldl -llog -o "$@"
 
 push: $(OUT)/scarlet-native
 	"$(ADB)" shell mkdir -p $(DEVICE_DIR)/logs

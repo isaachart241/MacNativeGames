@@ -3,13 +3,17 @@
    Each AudioOut is a Core Audio AudioQueue: an appended buffer's samples are copied and enqueued; when the device has
    played it, the queue's callback gives the buffer back (GetReleasedAudioOutBuffers) and signals the buffer event, so
    the game is paced by the real output. 5.1 output is mixed down to stereo (Switch order FL FR FC LFE BL BR).
-   SCARLET_AUDIO=0 keeps the silent real-time sink (each buffer held for its duration) for tests without a sound device. */
+   SCARLET_AUDIO=0 keeps the silent real-time sink (each buffer held for its duration) for tests without a sound device.
+   Android (Thor port): an AAudio stream per AudioOut; appended samples go to a ring the stream's callback plays from,
+   and a buffer is given back once its last frame has been played. SCARLET_AUDIO_MUTE=1 plays silence (tests). */
 #include "runtime.h"
 #include "ipc.h"
 #ifdef __APPLE__
 #include <AudioToolbox/AudioToolbox.h>
 #else
-typedef void *AudioQueueRef;   /* Android (Thor port): the silent real-time sink until the AAudio output (app stage) */
+#include <aaudio/AAudio.h>
+typedef void *AudioQueueRef;
+#define RING_FRAMES (1u << 17)   /* stereo PCM16 frames: more than QUEUE_MAX buffers of any size the game appends */
 #endif
 #include <pthread.h>
 #include <stdio.h>
@@ -29,6 +33,9 @@ typedef struct {
     Queued queue[QUEUE_MAX]; unsigned nqueue;          /* appended, not yet played (head first) */
     uint64_t released[QUEUE_MAX]; unsigned nreleased;  /* played, not yet collected by GetReleasedAudioOutBuffers */
     uint64_t played_samples;
+#ifndef __APPLE__
+    AAudioStream *stream; int16_t *ring; uint64_t wr, rd, head_played; int mute;   /* head_played: frames of queue[0] played */
+#endif
 } AudioOut;
 
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
@@ -48,6 +55,50 @@ static void played(void *user, AudioQueueRef q, AudioQueueBufferRef b) {   /* Co
     pthread_mutex_lock(&o->lock); release_head(o); pthread_mutex_unlock(&o->lock);
     AudioQueueFreeBuffer(q, b);
     runtime_event_signal(o->event);
+}
+#endif
+/* Scarlet: the level of what is queued, every 5 s (the renderer path has its own line; this is the AudioOut one) */
+static void level_meter(const int16_t *q, uint64_t samples) {
+    static double sum; static uint64_t n, nonzero, t0; static int peak;
+    for (uint64_t i = 0; i < samples; i++) { int v = q[i]; sum += (double)v * v; if (v) nonzero++; if (v < 0) v = -v; if (v > peak) peak = v; }
+    n += samples; uint64_t now = now_ns(); if (!t0) t0 = now;
+    if (now - t0 >= 5000000000ull) { fprintf(stderr, "[scarlet-audio] AudioOut level: rms %.4f peak %.4f over %.1f s, %llu samples, %llu nonzero\n",
+        n ? sqrt(sum / n) / 32768.0 : 0.0, peak / 32768.0, (now - t0) / 1e9, (unsigned long long)n, (unsigned long long)nonzero); sum = 0; n = nonzero = 0; peak = 0; t0 = now; }
+}
+#ifndef __APPLE__
+static void to_stereo(const int16_t *in, int16_t *out, uint64_t frames, uint32_t channels);
+static aaudio_data_callback_result_t aaudio_play(AAudioStream *st, void *user, void *data, int32_t want) {   /* AAudio thread */
+    (void)st; AudioOut *o = user; int16_t *out = data; int32_t done = 0, signal = 0;
+    pthread_mutex_lock(&o->lock);
+    if (o->state == STATE_STARTED) {
+        for (;;) {
+            while (o->nqueue && o->head_played >= o->queue[0].bytes / (2ull * o->channels)) { release_head(o); o->head_played = 0; signal = 1; }
+            if (!o->nqueue || done == want || o->rd == o->wr) break;
+            uint64_t left = o->queue[0].bytes / (2ull * o->channels) - o->head_played, k = (uint64_t)(want - done);
+            if (k > left) k = left; if (k > o->wr - o->rd) k = o->wr - o->rd;
+            for (uint64_t i = 0; i < k; i++) { uint64_t r = (o->rd + i) % RING_FRAMES; out[2 * (done + i)] = o->ring[2 * r]; out[2 * (done + i) + 1] = o->ring[2 * r + 1]; }
+            o->rd += k; o->head_played += k; done += (int32_t)k;
+        }
+    }
+    float vol = o->volume; int mute = o->mute;
+    pthread_mutex_unlock(&o->lock);
+    if (done < want) memset(out + 2 * done, 0, (size_t)(want - done) * 4);
+    if (mute) memset(out, 0, (size_t)want * 4);
+    else if (vol != 1.0f) for (int32_t i = 0; i < 2 * done; i++) { float v = out[i] * vol; out[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }
+    if (signal) runtime_event_signal(o->event);
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+static int aaudio_open(AudioOut *o) {
+    AAudioStreamBuilder *b; aaudio_result_t r = AAudio_createStreamBuilder(&b); if (r != AAUDIO_OK) return 0;
+    AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16); AAudioStreamBuilder_setChannelCount(b, 2); AAudioStreamBuilder_setSampleRate(b, (int32_t)o->rate);
+    AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY); AAudioStreamBuilder_setUsage(b, AAUDIO_USAGE_GAME);
+    AAudioStreamBuilder_setDataCallback(b, aaudio_play, o);
+    r = AAudioStreamBuilder_openStream(b, &o->stream); AAudioStreamBuilder_delete(b);
+    if (r != AAUDIO_OK) { fprintf(stderr, "[totk-audio] AudioOut: no AAudio output (%s); continuing silent\n", AAudio_convertResultToText(r)); o->stream = NULL; return 0; }
+    o->ring = calloc(RING_FRAMES, 4); if (!o->ring) runtime_fail("AudioOut ring");
+    if ((r = AAudioStream_requestStart(o->stream)) != AAUDIO_OK) { fprintf(stderr, "[totk-audio] AudioOut: AAudio start %s; continuing silent\n", AAudio_convertResultToText(r)); AAudioStream_close(o->stream); o->stream = NULL; return 0; }
+    fprintf(stderr, "[totk-audio] AudioOut: AAudio %d Hz stereo, burst %d frames%s\n", AAudioStream_getSampleRate(o->stream), AAudioStream_getFramesPerBurst(o->stream), o->mute ? " (SCARLET_AUDIO_MUTE: silent)" : "");
+    return 1;
 }
 #endif
 static void *silent_playback(void *arg) {
@@ -76,7 +127,8 @@ static void open_device(AudioOut *o) {
         if (s) { fprintf(stderr, "[totk-audio] AudioOut: no Core Audio output (%d); continuing silent\n", (int)s); o->silent = 1; }
     }
 #else
-    o->silent = 1; (void)e;
+    { const char *m = getenv("SCARLET_AUDIO_MUTE"); o->mute = m && atoi(m); }
+    if (!o->silent && !aaudio_open(o)) o->silent = 1;
 #endif
     if (o->silent) need(pthread_create(&o->thread, NULL, silent_playback, o) == 0, "AudioOut playback thread");
 }
@@ -106,6 +158,19 @@ static void append(AudioOut *o, const IpcRequest *rq) {
     pthread_mutex_lock(&o->lock);
     need(o->nqueue < QUEUE_MAX, "AudioOut queue full");
     o->queue[o->nqueue++] = (Queued){tag, d.data_size};
+#ifndef __APPLE__
+    if (!o->silent) {   /* the samples join the ring the AAudio callback plays */
+        uint64_t frames = d.data_size / (2ull * o->channels); int16_t tmp[2 * 1024];
+        const int16_t *src = ipc_guest(d.sample_buffer + d.data_offset, d.data_size);
+        for (uint64_t at = 0; at < frames; ) {
+            uint64_t k = frames - at < 1024 ? frames - at : 1024;
+            to_stereo(src + at * o->channels, tmp, k, o->channels); level_meter(tmp, 2 * k);
+            for (uint64_t i = 0; i < k; i++) { uint64_t w = (o->wr + i) % RING_FRAMES; o->ring[2 * w] = tmp[2 * i]; o->ring[2 * w + 1] = tmp[2 * i + 1]; }
+            o->wr += k; at += k;
+        }
+        need(o->wr - o->rd <= RING_FRAMES, "AudioOut ring overrun");
+    }
+#endif
     pthread_mutex_unlock(&o->lock);
     if (o->silent) return;
 #ifdef __APPLE__
@@ -114,13 +179,7 @@ static void append(AudioOut *o, const IpcRequest *rq) {
     need(AudioQueueAllocateBuffer(o->aq, (UInt32)(frames * 4 ? frames * 4 : 4), &qb) == 0, "AudioOut queue buffer");
     to_stereo(ipc_guest(d.sample_buffer + d.data_offset, d.data_size), qb->mAudioData, frames, o->channels);
     qb->mAudioDataByteSize = (UInt32)(frames * 4);
-    {   /* Scarlet: the level of what is queued, every 5 s (the renderer path has its own line; this is the AudioOut one) */
-        static double sum; static uint64_t n, nonzero, t0; static int peak; const int16_t *q = qb->mAudioData;
-        for (uint64_t i = 0; i < frames * 2; i++) { int v = q[i]; sum += (double)v * v; if (v) nonzero++; if (v < 0) v = -v; if (v > peak) peak = v; }
-        n += frames * 2; uint64_t now = now_ns(); if (!t0) t0 = now;
-        if (now - t0 >= 5000000000ull) { fprintf(stderr, "[scarlet-audio] AudioOut level: rms %.4f peak %.4f over %.1f s, %llu samples, %llu nonzero\n",
-            n ? sqrt(sum / n) / 32768.0 : 0.0, peak / 32768.0, (now - t0) / 1e9, (unsigned long long)n, (unsigned long long)nonzero); sum = 0; n = nonzero = 0; peak = 0; t0 = now; }
-    }
+    level_meter(qb->mAudioData, frames * 2);
     if (!frames) { memset(qb->mAudioData, 0, 4); qb->mAudioDataByteSize = 4; }   /* an empty buffer still has to come back */
     need(AudioQueueEnqueueBuffer(o->aq, qb, 0, NULL) == 0, "AudioOut enqueue");
 #endif
@@ -163,6 +222,9 @@ static void audio_out_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *
     case 11: {                                                                                  /* FlushAudioOutBuffers */
         pthread_mutex_lock(&o->lock); uint8_t any = o->nqueue != 0;
         while (o->nqueue) release_head(o);
+#ifndef __APPLE__
+        o->rd = o->wr; o->head_played = 0;
+#endif
         pthread_mutex_unlock(&o->lock);
 #ifdef __APPLE__
         if (o->aq) AudioQueueReset(o->aq);   /* its callbacks then find nothing left to release */
@@ -184,6 +246,9 @@ static void audio_out_close(void *p) {
     pthread_mutex_lock(&o->lock); o->running = 0; pthread_mutex_unlock(&o->lock);
 #ifdef __APPLE__
     if (o->aq) AudioQueueDispose(o->aq, true);
+#else
+    if (o->stream) { AAudioStream_requestStop(o->stream); AAudioStream_close(o->stream); }
+    free(o->ring);
 #endif
     if (o->silent) pthread_join(o->thread, NULL);
     pthread_mutex_destroy(&o->lock); free(o);
@@ -214,7 +279,11 @@ static void manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs
         write_name(rq, rs);
         uint32_t out[4] = {rate, channels, FORMAT_PCM16, STATE_STOPPED}; ipc_out(rs, out, sizeof out);
         rs->move[rs->nmove++] = runtime_ipc_new_session("IAudioOut", audio_out_handler, o, audio_out_close);
+#ifdef __APPLE__
         fprintf(stderr, "[totk-audio] AudioOut open %u Hz x%u PCM16 -> %s\n", rate, channels, o->silent ? "silent sink" : "Core Audio (stereo)");
+#else
+        fprintf(stderr, "[totk-audio] AudioOut open %u Hz x%u PCM16 -> %s\n", rate, channels, o->silent ? "silent sink" : "AAudio (stereo)");
+#endif
         return;
     }
     default: ipc_unimplemented(s, rq);

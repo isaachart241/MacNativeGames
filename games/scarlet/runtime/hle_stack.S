@@ -13,7 +13,7 @@
     .globl SYM(runtime_hle_switch)
     .p2align 2
 SYM(runtime_hle_switch):
-    mrs x9, TP_REG
+    LOAD_TP(x9)
     adrp x10, PAGE(SYM(runtime_hle_tsd_off))
     ldr x10, [x10, PAGEOFF(SYM(runtime_hle_tsd_off))]
     ldr x11, [x9, x10]
@@ -31,7 +31,7 @@ SYM(runtime_hle_switch):
     ldp x12, x11, [sp, #16]
     ldp x29, x30, [sp]
     mov sp, x12
-    mrs x9, TP_REG
+    LOAD_TP(x9)
     adrp x10, PAGE(SYM(runtime_hle_tsd_off))
     ldr x10, [x10, PAGEOFF(SYM(runtime_hle_tsd_off))]
     str x11, [x9, x10]

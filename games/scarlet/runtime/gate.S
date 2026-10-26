@@ -7,7 +7,7 @@ SYM(runtime_gate):
     // Switch to this thread's host stack first (see hle_stack.S): the guest stack only holds x16/x17.
     // Frame above the 800-byte register area: [sp+800] guest sp (points at saved x16/x17), [sp+808] host top or 0.
     stp x16, x17, [sp, #-16]!
-    mrs x16, TP_REG
+    LOAD_TP(x16)
     adrp x17, PAGE(SYM(runtime_hle_tsd_off))
     ldr x17, [x17, PAGEOFF(SYM(runtime_hle_tsd_off))]
     add x16, x16, x17
@@ -68,7 +68,7 @@ SYM(runtime_gate):
     bl SYM(runtime_dispatch)
     ldr x9, [sp, #808]          // give the host stack back to this thread
     cbz x9, 3f
-    mrs x10, TP_REG
+    LOAD_TP(x10)
     adrp x11, PAGE(SYM(runtime_hle_tsd_off))
     ldr x11, [x11, PAGEOFF(SYM(runtime_hle_tsd_off))]
     str x9, [x10, x11]

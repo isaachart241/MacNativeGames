@@ -17,6 +17,7 @@
 #include <AudioToolbox/AudioToolbox.h>
 #endif
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -111,30 +112,34 @@ static int prefill_blocks(void) {   // read once before the device starts (audio
     }
     return blocks;
 }
-#ifdef __APPLE__
-static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
-    (void)flags; (void)ts; (void)bus;
-    Mixer *m = ctx; float *out = io->mBuffers[0].mData;
+/* The device's pull: frames stereo float frames from the ring into out (Core Audio's render callback on Apple, AAudio's
+   data callback on Android). */
+static void ring_pull(Mixer *m, float *out, uint32_t frames) {
     atomic_fetch_add(&m->callback_frames,frames);
     unsigned epoch=atomic_load_explicit(&m->stop_epoch,memory_order_acquire);
     uint64_t rd = atomic_load(&m->rd), wr = atomic_load_explicit(&m->wr, memory_order_acquire), have = wr - rd;
     if(epoch!=m->callback_epoch){uint64_t until=atomic_load_explicit(&m->flush_until,memory_order_acquire);if(until>rd){rd=until<wr?until:wr;atomic_store_explicit(&m->rd,rd,memory_order_release);}have=wr-rd;m->callback_epoch=epoch;m->ready=0;}
     if(!atomic_load_explicit(&m->playing,memory_order_acquire)){
-        memset(out,0,(size_t)frames*2*sizeof(float));m->ready=0;atomic_store_explicit(&m->rd,wr,memory_order_release);return noErr;
+        memset(out,0,(size_t)frames*2*sizeof(float));m->ready=0;atomic_store_explicit(&m->rd,wr,memory_order_release);return;
     }
     if(!m->ready){
         /* prefill_blocks() 5-ms blocks (default four, 20 ms) of scheduling headroom for the producer.
            A real underrun still counts and requires a fresh prefill. */
         uint64_t prefill=(uint64_t)m->frame*(uint64_t)prefill_blocks();if(prefill<frames)prefill=frames;if(prefill>RING_FRAMES)prefill=RING_FRAMES;
-        if(have<prefill){memset(out,0,(size_t)frames*2*sizeof(float));return noErr;}
+        if(have<prefill){memset(out,0,(size_t)frames*2*sizeof(float));return;}
         m->ready=1;
     }
-    UInt32 n = frames < have ? frames : (UInt32)have;
+    uint32_t n = frames < have ? frames : (uint32_t)have;
     uint64_t nonzero=0;
-    for (UInt32 i = 0; i < n; i++) { uint64_t k = (rd + i) % RING_FRAMES; out[2 * i] = m->ring[2 * k]; out[2 * i + 1] = m->ring[2 * k + 1];if(out[2*i]!=0 || out[2*i+1]!=0)nonzero++; }
+    for (uint32_t i = 0; i < n; i++) { uint64_t k = (rd + i) % RING_FRAMES; out[2 * i] = m->ring[2 * k]; out[2 * i + 1] = m->ring[2 * k + 1];if(out[2*i]!=0 || out[2*i+1]!=0)nonzero++; }
     atomic_fetch_add(&m->callback_nonzero,nonzero);
     if (n < frames) { memset(out + 2 * n, 0, (frames - n) * 2 * sizeof(float));atomic_fetch_add(&m->underruns,1);atomic_fetch_add(&m->missing_frames,frames-n);m->ready=0; }
     atomic_store_explicit(&m->rd, rd + n, memory_order_release);
+}
+#ifdef __APPLE__
+static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
+    (void)flags; (void)ts; (void)bus;
+    ring_pull(ctx, io->mBuffers[0].mData, frames);
     return noErr;
 }
 static void output_open(Mixer *m, int rate) {
@@ -157,7 +162,44 @@ static void output_open(Mixer *m, int rate) {
 }
 #else
 /* Android (Thor port): no output device yet (AAudio comes with the app stage); the mixer runs and paces as without a device */
-static void output_open(Mixer *m, int rate) { (void)m; (void)rate; fprintf(stderr, "[totk-audio] Android: audio renderer output not connected yet: mixing without sound\n"); }
+/* Android (Thor port): AAudio, float stereo at the renderer's rate, pulled from the same ring as Core Audio.
+   TOTK_AUDIO_OFF: mixing without a device, as on the Mac. SCARLET_AUDIO_MUTE=1 (tests): the stream runs and is fed but
+   plays silence. A disconnected device (headphones unplugged) reopens the stream on the default one. */
+#include <aaudio/AAudio.h>
+static int g_audio_mute = -1;
+static aaudio_data_callback_result_t aaudio_pull(AAudioStream *st, void *ud, void *data, int32_t frames) {
+    (void)st; ring_pull(ud, data, (uint32_t)frames);
+    if (g_audio_mute) memset(data, 0, (size_t)frames * 2 * sizeof(float));
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+static int g_aaudio_rate;
+static void aaudio_start(Mixer *m);
+static void *aaudio_reopen(void *ud) { aaudio_start(ud); return NULL; }
+static void aaudio_error(AAudioStream *st, void *ud, aaudio_result_t err) {
+    (void)st; fprintf(stderr, "[totk-audio] AAudio stream error %d (%s): reopening\n", err, AAudio_convertResultToText(err));
+    pthread_t t; if (!pthread_create(&t, NULL, aaudio_reopen, ud)) pthread_detach(t);   /* not from the callback's own thread */
+}
+static void aaudio_start(Mixer *m) {
+    static AAudioStream *stream;
+    if (stream) { AAudioStream_close(stream); stream = NULL; }
+    AAudioStreamBuilder *b; aaudio_result_t r = AAudio_createStreamBuilder(&b);
+    if (r != AAUDIO_OK) { fprintf(stderr, "[totk-audio] 【红】AAudio builder: %s: mixing without sound\n", AAudio_convertResultToText(r)); return; }
+    AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_FLOAT); AAudioStreamBuilder_setChannelCount(b, 2);
+    AAudioStreamBuilder_setSampleRate(b, g_aaudio_rate); AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    AAudioStreamBuilder_setUsage(b, AAUDIO_USAGE_GAME); AAudioStreamBuilder_setContentType(b, AAUDIO_CONTENT_TYPE_SONIFICATION);
+    AAudioStreamBuilder_setDataCallback(b, aaudio_pull, m); AAudioStreamBuilder_setErrorCallback(b, aaudio_error, m);
+    r = AAudioStreamBuilder_openStream(b, &stream); AAudioStreamBuilder_delete(b);
+    if (r != AAUDIO_OK) { fprintf(stderr, "[totk-audio] 【红】AAudio open: %s: mixing without sound\n", AAudio_convertResultToText(r)); stream = NULL; m->unit_ok = 0; return; }
+    if ((r = AAudioStream_requestStart(stream)) != AAUDIO_OK) { fprintf(stderr, "[totk-audio] 【红】AAudio start: %s: mixing without sound\n", AAudio_convertResultToText(r)); AAudioStream_close(stream); stream = NULL; m->unit_ok = 0; return; }
+    m->unit_ok = 1;
+    fprintf(stderr, "[totk-audio] AAudio output %d Hz stereo, burst %d frames, buffer %d frames%s\n", AAudioStream_getSampleRate(stream),
+            AAudioStream_getFramesPerBurst(stream), AAudioStream_getBufferSizeInFrames(stream), g_audio_mute ? " (SCARLET_AUDIO_MUTE: silent)" : "");
+}
+static void output_open(Mixer *m, int rate) {
+    if (getenv("TOTK_AUDIO_OFF")) { fprintf(stderr, "[totk-audio] TOTK_AUDIO_OFF: mixing without an AAudio device\n"); return; }
+    if (g_audio_mute < 0) { const char *e = getenv("SCARLET_AUDIO_MUTE"); g_audio_mute = e && atoi(e); }
+    g_aaudio_rate = rate; aaudio_start(m);
+}
 #endif
 static void output_push(Mixer *m, const float *lr, int frames) {
     uint64_t wr = atomic_load(&m->wr), rd = atomic_load_explicit(&m->rd, memory_order_acquire);

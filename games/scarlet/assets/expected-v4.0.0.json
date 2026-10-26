@@ -27,9 +27,9 @@
         "files": 30
     },
     "rewritten_sha256_android": {
-        "main.patched.bin": "85da1b50f80bc173977b2f5cc509f03a9a18c03c3180a88739fd724c0c0d5f6a",
-        "sdk.patched.bin": "2d2f19927137d9a687762c92df6846fff37e0e7da89716fbddd0950d3404bb37",
-        "subsdk0.patched.bin": "d290408c2db1da700a11828440c47fec93710e0413d9181725f45ac769888813"
+        "main.patched.bin": "4cae793e2fc8fc0df0a5c193c6700db51d7ff0600faef381d59a282b2cd4e73d",
+        "sdk.patched.bin": "2d5659cb82dfe6886836d99c727f762cfbb4158ae97a9d81de870c1efbe2742c",
+        "subsdk0.patched.bin": "d32bed0eb50570b4b47e7e80403b74ad81d7132a3606d7b5c1b27db8af29a606"
     },
     "relative_beyond_image": {
         "main": [
