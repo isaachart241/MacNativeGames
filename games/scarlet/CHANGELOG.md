@@ -559,3 +559,13 @@ character down the stairs. Frame time p50 33.33 ms, p95 35.0 ms; NVN replay 11.2
 window and swapchain are remade, the game kept running, focus out and in was reported and the sound was silent in
 between. Not checked: the face buttons pressed by hand (whether the Thor sends BUTTON_A for its bottom button), and
 sound through the speaker (the tests ran muted at night). The Mac runtime still builds.
+
+**Shaders without the Mac.** `android/tools/prefill_shaders.py` translates for the Thor, ahead of play, every shader
+variant in the Mac port's own shader cache that the device's cache lacks: the Mac keeps each variant's guest code, its
+constant section and the bind state it depends on, and shader keys are the same on both ports. It runs them through the
+bridge's translation with that bind state as the answers; `android/tools/push_shaders.sh` unpacks them into the app's
+cache as the app's user and appends the index. 195 shaders (198 variants) were added, each with exactly the Mac's
+dependencies; the device cache went from 202 variants of 172 shaders to 400 of 369. With the bridge turned off
+(`TOTK_XLATE_TCP` unset), title, Continue, the house and a walk round the ground floor drew with no shader missing
+(only pipelines being built at first use: 112 draws over two frames). Not made ahead: transform feedback variants
+(their layout is known only when the game draws) and anything neither port has met yet.
