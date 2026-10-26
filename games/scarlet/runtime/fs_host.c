@@ -196,9 +196,15 @@ static unsigned commit(const char *name) {
     pthread_mutex_unlock(&lock);
     if (!found) return R_PATH_NOT_FOUND;
     for (int i = 0; i < NFILES; i++) { pthread_mutex_lock(&lock); int fd = files[i].fd; pthread_mutex_unlock(&lock); if (fd > 0) full_fsync(fd); }
-    if (save && !(getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 23)) atomic_store(&save_dirty, 0);   /* 23: probe-save's negative control */
+    if (save && !(getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 23)) {   /* 23: probe-save's negative control */
+        int changed = atomic_exchange(&save_dirty, 0);
+        void runtime_save_committed(const char *root) __attribute__((weak));   /* runtime/save_backup_android.c */
+        if (changed && runtime_save_committed) runtime_save_committed(save_root);
+    }
     return 0;
 }
+/* The save folder (for runtime/save_backup_android.c's first copy at start); empty before storage is ready. */
+const char *runtime_fs_save_root(void) { return save_root; }
 
 /* ---------- files ---------- */
 static File *file_of(uint64_t h, int *fd, int *mode) {

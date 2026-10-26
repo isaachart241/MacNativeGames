@@ -75,6 +75,7 @@ static void *game_thread(void *arg) {
     fprintf(stderr, "[totk] Scarlet for the Thor: data folder %s\n", dir);
     load_env("env.txt");
     runtime_env_input_script(); runtime_env_input_file(); runtime_env_autoload(); runtime_env_thread_dumps();
+    void runtime_save_backup_start(void); runtime_save_backup_start();   /* runtime/save_backup_android.c */
     const char *buzz = getenv("SCARLET_RUMBLE_TEST");   // 1..255: one 300 ms vibration at that strength, to check the motor
     if (buzz && atoi(buzz) > 0) { void runtime_android_rumble(int); runtime_android_rumble(atoi(buzz) > 255 ? 255 : atoi(buzz)); usleep(300000); runtime_android_rumble(0); }
     const char *rewritten = getenv("SCARLET_REWRITTEN"); if (!rewritten || !*rewritten) rewritten = "rewritten/v400-android";

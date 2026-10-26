@@ -962,3 +962,34 @@ the map screen on the bottom with the dimmed world on top; the title on both scr
 the bottom (black on top, as the game draws it); normal play unchanged (the clean world on top, the map below). Not
 checked: dialogue and battles (not reachable at this point of the user's save without advancing the story); the
 first version left the menu's text on top (the text's own uniform buffer).
+
+### 2026-10-26: Thor port: save backups; dialogue and battles on the bottom; a stray triangle over the beach
+
+- **Save backups** (`runtime/save_backup_android.c`, new). The save lives in the app's data folder, which Android
+  deletes with the app (an uninstall, or an update signed with another key). A commit that changed save data
+  (`runtime/fs_host.c`, `runtime_save_committed`) schedules a copy of the save folder to
+  `/sdcard/Documents/Scarlet saves/<date time>/` 5 s later (the game commits several times in a row), made once the
+  save is finished, on a thread of its own, written to a dot-named folder and renamed when complete; one more copy is
+  made at start. The 10 newest are kept. `SCARLET_SAVE_BACKUP=0` turns it off, `SCARLET_SAVE_BACKUP_DIR` moves it;
+  restoring is in `android/README.md` (the command was tried on a scratch folder: the copy was byte-identical).
+  Checked on the Thor: a copy at start and one after each of the game's autosaves during the test below.
+- **Dialogue and battles**, tested on a copy of the user's save (kept in `user-data/save-before-story`; afterwards the
+  save was put back and compared byte for byte with it and with the copy from before the map work, and the backups
+  the test made were deleted, leaving the user's own). The story was played from the start of the user's save to the
+  first battle; the user walked the character down to Nemona on the beach. On the bottom screen, above the map strip:
+  the dialogue boxes with their name tags, the choice menus, the battle's command menu (Battle, Pokémon, Bag, Run), the
+  moves with their PP, both HP boxes (the bars went down as the battle went on), the battle messages ("Quaxly used
+  Pound!") and "Check Status"; the top screen showed the scene alone; between menus the bottom went back to the whole
+  map. No failures in the log.
+- **The nickname prompt** read "What is ␓Quaxly␓(♀)’s nickname?": the game marks the name with U+0013 on each side,
+  which the dialog drew as boxes. `runtime/swkbd_host.c` now drops control characters other than line breaks from the
+  keyboard's header, sub, guide and OK texts. Checked on the logged prompt (the filter alone); the dialog itself was
+  not shown again.
+- **A stray triangle over the beach.** Below Cabo Poco a large flat purple shape covered the sky from some camera
+  angles, and a dark patch lay on the sand. The render-target dump showed it already in the G-buffer (pass 14, all
+  four targets), so it was geometry, not the sky or lighting. The Vulkan pipelines never enabled primitive restart,
+  while Metal always restarts strips at the all-ones index: an indexed strip's restart index was drawn as a vertex.
+  Strips and fans now restart (`restarts()` in `nvn_vk_exec.c`; 8-bit indices widened on the CPU keep 0xff as the
+  32-bit restart index). Checked on the Thor from the same position and camera as the broken screenshot: clear sky
+  with clouds, and the dark patch was gone (it was the triangle's shadow). Not checked: which mesh it was, or other
+  places that had the same fault.

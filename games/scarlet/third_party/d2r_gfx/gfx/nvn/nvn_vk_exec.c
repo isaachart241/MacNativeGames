@@ -797,6 +797,13 @@ static VkPrimitiveTopology topo_of(int prim, int *quads) {
         default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     }
 }
+/* Strips and fans restart at the all-ones index, as Metal always does (totk_nvn_ext.c, SetPrimitiveRestart). Without it
+   an indexed strip's restart index was drawn as a vertex: on the Thor a huge triangle across the sky over the beach below
+   Cabo Poco, 2026-10-26. */
+static int restarts(VkPrimitiveTopology t) {
+    return t == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
+           t == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY || t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+}
 static VkFormat dummy_attr_fmt(int cls) { return cls == 1 ? VK_FORMAT_R32G32B32A32_UINT : cls == 2 ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_SFLOAT; }
 
 /* Pipelines: looked up by a hash of the key, created on worker threads (the draw that first needs one is skipped until it
@@ -957,7 +964,7 @@ static VkPipeline pso_get(vk_prog *pr, VkPrimitiveTopology topo) {
     for (int sidx = 0; sidx < 16; sidx++) if (used_streams & (1u << sidx))
         j->vb[nvb++] = (VkVertexInputBindingDescription){(uint32_t)sidx, S.stream[sidx].stride, S.stream[sidx].divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
     if (need_dummy) j->vb[nvb++] = (VkVertexInputBindingDescription){16, 0, VK_VERTEX_INPUT_RATE_VERTEX};
-    j->ia = (VkPipelineInputAssemblyStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, topo, VK_FALSE};
+    j->ia = (VkPipelineInputAssemblyStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, topo, restarts(topo) ? VK_TRUE : VK_FALSE};
     j->vps = (VkPipelineViewportStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL};
     int pm = S.poly.mode;
     j->rs = (VkPipelineRasterizationStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, S.depth_clamp ? VK_TRUE : VK_FALSE, S.raster_discard ? VK_TRUE : VK_FALSE,
@@ -1303,7 +1310,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
             uint32_t *ix = vk_arena_alloc(&sub->arena, (VkDeviceSize)nout * 4 + 4, 16, &ib, &io);
             for (uint32_t o = 0; o < nout; o++) {
                 uint32_t k = quads ? (o / 6) * 4 + (uint32_t[]){0, 1, 2, 0, 2, 3}[o % 6] : o, v;
-                if (isz == 1) v = src[k]; else if (isz == 2) { uint16_t h; memcpy(&h, src + 2 * k, 2); v = h; } else memcpy(&v, src + 4 * k, 4);
+                if (isz == 1) v = src[k] == 0xff && restarts(topo) ? 0xffffffffu : src[k]; else if (isz == 2) { uint16_t h; memcpy(&h, src + 2 * k, 2); v = h; } else memcpy(&v, src + 4 * k, 4);
                 ix[o] = v;
             }
             vkCmdBindIndexBuffer(cb, ib, io, VK_INDEX_TYPE_UINT32);

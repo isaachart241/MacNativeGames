@@ -56,6 +56,14 @@ static size_t utf16_to_utf8(const uint16_t *s, size_t n, char *out, size_t cap) 
     return o;
 }
 
+/* Drop control characters other than line breaks: the game marks names in its texts with them (Scarlet: U+0013 around
+   the Pokémon's name in "What is Quaxly's nickname?"), which a dialog would show as boxes. */
+static void drop_controls(char *s) {
+    char *o = s;
+    for (; *s; s++) if (!((unsigned char)*s < 0x20 && *s != '\n') && *s != 0x7f) *o++ = *s;
+    *o = 0;
+}
+
 /* UTF-8 -> UTF-16, at most cap units (a character that does not fit whole is dropped); bad bytes become U+FFFD. */
 static size_t utf8_to_utf16(const char *s, uint16_t *out, size_t cap) {
     const unsigned char *p = (const unsigned char *)s; size_t n = 0;
@@ -122,6 +130,7 @@ static unsigned show_keyboard(void *out_string, const void *arg_ptr) {
     utf16_to_utf8((const uint16_t *)(arg + KB_SUB), u16_len((const uint16_t *)(arg + KB_SUB), 0x80), sub, sizeof sub);
     utf16_to_utf8((const uint16_t *)(arg + KB_GUIDE), u16_len((const uint16_t *)(arg + KB_GUIDE), 0x100), guide, sizeof guide);
     utf16_to_utf8((const uint16_t *)(arg + KB_OK_TEXT), u16_len((const uint16_t *)(arg + KB_OK_TEXT), 8), ok, sizeof ok);
+    drop_controls(header); drop_controls(sub); drop_controls(guide); drop_controls(ok);
     uint64_t work = rd64(arg + ARG_WORK), work_size = rd64(arg + ARG_WORK_SIZE);
     int32_t init_off = (int32_t)rd32(arg + KB_INIT_OFF), init_len = (int32_t)rd32(arg + KB_INIT_LEN);
     if (init_len > 0 && work && init_off >= 0 && (uint64_t)init_off + (uint64_t)init_len * 2 <= work_size)

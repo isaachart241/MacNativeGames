@@ -52,6 +52,18 @@ play from the minimap (hidden from the top screen but still drawn by the game), 
 do (Y), its place names, the objective and the whole-Paldea view (zoomed out) are added too. `SCARLET_BOTTOM=0` leaves the bottom screen alone and keeps the minimap;
 `SCARLET_MINIMAP=1` keeps the minimap as well, `SCARLET_BOTTOM_UI=0` keeps the interface on the top screen.
 
+## Save backups
+
+The save lives in the app's data folder, which Android deletes with the app (an uninstall, or an update signed with
+another key). So the app copies it to `/sdcard/Documents/Scarlet saves/<date time>/` once at start and 5 s after each
+save, keeping the 10 newest. `SCARLET_SAVE_BACKUP=0` turns this off; `SCARLET_SAVE_BACKUP_DIR=<path>` moves it. To
+restore one, close the game and copy the backup's files, as the app, into the folder under `user-data/save/` that holds
+`main`:
+
+```sh
+adb shell "run-as org.macnativegames.scarlet cp '/sdcard/Documents/Scarlet saves/<date time>/'* /sdcard/Android/data/org.macnativegames.scarlet/files/user-data/save/<folder>/"
+```
+
 ## Shaders
 
 The game's shaders are translated to SPIR-V on the Thor itself, the first time each one is drawn, and kept in the app's
