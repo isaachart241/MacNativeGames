@@ -131,13 +131,38 @@ Answered so far, in order:
 - Audio comes up: Wwise opens `audren:u` (REV10, 48 kHz stereo through CoreAudio) and loads `PM.bnk` (the
   `English(US)` path first, as expected).
 
-Where it stops now (GPU submission still off): a null dereference in `nn::os::LockMutex` from main+0x14fe804, at
-offset 0xe0 of what main+0x14ff4dc returned. That function finds or creates a 0x128-byte object by name in a
-manager: it returns null when the manager's cache (`this+0x58`) is missing. Under lldb at the crash, the manager's
-`this+0x58` is null and the name it was asked for is the empty string (hash 0xcbf29ce484222645). Something earlier
-left the cache uncreated and the name empty; not found yet. The init sequence that calls it is at main+0x11bce9c..
-0x11bcec4 (five direct calls, then a virtual call at +0x58).
+**The missing audio root (fixed).** The crash at main+0x14fe804 was the audio system's node tree: its root
+(`this+0x58`) was never created. Traced back step by step (a write watchpoint showed nothing ever wrote it):
+
+- main+0x1509880 creates the Wwise globals (`SourceGlobal`, `DefaultListener`) and the `Root` node, and stores it at
+  `+0x58`. It runs from main+0x1505338 only after two gates: the sound engine init (main+0x1507028, returned 1) and
+  main+0x1508a4c, which returned 0.
+- That gate's first step, main+0x15096ec, hands the Wwise low-level IO its base path through a virtual call that must
+  return `AK_Success` (1): Wwise's `SetBasePath`. It checks the folder exists with `nn::fs::GetEntryType` on
+  `data:/audio/wwise/bin/Switch/`.
+- **Host bug**: `runtime_romfs_entry_type` appended `/` to anything that is not a file, so a folder asked for with
+  its trailing slash became `audio/wwise/bin/Switch//` and was reported missing. Fixed in `runtime/romfs.c` (no second
+  slash). TotK and Bayonetta never asked for a folder that way.
+- The audio system's init result was ignored by its caller, which is why the failure only showed later as a null
+  dereference. Verified with lldb probes: base path 1, second gate 1, root init 1, init 1.
+
+After the fix, Wwise opens its five packages (`Stream`, `LooseMedia`, `Patch00`, `SDC0`, `SDC2`) and loads all 17
+banks, and the game reads `event/trevt/bin/event.trevt`.
+
+Then, answered by name:
+
+- `nn::hid::BindNpadStyleSetUpdateEvent`: an event created and never signalled (the Mac's controller keeps its
+  style).
+- `nn::pl::RequestSharedFontLoad`: the fonts load on first use.
+
+**Where it stops now**: a null dereference at main+0x2151bc0 during PokemonEngine's component setup (main+0x11acb4c
+names `pe_FlatbuffersDataComponent`, `pe_TextComponent`, `pe_InputEventTriggerComponent`, `message/grammar/`).
+main+0x788704 looks an entry up in a table by (0x3f, 0x20, n); n = 1 is found, n = 2 is not, and the caller does not
+check. Next: find what fills that table.
 
 Tools for the next step: `TOTK_FS_LOG=1` (every RomFS open), `TOTK_INPUT_FILE` with `hletrace 2` (first call of each
 host function, in order), and lldb `--batch` with the inspection commands as `-k` (they run when the process stops on
 the crash).
+lldb helpers used here (kept outside the repository, easy to rewrite): a script that stops in the loader's
+`relocate`, reads main's base from `modules[0].base`, and then sets breakpoints or watchpoints at main offsets. The
+base changes every run because the loader maps main with mmap.

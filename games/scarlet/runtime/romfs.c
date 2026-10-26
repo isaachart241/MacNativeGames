@@ -286,9 +286,11 @@ unsigned runtime_romfs_read(uint64_t *out,uint64_t h,int64_t offset,void *buffer
 }
 unsigned runtime_romfs_size(int64_t *out,uint64_t h) {Entry e;if(!out||!handle_entry(h,&e))return INVALID;int fd;uint64_t base,size;handle_source(h,&e,&fd,&base,&size);*out=(int64_t)size;return 0;}
 void runtime_romfs_close(uint64_t h) {Entry e;if(!handle_entry(h,&e))runtime_fail("close invalid file handle");uint64_t j=h-0x100000000ULL;pthread_mutex_lock(&lock);int fd=handle_ovl[j]?handle_fd[j]:-1;handles[j]=0;handle_ovl[j]=0;handle_fd[j]=-1;pthread_mutex_unlock(&lock);if(fd>=0)close(fd);}
+/* A folder may be asked for with its trailing '/' (Scarlet: Wwise's SetBasePath checks data:/audio/wwise/bin/Switch/);
+   appending another one would look for "Switch//" and report the folder missing. */
 unsigned runtime_romfs_entry_type(int *out,const char *path) {
  if(!out)return INVALID;const char *p=rom_path(path);if(!p)return NOT_FOUND;if(file_index(p)!=UINT64_MAX){*out=1;return 0;}
- char dir[4096];if(snprintf(dir,sizeof(dir),"%s/",p)>=(int)sizeof(dir))return INVALID;if(folder_exists(dir)){*out=0;return 0;}return NOT_FOUND;
+ size_t n=strlen(p);char dir[4096];if(snprintf(dir,sizeof(dir),n&&p[n-1]=='/'?"%s":"%s/",p)>=(int)sizeof(dir))return INVALID;if(folder_exists(dir)){*out=0;return 0;}return NOT_FOUND;
 }
 /* Directory listing (Bayonetta 3 lists Contents:/): the immediate children of a folder, from the sorted index and the
    added files. A name with no further '/' is a file; the first segment of a longer one is a subfolder, and the sorted
