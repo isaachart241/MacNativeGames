@@ -124,7 +124,7 @@ static void *vsync_thread(void *arg) {
     for (;;) {
         t.tv_nsec += 16666667; if (t.tv_nsec >= 1000000000) { t.tv_nsec -= 1000000000; t.tv_sec++; }
         while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, NULL) == EINTR) {}
-        if (atomic_load(&vsyncPaused)) continue;
+        if (atomic_load(&vsyncPaused) && !runtime_fs_save_busy()) continue;
         pthread_mutex_lock(&vsyncLock); for (unsigned i = 0; i < vsyncCount; i++) hle_signal_system_event(vsyncEvents[i]); pthread_mutex_unlock(&vsyncLock);
     }
     return NULL;
@@ -173,17 +173,29 @@ void nvn_vk_window_lost(void) __attribute__((weak));
 static pthread_mutex_t windowLock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t windowCond = PTHREAD_COND_INITIALIZER;
 static ANativeWindow *window;
-/* Called by the Vulkan backend at every present, before it takes its locks: waits while there is no window. */
+/* Called by the Vulkan backend at every present, before it takes its locks: waits while there is no window. A save in
+   progress (runtime_fs_save_busy: written, not committed yet) is let finish first, there and in the vsync ticks: an app
+   that is away may be closed by the player or by Android, and a kill between the files of a save leaves the slot half
+   written (the Mac's window close waits for the same thing). */
 void nvn_vk_present_hook(void) {
     if (!atomic_load(&vsyncPaused)) return;
     pthread_mutex_lock(&windowLock);
-    while (atomic_load(&vsyncPaused)) pthread_cond_wait(&windowCond, &windowLock);
+    while (atomic_load(&vsyncPaused)) {
+        if (runtime_fs_save_busy()) { static int said; if (!said++) fprintf(stderr, "[totk] away with a save in progress: it finishes before the game pauses\n"); break; }
+        struct timespec t; clock_gettime(CLOCK_REALTIME, &t); t.tv_nsec += 200000000; if (t.tv_nsec >= 1000000000) { t.tv_nsec -= 1000000000; t.tv_sec++; }
+        pthread_cond_timedwait(&windowCond, &windowLock, &t);
+    }
     pthread_mutex_unlock(&windowLock);
 }
+static void *pcache_save_thread(void *arg) { (void)arg; vk_pcache_save(); return NULL; }
 void runtime_android_window(ANativeWindow *w) {
     if (w) ANativeWindow_acquire(w);
     pthread_mutex_lock(&windowLock); ANativeWindow *old = window; window = w; pthread_mutex_unlock(&windowLock);
-    if (!w) atomic_store(&vsyncPaused, 1);   /* no new frames for the old window */
+    if (!w) {
+        atomic_store(&vsyncPaused, 1);   /* no new frames for the old window */
+        /* the pipeline cache now, in the background: an app that is away may be closed without notice */
+        pthread_t t; if (vk_pcache_save && !pthread_create(&t, NULL, pcache_save_thread, NULL)) pthread_detach(t);
+    }
     if (old) { if (nvn_vk_window_lost) nvn_vk_window_lost(); ANativeWindow_release(old); }
     if (w) {
         pthread_mutex_lock(&windowLock); atomic_store(&vsyncPaused, 0); pthread_cond_broadcast(&windowCond); pthread_mutex_unlock(&windowLock);

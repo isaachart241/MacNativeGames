@@ -631,3 +631,11 @@ read the environment when the library loads, before the app reads `env.txt`, so 
 **Setup.** `android/tools/install_data.sh` copies the game data, fonts, the Android rewrite and (once) the Mac's save
 into the app's folder as the app's user; `android/README.md` describes building, installing, the data folder, the
 controls and the two ways to get shaders.
+
+**Saving on the Thor.** Saved from the game's menu in the house (the top face button opens the menu, as the Switch's
+X; R saves): "You saved your progress!", the save file rewritten, and after a fresh start Continue loads it. Saves go
+straight to their files and are flushed at the game's commit, so a kill between the files of a save would leave the
+slot half written; an app away from the screen may be closed at any time, so the pause now waits while a save is in
+progress (`runtime_fs_save_busy`: presents and vsync ticks go on until it is committed). Checked by saving and pressing
+Home in the same moment: the save completed and loads. Leaving the app also writes the Vulkan pipeline cache at once
+(otherwise every 3,600 presents), so a closed app keeps the pipelines it built.
