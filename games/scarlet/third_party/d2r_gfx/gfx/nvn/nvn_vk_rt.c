@@ -10,11 +10,16 @@
 //   - tools/windows/prepare_shaders.py ("Prepare shaders", after the game import or from the setup screen): every
 //     shader of the shared list found in the player's own game files, translated before play;
 //   - a miss during play: translated in the background by the translator service (TOTK_XLATE_CMD, totk_xlate --service
-//     --target spirv), started once. The render thread never waits: the draw is skipped until the variant is ready
+//     --target spirv), started once. The render thread does not wait: the draw is skipped until the variant is ready
 //     (TOTK_SHADER_SYNC=1 waits instead, for comparisons). Each miss is appended to <profile>/shader-list-contribution.txt
 //     as a "V <key> <deps>" row, the format the shared list takes contributions in.
+//     Android (the Thor, where the translator runs on the device): the draw waits for its variant, up to
+//     TOTK_SHADER_WAIT_MS (default 5000; 0 skips as elsewhere). A skipped draw is lost for good when the game draws it
+//     only once: from an empty cache Scarlet's house stayed black (a pass made while it loads), with every shader right.
 // All index files are read when the device starts, before the first frame.
 #include "nvn_vk.h"
+#include <errno.h>
+#include <time.h>
 #include "nvn_vk_json.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -121,19 +126,55 @@ static int svc_call(const char *req, char *reply, size_t n) {
     return k > 0;
 }
 #elif defined(__ANDROID__)
-/* Thor port: the translator runs on the Mac (android/tools/shader_bridge.py), reached over adb reverse at
-   127.0.0.1:TOTK_XLATE_TCP. The request carries the guest code inline ("code_hex", added by translate); the reply line
-   {"ok": true, "spv": n, "json": m} is followed by the n + m bytes of <variant>_v.spv and <variant>_v.json, written
-   into the cache here before the reply is handed back. One connection, one request at a time (the worker thread). */
+/* Thor port: two translators, one request at a time (the worker thread). The request carries the guest code inline
+   ("code_hex", added by translate).
+   - On the device (the default): the translator's Vulkan service (totk_xlate --service-vk, games/scarlet/android/xlate),
+     packaged beside this library as libtotk_xlate.so with spirv-cross as libspirv_cross.so (an app may run programs
+     from its native library folder), or named by TOTK_XLATE_EXE / TOTK_SPIRV_CROSS. Started once, at a lower priority
+     than the game, on pipes; it writes <variant>_v.spv and _v.json into the cache itself and answers {"ok": true}.
+   - On the Mac, with TOTK_XLATE_TCP=<port> (android/tools/shader_bridge.py over adb reverse at 127.0.0.1:<port>): the
+     reply line {"ok": true, "spv": n, "json": m} is followed by the n + m bytes of the two files, written into the cache
+     here before the reply is handed back. */
 #include <arpa/inet.h>
+#include <dlfcn.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
+extern char **environ;
+static int g_local_in = -1, g_local_out = -1, g_local_failed;
+/* The translator service on the device: started at the first miss; a dead one is started again once. */
+static int local_start(void) {
+    if (g_local_in >= 0) return 1;
+    if (g_local_failed >= 2) return 0;
+    char dir[1024] = ".", exe[1100], sc[1100], work[1200];
+    Dl_info self; if (dladdr((void *)local_start, &self) && self.dli_fname) { snprintf(dir, sizeof dir, "%s", self.dli_fname); char *sl = strrchr(dir, '/'); if (sl) *sl = 0; }
+    const char *e = getenv("TOTK_XLATE_EXE"), *c = getenv("TOTK_SPIRV_CROSS");
+    snprintf(exe, sizeof exe, "%s", e && *e ? e : ""); if (!*exe) snprintf(exe, sizeof exe, "%s/libtotk_xlate.so", dir);
+    snprintf(sc, sizeof sc, "%s", c && *c ? c : ""); if (!*sc) snprintf(sc, sizeof sc, "%s/libspirv_cross.so", dir);
+    snprintf(work, sizeof work, "%s/xlate-work", cache_dir());
+    if (access(exe, X_OK) || access(sc, X_OK)) { g_local_failed = 2; VKLOG("no shader translator at %s (or spirv-cross at %s): shaders not in the cache cannot be translated (draws using them are skipped)", exe, sc); return 0; }
+    signal(SIGPIPE, SIG_IGN);   /* a translator that dies fails the write instead of ending the game */
+    int to[2], from[2]; if (pipe2(to, O_CLOEXEC) || pipe2(from, O_CLOEXEC)) return 0;
+    posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, to[0], 0); posix_spawn_file_actions_adddup2(&fa, from[1], 1);
+    char *argv[] = {exe, "--service-vk", "--spirv-cross", sc, "--out", work, "--results", (char *)cache_dir(), "--chain", "thor-vk1", NULL};
+    pid_t pid; int r = posix_spawn(&pid, exe, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa); close(to[0]); close(from[1]);
+    if (r) { close(to[1]); close(from[0]); g_local_failed++; VKLOG("cannot start the shader translator %s: %s", exe, strerror(r)); return 0; }
+    setpriority(PRIO_PROCESS, pid, 10);   /* behind the game's threads: a miss only skips draws until it is done */
+    g_local_in = to[1]; g_local_out = from[0];
+    VKLOG("shader translator: %s (pid %d), on the device", exe, (int)pid);
+    return 1;
+}
+static void local_stop(void) { if (g_local_in >= 0) { close(g_local_in); close(g_local_out); } g_local_in = g_local_out = -1; g_local_failed++; }
 static int g_sock = -1;
 static int svc_connect(void) {
     if (g_sock >= 0) return 1;
     const char *port = getenv("TOTK_XLATE_TCP");
-    if (!port || !*port) { VKONCE("TOTK_XLATE_TCP not set: shaders not in the cache cannot be translated (draws using them are skipped)"); return 0; }
     int fd = socket(AF_INET, SOCK_STREAM, 0); if (fd < 0) return 0;
     struct sockaddr_in a = {0}; a.sin_family = AF_INET; a.sin_port = htons((uint16_t)atoi(port)); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(fd, (struct sockaddr *)&a, sizeof a)) { VKLOG("shader translator bridge at 127.0.0.1:%s not reachable (adb reverse; android/tools/shader_bridge.py)", port); close(fd); return 0; }
@@ -143,6 +184,16 @@ static int svc_connect(void) {
 static int read_full(int fd, void *p, size_t n) { uint8_t *b = p; while (n) { ssize_t r = read(fd, b, n); if (r <= 0) return 0; b += r; n -= (size_t)r; } return 1; }
 static int write_full(int fd, const void *p, size_t n) { const uint8_t *b = p; while (n) { ssize_t r = write(fd, b, n); if (r <= 0) return 0; b += r; n -= (size_t)r; } return 1; }
 static int svc_call_files(const char *req, const char *variant, char *reply, size_t n) {
+    const char *port = getenv("TOTK_XLATE_TCP");
+    if (!port || !*port) {   /* the translator on the device */
+        if (!local_start()) return 0;
+        if (!write_full(g_local_in, req, strlen(req)) || !write_full(g_local_in, "\n", 1)) { local_stop(); return 0; }
+        size_t k = 0; char c;
+        while (k + 1 < n && read_full(g_local_out, &c, 1)) { if (c == '\n') break; reply[k++] = c; }
+        reply[k] = 0;
+        if (!k) { VKLOG("the shader translator stopped"); local_stop(); return 0; }
+        return 1;
+    }
     if (!svc_connect()) return 0;
     if (!write_full(g_sock, req, strlen(req)) || !write_full(g_sock, "\n", 1)) { close(g_sock); g_sock = -1; return 0; }
     size_t k = 0; char c;
@@ -414,12 +465,29 @@ int vk_rt_variant(int stage, const uint8_t *control, const uint8_t *code, const 
         pthread_cond_broadcast(&g_rt_cv);
         if (g_misses <= 4 || g_misses % 100 == 0) VKLOG("[shader] %llu variants missing from the prepared cache so far (%llu found); translating in the background", (unsigned long long)g_misses, (unsigned long long)g_hits);
     }
-    static int sync = -1; if (sync < 0) { const char *s = getenv("TOTK_SHADER_SYNC"); sync = s && atoi(s); }
-    if (sync) {   // comparisons: wait for it
-        while (p->state == 1) pthread_cond_wait(&g_rt_cv, &g_rt_mu);
-        pthread_mutex_unlock(&g_rt_mu); js_free(ans);
-        if (p->state == 2) return 0;
-        return vk_rt_variant(stage, control, code, answers, path_base, n);
+    static long wait_ms = -2;   /* -1: until it is ready (TOTK_SHADER_SYNC=1), 0: skip the draw, > 0: at most that long */
+    if (wait_ms == -2) {
+        const char *s = getenv("TOTK_SHADER_SYNC"), *w = getenv("TOTK_SHADER_WAIT_MS");
+#ifdef __ANDROID__
+        long dflt = 5000;
+#else
+        long dflt = 0;
+#endif
+        wait_ms = s && atoi(s) ? -1 : w && *w ? atol(w) : dflt;
+    }
+    if (wait_ms) {
+        struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_sec += wait_ms / 1000; dl.tv_nsec += (wait_ms % 1000) * 1000000; if (dl.tv_nsec >= 1000000000) { dl.tv_nsec -= 1000000000; dl.tv_sec++; }
+        while (p->state == 1) {
+            if (wait_ms < 0) pthread_cond_wait(&g_rt_cv, &g_rt_mu);
+            else if (pthread_cond_timedwait(&g_rt_cv, &g_rt_mu, &dl) == ETIMEDOUT) break;
+        }
+        if (p->state != 1) {
+            pthread_mutex_unlock(&g_rt_mu); js_free(ans);
+            if (p->state == 2) return 0;
+            return vk_rt_variant(stage, control, code, answers, path_base, n);
+        }
+        VKONCE("[shader] a variant took longer than %ld ms to translate: its draws are skipped until it is ready", wait_ms);
     }
     pthread_mutex_unlock(&g_rt_mu); js_free(ans);
     return 2;

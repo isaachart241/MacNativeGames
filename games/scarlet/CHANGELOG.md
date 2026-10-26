@@ -639,3 +639,40 @@ slot half written; an app away from the screen may be closed at any time, so the
 progress (`runtime_fs_save_busy`: presents and vsync ticks go on until it is committed). Checked by saving and pressing
 Home in the same moment: the save completed and loads. Leaving the app also writes the Vulkan pipeline cache at once
 (otherwise every 3,600 presents), so a closed app keeps the pipelines it built.
+
+### 2026-10-26: Thor port: the shader translator runs on the Thor
+
+Until now a shader the Thor had not met needed the Mac (the bridge over USB, or translating ahead of play). The
+translator now runs on the device, so the game needs nothing from the Mac to go somewhere new.
+
+**The translator for Android.** The Mac port's translator is C# (the Ryujinx shader translator plus this project's
+service, `games/totk/tools/totk_xlate`), compiled ahead of time with NativeAOT. With the .NET 10 SDK it cross-compiles
+from the Mac to `linux-bionic-arm64`, linked by the NDK's clang (`android/xlate/build.sh`; no Linux machine needed).
+Two things kept it from running there: .NET's SHA-256 needs OpenSSL, which Android lacks (the TotK vertex-counter check
+hashes every vertex shader: a managed SHA-256 under `SCARLET_VK`, checked against .NET's on 320 inputs), and a generic
+`JsonArray.Add<string>` needs reflection metadata NativeAOT drops. spirv-cross builds with the NDK from the Mac build's
+checkout. Both ride in the APK as `libtotk_xlate.so` and `libspirv_cross.so` (an app may run programs from its native
+library folder); the translator is a prebuilt with a SHA-256 (`prebuilt/android-arm64`), as the Mac's is, so building
+the APK needs no .NET.
+
+**Which source.** Scarlet's Mac translator came from the Bayonetta 3 port and is older than the repository's source.
+Built with the translator's patches 0001 to 0004 (not 0005, unwritten vertex outputs set to (0, 0, 0, 1), which the
+Vulkan service does itself), the source gives SPIR-V and resource files byte for byte equal to that binary on all 351
+variants of the Mac's shader cache. The edits to the shared files (`partial`, the `--service-vk` switch and the SHA-256,
+under `SCARLET_VK`) leave TotK's build unchanged: all four output files equal on the same 351 variants.
+
+**The Vulkan service.** `android/xlate/VkService.cs` (`totk_xlate --service-vk`) ports the Mac bridge
+(`android/tools/shader_bridge.py`): the MSL chain's translation as the Mac makes it, then the fragment set move, the
+vertex output defaults, the reflection, the storage-buffer offsets and the transform feedback variant.
+`android/xlate/check_parity.py` puts every variant of the Mac's cache and a transform feedback variant of each vertex
+shader through both: 483 of 483 outputs byte for byte equal (and the 23 requests for an output a shader does not write
+refused by both). On the Thor the same 506 requests gave the same 966 files, about 17 ms a translation.
+
+**In the game.** The backend starts the translator at the first miss (`nvn_vk_rt.c`: pipes, a lower priority than the
+game; `TOTK_XLATE_TCP` still selects the Mac bridge). From an empty cache the title rendered, every file the Thor made
+that the bridge had also made was equal (288 of 288), but the house stayed black: a draw whose shader was still being
+translated was skipped, and a pass the game draws once while the house loads was lost for good. On Android a draw now
+waits for its shader (up to 5 s, `TOTK_SHADER_WAIT_MS`); from an empty cache the house then rendered, about 100 shaders
+translated during the load (frames up to 94 ms). The bridge-made cache was merged in: 433 variants of 371 shaders.
+Draws still wait for nothing while a pipeline is created past the 8 ms a frame budget (`TOTK_PIPE_BUDGET_MS`); no run
+went wrong for that.

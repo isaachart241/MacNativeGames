@@ -19,7 +19,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
-static class ShaderService
+static partial class ShaderService   // partial: the Scarlet build adds its Vulkan mode (games/scarlet/android/xlate/VkService.cs)
 {
     sealed class RuntimeError : Exception { public RuntimeError(string message) : base(message) { } }
 

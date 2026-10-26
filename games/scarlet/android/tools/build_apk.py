@@ -7,7 +7,7 @@
 (android/Makefile APK=1 GFX=vk apk runs this.) The APK holds:
   - AndroidManifest.xml, compiled here to Android's binary XML. Only the android: attributes in ATTRS are known; their
     resource IDs are the framework's public ones (checked against the Thor's /system/framework/framework-res.apk).
-  - lib/arm64-v8a/libscarlet.so.
+  - lib/arm64-v8a/libscarlet.so, and the programs it runs (--extra-lib: the shader translator and spirv-cross).
   - an APK Signature Scheme v2 block (minSdkVersion 33 needs no v1 JAR signature), signed with openssl by a debug key
     made in --key the first time (key.pem, cert.der, pub.der). Keep the folder: Android refuses an update signed by
     another key (uninstall first, which deletes the app's files folder).
@@ -214,6 +214,7 @@ def main():
     ap.add_argument('--manifest', required=True)
     ap.add_argument('--lib', required=True, help='libscarlet.so (android/Makefile APK=1 GFX=vk)')
     ap.add_argument('--key', required=True, help='folder of the debug signing key (made if missing)')
+    ap.add_argument('--extra-lib', action='append', default=[], help='another lib*.so for lib/arm64-v8a (the shader translator, spirv-cross)')
     ap.add_argument('-o', '--output', required=True)
     args = ap.parse_args()
     manifest = binary_xml(args.manifest)
@@ -224,6 +225,10 @@ def main():
             z.writestr(zipfile.ZipInfo('AndroidManifest.xml', fixed), manifest, compress_type=zipfile.ZIP_DEFLATED)
             z.writestr(zipfile.ZipInfo('lib/arm64-v8a/libscarlet.so', fixed), open(args.lib, 'rb').read(),
                        compress_type=zipfile.ZIP_DEFLATED)
+            for extra in args.extra_lib:   # programs the app runs: extracted with execute permission (extractNativeLibs)
+                info = zipfile.ZipInfo('lib/arm64-v8a/' + os.path.basename(extra), fixed)
+                info.external_attr = 0o100755 << 16
+                z.writestr(info, open(extra, 'rb').read(), compress_type=zipfile.ZIP_DEFLATED)
         apk = sign_v2(open(unsigned, 'rb').read(), args.key)
     with open(args.output, 'wb') as f:
         f.write(apk)

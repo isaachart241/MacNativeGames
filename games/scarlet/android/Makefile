@@ -54,7 +54,7 @@ CFLAGS := -std=gnu11 $(NATIVE_OPT) $(PIC) -g -Wall -Wextra -Wno-unused-function 
   -include android/compat/android_prelude.h -Iandroid/compat -Iandroid/compat/vk -I$(GEN) -Iruntime \
   -Ithird_party/d2r_gfx/gfx/nvn/include -Ithird_party/d2r_gfx/gfx/nvn -Ithird_party/d2r_gfx/gfx/tex -Ithird_party/d2r_gfx/third_party
 
-.PHONY: all push boot clean apk install
+.PHONY: all push boot clean apk install translator
 all: $(OUT)/scarlet-native
 
 $(GENERATED):
@@ -76,16 +76,39 @@ $(OUT)/scarlet-native: $(OBJECTS)
 $(OUT)/libscarlet.so: $(OBJECTS)
 	"$(CC)" -shared -Wl,-soname,libscarlet.so -Wl,-Bsymbolic -Wl,--no-undefined $(OBJECTS) $(GFX_LIBS) -landroid -laaudio -lmediandk -lm -ldl -llog -o "$@"
 
+# The shader translator on the device (third_party/d2r_gfx/gfx/nvn/nvn_vk_rt.c starts it): the prebuilt NativeAOT
+# program (android/xlate/build.sh made it; SHA-256 checked, so building needs no .NET) and spirv-cross, built here from
+# the Mac build's checkout at the Mac Makefile's commit. Both go into the APK as lib*.so: an app may run programs from its
+# native library folder, not from its data.
+TOOLS := $(WORK)/build-android-tools
+SPIRV_CROSS_COMMIT := aa217aeb6c9f0ace7a0ab233b28807edf45eb165
+SPIRV_CROSS_SOURCES := main.cpp spirv_cfg.cpp spirv_cpp.cpp spirv_cross.cpp spirv_cross_parsed_ir.cpp spirv_cross_util.cpp \
+  spirv_glsl.cpp spirv_hlsl.cpp spirv_msl.cpp spirv_parser.cpp spirv_reflect.cpp
+CXX := $(NDK)/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android$(API)-clang++
+$(TOOLS)/libtotk_xlate.so: prebuilt/android-arm64/totk_xlate prebuilt/android-arm64/totk_xlate.sha256
+	@mkdir -p "$(dir $@)"
+	test "$$(shasum -a 256 "$<" | cut -d' ' -f1)" = "$$(cut -d' ' -f1 prebuilt/android-arm64/totk_xlate.sha256)"
+	cp "$<" "$@" && chmod +x "$@"
+$(TOOLS)/libspirv_cross.so:
+	@mkdir -p "$(WORK)/src" "$(TOOLS)/spirv-cross-obj"
+	test -d "$(WORK)/src/SPIRV-Cross" || git clone -q https://github.com/KhronosGroup/SPIRV-Cross.git "$(WORK)/src/SPIRV-Cross"
+	git -C "$(WORK)/src/SPIRV-Cross" checkout -q $(SPIRV_CROSS_COMMIT)
+	for f in $(SPIRV_CROSS_SOURCES); do "$(CXX)" -O3 -DNDEBUG -std=c++11 -fPIE -c "$(WORK)/src/SPIRV-Cross/$$f" -o "$(TOOLS)/spirv-cross-obj/$$f.o" & done; wait
+	"$(CXX)" -static-libstdc++ -pie $(addprefix $(TOOLS)/spirv-cross-obj/,$(addsuffix .o,$(SPIRV_CROSS_SOURCES))) -o "$@"
+translator: $(TOOLS)/libtotk_xlate.so $(TOOLS)/libspirv_cross.so
+
 APK_KEY ?= $(WORK)/apk-key
-apk: $(OUT)/libscarlet.so android/app/AndroidManifest.xml android/tools/build_apk.py
-	python3 android/tools/build_apk.py --manifest android/app/AndroidManifest.xml --lib "$<" --key "$(APK_KEY)" -o "$(OUT)/scarlet.apk"
+apk: $(OUT)/libscarlet.so $(TOOLS)/libtotk_xlate.so $(TOOLS)/libspirv_cross.so android/app/AndroidManifest.xml android/tools/build_apk.py
+	python3 android/tools/build_apk.py --manifest android/app/AndroidManifest.xml --lib "$<" --key "$(APK_KEY)" -o "$(OUT)/scarlet.apk" \
+	  --extra-lib "$(TOOLS)/libtotk_xlate.so" --extra-lib "$(TOOLS)/libspirv_cross.so"
 install: apk
 	"$(ADB)" install -r "$(OUT)/scarlet.apk"
 
-push: $(OUT)/scarlet-native
+push: $(OUT)/scarlet-native $(TOOLS)/libtotk_xlate.so $(TOOLS)/libspirv_cross.so
 	"$(ADB)" shell mkdir -p $(DEVICE_DIR)/logs
 	"$(ADB)" push "$<" $(DEVICE_DIR)/scarlet-native
-	"$(ADB)" shell chmod 755 $(DEVICE_DIR)/scarlet-native
+	"$(ADB)" push "$(TOOLS)/libtotk_xlate.so" "$(TOOLS)/libspirv_cross.so" $(DEVICE_DIR)/
+	"$(ADB)" shell chmod 755 $(DEVICE_DIR)/scarlet-native $(DEVICE_DIR)/libtotk_xlate.so $(DEVICE_DIR)/libspirv_cross.so
 
 # THOR_ENV: extra environment for the run (for example SCARLET_TEXT=Name TOTK_INPUT_FILE=input.txt).
 THOR_ENV ?=

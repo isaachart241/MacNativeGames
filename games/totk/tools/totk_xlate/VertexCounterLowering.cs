@@ -19,7 +19,11 @@ static class VertexCounterLowering
     internal static byte[] Apply(byte[] code, string stage, byte[] spirv, List<string> notes)
     {
         if (stage != "vs") return spirv;
+#if SCARLET_VK
+        string codeHash=Convert.ToHexString(ManagedSha256.Hash(code));   // Android: .NET's SHA-256 needs OpenSSL, which Android lacks
+#else
         string codeHash=Convert.ToHexString(SHA256.HashData(code));
+#endif
         if(codeHash!=VertexCodeHash&&codeHash!=InstanceCodeHash)return spirv;
         uint[] w = new uint[spirv.Length / 4]; Buffer.BlockCopy(spirv, 0, w, 0, spirv.Length);
         uint lane = 0, uintType = 0, vectorType = 0, trueId = 0;

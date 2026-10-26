@@ -193,6 +193,9 @@ static class SwshXlate
     {
         if (args.Length >= 2 && args[0] == "--disasm") return Disasm(args[1], args.Length > 2 ? args[2] : "vs");
         if (args.Length >= 1 && args[0] == "--service") return ShaderService.Run(args);   // the runtime's translation service (Service.cs)
+#if SCARLET_VK
+        if (args.Length >= 1 && args[0] == "--service-vk") return ShaderService.RunVk(args);   // Scarlet on the Thor (games/scarlet/android/xlate)
+#endif
         if (args.Length == 1 && args[0] == "--serve")
         {
             // One request per line: {"job": {...}, "out": "<dir>"}; one reply line "ok <key>" / "fail <key> <message>".

@@ -41,17 +41,20 @@ typed in a dialog with the on-screen keyboard.
 
 ## Shaders
 
-The game's shaders are translated to SPIR-V on the Mac; the device keeps what it has met in its cache. Two ways to fill
-it:
+The game's shaders are translated to SPIR-V on the Thor itself, the first time each one is drawn, and kept in the app's
+cache. The translator is the Mac port's own (the Ryujinx shader translator with this project's service), compiled ahead
+of time for Android with NativeAOT and packed into the APK with spirv-cross as `libtotk_xlate.so` and
+`libspirv_cross.so`; its Vulkan mode (`android/xlate/VkService.cs`) gives byte for byte what the Mac bridge gave. A draw
+waits for its shader (about 20 ms each; up to 5 s, `TOTK_SHADER_WAIT_MS`), so the first look at a new place may stutter
+briefly; after that it comes from the cache.
 
-- **Ahead of play:** `android/tools/prefill_shaders.py` translates every shader the Mac port has met (its own cache)
-  that the device lacks, and `android/tools/push_shaders.sh` installs them. Title, Continue and the house need nothing
-  else.
-- **During play:** with the Thor on USB, run `adb reverse tcp:7841 tcp:7841` and
-  `python3 android/tools/shader_bridge.py --port 7841`, and add `TOTK_XLATE_TCP=7841` to `env.txt`. A shader the
-  device lacks is translated on the Mac while the game runs (its draws are skipped for the second or so that takes).
-
-Without either, a shader neither port has met is never drawn on the Thor.
+- **Rebuilding the translator** needs the .NET 10 SDK: `android/xlate/build.sh android` (or `mac` for checks), then copy
+  `SCARLET_build/build-android-tools/xlate-android/totk_xlate` to `prebuilt/android-arm64/` and update its `.sha256`.
+  `python3 android/xlate/check_parity.py` compares the service with the bridge over the Mac's shader cache.
+- **Ahead of play:** `android/tools/prefill_shaders.py` translates every shader the Mac port has met that the device
+  lacks, and `android/tools/push_shaders.sh` installs them (no stutter the first time there).
+- **On the Mac instead:** with `TOTK_XLATE_TCP=7841` in `env.txt`, `adb reverse tcp:7841 tcp:7841` and
+  `python3 android/tools/shader_bridge.py --port 7841`, the Mac translates.
 
 ## Command-line build (tests)
 
