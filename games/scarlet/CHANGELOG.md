@@ -466,3 +466,33 @@ Not done: the player character (only its shadow is drawn; it is skinned through 
 backend does not implement yet), a window (needs the APK stage's surface), storage buffers whose 16-byte-aligned start is
 not 64-byte aligned (the Adreno's minimum; the MSL-chain shaders assume 16, so those bindings read 0..48 bytes early;
 none in the lighting pass), `TOTK_VK_NO_BC=1` (crashes in the driver), performance (not measured).
+
+### 2026-10-26: Thor port, T2: the player character, and three fixes for the Adreno
+
+All on the Thor, offscreen, checked with screenshots in the house after Continue.
+
+- **Per-stage program binds.** Scarlet binds vertex-only programs and unbinds the fragment stage (`BindProgram(NULL,
+  FRAGMENT)`) for its transform feedback captures; the TotK Vulkan backend took every bind as the whole program, so those
+  draws ran with no program and were dropped. The replay now keeps a program per graphics stage and combines them as the
+  Metal backend does (`prog_bind`, `prog_combined`).
+- **Transform feedback**, as on the Mac: a capture draw uses a variant of the vertex shader that stores the captured
+  components itself (`shader_bridge.py tf_patch`: storage buffers 100+b and an info block at 98 in set 0, read
+  `{first, count, base_instance, strides, offsets}`), drawn with rasterisation discarded; offsets advance per draw
+  (`OP_TF_BIND` / `OP_TF_STATE`). The layout comes from the control section (`vk_tf_layout`, the Metal backend's
+  `tf_layout`), and a capture variant has its own shader key. Guest capture buffers are only 4-byte aligned, so each is
+  bound at its 64-byte-aligned start and the shader adds the rest.
+- **Unwritten varyings** read (0, 0, 0, 1) (`vs_out_defaults`, the Mac's fix ported to SPIR-V): the character was washed out.
+- **Storage buffers on the Adreno.** The translator's storage buffer accesses index from the buffer's exact address
+  (Metal's 16-byte rule); a Vulkan descriptor must start on `minStorageBufferOffsetAlignment` (64), so whenever a buffer
+  was not 64-byte aligned every access landed up to 48 bytes early. The character's head exploded in some frames and not
+  in others (the skinning data moves every frame). Every storage buffer access chain now adds its binding's offset from
+  the aligned start, read from one more storage buffer (`sbuf_offsets`, filled per draw by `VK_RB_SBOFF`).
+- **Driver crashes** (a NULL dereference in `vulkan.adreno.so`, in `vkEndCommandBuffer`, intermittently during the load
+  after Continue): when the game released a texture from another thread while the render thread was recording, the
+  backend destroyed the image at once if the GPU was idle, under an open command buffer that used it. Destruction now
+  waits for the submission being recorded. Submissions also use one command pool per recording thread. The crash
+  handler names the library and offset of each frame (`dladdr`), which located it.
+
+Checked: four consecutive screenshots (presents 3000 to 3450) show the character animating correctly in the house;
+the run held 30 fps (frame time median 33.3 ms, NVN replay about 8 ms a frame); no crash in the last two runs (one with
+170 variants translated during it).

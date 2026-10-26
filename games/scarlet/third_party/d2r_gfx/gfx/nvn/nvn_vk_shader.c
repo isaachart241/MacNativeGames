@@ -32,6 +32,7 @@ static int kind_of(const char *k, int bank) {
     if (!strcmp(k, "sbuf")) return NVN_RB_SBUFP; if (!strcmp(k, "ubo_ptr")) return NVN_RB_UBOP; if (!strcmp(k, "sbuf_ubo")) return NVN_RB_SBUFU;
     if (!strcmp(k, "support")) return NVN_RB_SUPPORT; if (!strcmp(k, "c1")) return NVN_RB_C1;
     if (!strcmp(k, "drvcb")) return bank == 2 ? NVN_RB_DRV2 : NVN_RB_DRV0;
+    if (!strcmp(k, "tf_info")) return VK_RB_TFINFO; if (!strcmp(k, "tf_buf")) return VK_RB_TFBUF; if (!strcmp(k, "sbuf_off")) return VK_RB_SBOFF;
     return 0;
 }
 static int dim_of(const char *d) { return !d ? 1 : !strcmp(d, "1d") ? 0 : !strcmp(d, "3d") ? 2 : !strcmp(d, "cube") ? 3 : !strcmp(d, "buffer") ? 4 : 1; }
@@ -85,6 +86,9 @@ vk_shader *vk_shader_load(const char *base, int stage) {
     }
     for (js *f = js_get(j, "frag_outputs") ? js_get(j, "frag_outputs")->child : NULL; f; f = f->next) s->fout_mask |= 1u << (js_int(f, 0) & 31);
     s->writes_depth = js_bool(js_get(j, "writes_depth"), 0);
+    { const js *tf = js_get(j, "tf"), *st = tf ? js_get(tf, "strides") : NULL; int k = 0;   // Scarlet: transform feedback variant
+      for (const js *e = st ? st->child : NULL; e && k < 4; e = e->next) s->tf_stride[k++] = (uint16_t)js_int(e, 0);
+      s->tf_n = k; }
     js *dr = js_get(j, "drv_reads"); s->drv_read[0] = js_get(dr, "0") != NULL; s->drv_read[2] = js_get(dr, "2") != NULL;
     js *tg = js_get(j, "threadgroup_size"); for (int i = 0; i < 3; i++) s->tg[i] = (uint16_t)js_int(js_at(tg, i), 1);
     const char *c1 = js_str(js_get(j, "c1"), "");
@@ -151,11 +155,31 @@ vk_prog *vk_prog_get(const prog_t *cp) {
         uint32_t st; memcpy(&st, control + 0x714, 4); if (st >= 6) continue;
         akey = vk_exec_answer_key((int)st, akey + st + 1); stages |= 1 << st;
     }
+    /* Scarlet: while transform feedback captures, a vertex program with a capture layout gets its transform feedback
+       variant (a separate program: the answers carry the layout, which also makes it a separate translation). */
+    int vk_exec_tf_active(void); int tf = vk_exec_tf_active() && (stages & 1);
+    uint8_t tf_slot[4], tf_comp[4]; uint16_t tf_stride[4]; int tf_n = 0;
+    if (tf) for (unsigned i = 0; i < cp->nstage && i < 6; i++) {
+        const uint8_t *control = cp->sd[i].control; uint32_t st; if (!control) continue; memcpy(&st, control + 0x714, 4);
+        if (st == 0) tf_n = vk_tf_layout(control, tf_slot, tf_comp, tf_stride);
+    }
+    if (tf_n < 0) { VKONCE("transform feedback: a vertex program's capture layout is not understood (its capture draws are skipped)"); return NULL; }
+    if (tf_n > 0) akey ^= 0x7f4a7c159e3779b9ull;
     unsigned slot = prog_slot(cp->serial, akey);
     pthread_mutex_lock(&g_shmu);
     if (cp->serial) for (vk_prog *p = g_prog_tab[slot]; p; p = p->next) if (p->serial == cp->serial && p->akey == akey) { pthread_mutex_unlock(&g_shmu); return p->failed ? NULL : p; }
     pthread_mutex_unlock(&g_shmu);
     for (int st = 0; st < 6; st++) if (stages & (1 << st)) vk_exec_answers(st, ans[st], sizeof ans[st]);
+    if (tf_n > 0) {   /* ..."fout": {...}} -> ..., "tf": {"slots": [...], "comps": [...], "strides": [...]}} */
+        size_t l = strlen(ans[0]); char t[256]; int o = snprintf(t, sizeof t, ", \"tf\": {\"slots\": [");
+        for (int b = 0; b < tf_n; b++) o += snprintf(t + o, sizeof t - o, "%s%u", b ? ", " : "", tf_slot[b]);
+        o += snprintf(t + o, sizeof t - o, "], \"comps\": [");
+        for (int b = 0; b < tf_n; b++) o += snprintf(t + o, sizeof t - o, "%s%u", b ? ", " : "", tf_comp[b]);
+        o += snprintf(t + o, sizeof t - o, "], \"strides\": [");
+        for (int b = 0; b < tf_n; b++) o += snprintf(t + o, sizeof t - o, "%s%u", b ? ", " : "", tf_stride[b]);
+        snprintf(t + o, sizeof t - o, "]}}");
+        if (l && ans[0][l - 1] == '}' && l + strlen(t) < sizeof ans[0]) { ans[0][l - 1] = 0; strcat(ans[0], t); }
+    }
     vk_prog *p = calloc(1, sizeof *p); p->serial = cp->serial; p->akey = akey;
     for (unsigned i = 0; i < cp->nstage && i < 6; i++) {
         const uint8_t *control = cp->sd[i].control; const uint8_t *code = (const uint8_t *)(uintptr_t)cp->sd[i].data;
@@ -173,3 +197,18 @@ vk_prog *vk_prog_get(const prog_t *cp) {
     return p->failed ? NULL : p;
 }
 void mtl_prog_release(prog_t *p) { (void)p; /* programs are keyed by serial; variants are shared and kept */ }
+
+/* Scarlet: a vertex program's transform feedback layout from its GLSLC control section, as the Metal backend reads it
+   (nvn_mtl.m tf_layout): +0x6ec buffer count; per buffer b, +0xdc + 0x80b the captured varying (0x20 + N = location N),
+   +0x4dc + 0x80b the component count from x, +0x6dc + 2b the stride in bytes, +0x6e8 + b enabled. */
+int vk_tf_layout(const uint8_t *c, uint8_t slot[4], uint8_t comps[4], uint16_t stride[4]) {
+    unsigned n = c[0x6ec]; if (!n) return 0;
+    if (n > 4) return -1;
+    for (unsigned b = 0; b < n; b++) {
+        unsigned code = c[0xdc + 0x80 * b], k = c[0x4dc + 0x80 * b]; uint16_t sd; memcpy(&sd, c + 0x6dc + 2 * b, 2);
+        if (!(code >= 0x20 && code < 0x40 && k >= 1 && k <= 4 && sd >= 4 * k && !(sd & 3) && c[0x6e8 + b] == 1)) return -1;
+        for (unsigned i = 0; i < 0x80; i++) if (i != 0x0c && c[0xd0 + 0x80 * b + i] && 0xd0 + 0x80 * b + i < 0x4d0) return -1;
+        slot[b] = (uint8_t)(code - 0x20); comps[b] = (uint8_t)k; stride[b] = sd;
+    }
+    return (int)n;
+}

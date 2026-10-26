@@ -75,6 +75,7 @@ typedef struct vk_sub {
     vk_readback *rb; int nrb, crb;
     vk_defer *defer;
     struct vk_sub *next;
+    struct vk_sub_home *home;        // Thor port: the recording thread's command pool and free list (see sub_new)
 } vk_sub;
 extern _Thread_local vk_sub *g_sub;               // the submission being recorded (submit thread), NULL outside begin/commit
 vk_sub *vk_sub_current(void);       // g_sub, or an implicit one (begun on demand)
@@ -137,6 +138,10 @@ uint64_t vk_tex_live(void);
 
 // ---------- shaders / programs ----------
 enum { VKD_UBO = 1, VKD_SSBO, VKD_COMBINED, VKD_SAMPLED, VKD_SAMPLER, VKD_STORAGE, VKD_UTEXEL, VKD_STEXEL };
+// Scarlet (Thor port): transform feedback variants (android/tools/shader_bridge.py tf_patch) bind an info block and one
+// storage buffer per capture buffer; binding kinds beyond nvn_refl.h's.
+enum { VK_RB_TFINFO = 40, VK_RB_TFBUF = 41, VK_RB_SBOFF = 42 };   // SBOFF: per-binding storage buffer misalignment (shader_bridge.py sbuf_offsets)
+int vk_tf_layout(const uint8_t *control, uint8_t slot[4], uint8_t comps[4], uint16_t stride[4]);   // buffers, 0 none, -1 not understood
 typedef struct {
     uint8_t set, desc, kind, rw, dim, arrayed, ms, cls, samp_kind, storage_fmt;
     uint16_t binding, count, reg, samp_reg, off, bank;
@@ -149,6 +154,7 @@ typedef struct vk_shader {
     uint32_t fout_mask; int writes_depth;
     uint8_t drv_read[3]; uint16_t tg[3];
     uint8_t c1[4096]; uint32_t c1_len; VkBuffer c1buf; VmaAllocation c1al;
+    int tf_n; uint16_t tf_stride[4];   // Scarlet: a transform feedback variant capturing into tf_n buffers
     struct vk_shader *next;
 } vk_shader;
 typedef struct vk_prog {

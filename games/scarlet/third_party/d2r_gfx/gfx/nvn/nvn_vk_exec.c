@@ -35,7 +35,17 @@ static struct {
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     p_poly_offset po; float vp[16][6]; int has_vp; float dr[2]; float blend_color[4];
     int64_t copy_stride; int depth_clamp, render_disabled, raster_discard;
+    uint64_t tf_addr[4], tf_size[4], tf_off[4]; int tf_active;   /* Scarlet: transform feedback buffers, bytes captured into each, capture on */
+    const prog_t *stage_prog[5];   /* Scarlet: the program bound for each graphics stage (per-stage binds, see prog_bind) */
 } S;
+static struct { uint32_t first, count, base_instance; } g_tfd;   /* Scarlet: the capture draw being recorded (tf_info block) */
+/* Bytes from the 64-byte (storage buffer offset) aligned start of capture buffer b's pool offset to its current position:
+   guest capture buffers are only 4-byte aligned. Pools start on a page, so pool offset and address agree modulo 64. */
+static uint64_t tf_misalign(int b) {
+    uint64_t al = V.props.limits.minStorageBufferOffsetAlignment > 4 ? V.props.limits.minStorageBufferOffsetAlignment : 4;
+    return (S.tf_addr[b] + S.tf_off[b]) % al;
+}
+int vk_exec_tf_active(void) { return S.tf_active; }
 static struct { p_set_rt rt; int has_rt; p_scissor sc; int has_sc; } R;
 static struct {
     int open; uint32_t w, h, layers, ncolor; VkFormat cfmt[8], dfmt, sfmt; VkSampleCountFlagBits samples;
@@ -567,6 +577,29 @@ static void write_stage(wset *ws, VkDescriptorSet sets[2], vk_shader *sh, int st
                 VkImageView iv = x && x->img ? vk_tex_view_typed(x, v, hv, want_vt(b), 1) : VK_NULL_HANDLE;
                 if (iv) vk_tex_mark_written(x); else iv = vk_dummy_view(b->dim > 3 ? 1 : b->dim, b->arrayed, 0, b->cls, 1);
                 w_img(ws, ds, b, VK_NULL_HANDLE, iv); break; }
+            case VK_RB_TFINFO: {   // Scarlet: {first, count, base_instance, 0, stride0..3, off0..3} of the capture draw
+                VkBuffer sb; VkDeviceSize so; uint32_t *m = vk_arena_alloc(&sub->arena, 48, V.props.limits.minUniformBufferOffsetAlignment, &sb, &so);
+                m[0] = g_tfd.first; m[1] = g_tfd.count; m[2] = g_tfd.base_instance; m[3] = 0;
+                for (int k = 0; k < 4; k++) m[4 + k] = sh->tf_stride[k];
+                for (int k = 0; k < 4; k++) m[8 + k] = (uint32_t)(tf_misalign(k) / 4);
+                w_buf(ws, ds, b, sb, so, 48); break; }
+            case VK_RB_TFBUF: {    // Scarlet: capture buffer reg from its current offset, bound at the aligned start before it
+                uint64_t a = reg < 4 ? S.tf_addr[reg] + S.tf_off[reg] : 0, n = reg < 4 && S.tf_size[reg] > S.tf_off[reg] ? S.tf_size[reg] - S.tf_off[reg] : 0;
+                uint64_t mis = reg < 4 ? tf_misalign(reg) : 0; VkBuffer buf; VkDeviceSize off;
+                if (!a || !n || !vk_buf_at(a - mis, n + mis, &buf, &off)) { VKONCE("transform feedback buffer %d at %#llx not in a memory pool", reg, (unsigned long long)a); w_buf(ws, ds, b, vk_zero_buffer(), 0, 65536); break; }
+                w_buf(ws, ds, b, buf, off, n + mis); break; }
+            case VK_RB_SBOFF: {   // Thor port: o[binding] = 4-byte elements from each storage buffer's aligned descriptor start to its address
+                VkBuffer sb; VkDeviceSize so; uint32_t *o = vk_arena_alloc(&sub->arena, 4 * 128, V.props.limits.minStorageBufferOffsetAlignment, &sb, &so);
+                memset(o, 0, 4 * 128);
+                uint64_t al = V.props.limits.minStorageBufferOffsetAlignment > 16 ? V.props.limits.minStorageBufferOffsetAlignment : 16;
+                for (int k = 0; k < sh->nb; k++) {
+                    const vk_bind *x = &sh->b[k]; uint64_t va = 0; int r = x->reg;
+                    if ((x->kind == NVN_RB_SBUFP || x->kind == NVN_RB_UBOP) && r < 16) va = x->kind == NVN_RB_SBUFP ? S.ssbo[st][r].addr : S.ubo[st][r].addr;
+                    else if (x->kind == NVN_RB_SBUFU && r < 16) { const p_bind_buf *u = &S.ubo[st][r]; if (u->addr && u->size >= (uint64_t)x->off + 8) memcpy(&va, (const void *)(uintptr_t)(u->addr + x->off), 8); }
+                    else continue;
+                    if (va && x->binding < 128 && vk_pool_find(va & ~(al - 1), 1)) o[x->binding] = (uint32_t)((va & (al - 1)) / 4);
+                }
+                w_buf(ws, ds, b, sb, so, 4 * 128); break; }
             default: VKONCE("binding kind %d not implemented", b->kind); break;
         }
     }
@@ -593,6 +626,9 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     VkCommandBuffer cb = CB();
     int quads; VkPrimitiveTopology topo = topo_of(dw ? dw->prim : di->prim, &quads);
     VkPipeline pipe = pso_get(pr, topo); if (!pipe) { atomic_fetch_add(&g_stat_skip_pipe, 1); return; }
+    int tf = S.tf_active && pr->sh[0]->tf_n;   // Scarlet: a capture draw (plain list / point draws, as on the Mac)
+    if (tf && !dw) { VKONCE("transform feedback: indexed capture draws are not implemented (skipped)"); return; }
+    if (tf) { g_tfd.first = (uint32_t)dw->first; g_tfd.count = (uint32_t)dw->count; g_tfd.base_instance = (uint32_t)dw->base_instance; }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     bind_descriptors(pr, VK_PIPELINE_BIND_POINT_GRAPHICS);
     // dynamic state
@@ -630,6 +666,10 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     uint32_t inst = dw ? (dw->instances > 0 ? (uint32_t)dw->instances : 1) : (di->instances > 0 ? (uint32_t)di->instances : 1);
     vk_sub *sub = vk_sub_current();
     if (dw && !quads) vkCmdDraw(cb, (uint32_t)dw->count, inst, (uint32_t)dw->first, (uint32_t)dw->base_instance);
+    if (tf) {   // the next capture continues after this one's vertices
+        for (int k = 0; k < pr->sh[0]->tf_n; k++) S.tf_off[k] += (uint64_t)dw->count * inst * pr->sh[0]->tf_stride[k];
+        static int said; if (!said++) VKLOG("[tf] first capture draw: %d vertices x %u instances into %d buffers", dw->count, inst, pr->sh[0]->tf_n);
+    }
     else if (dw) {   // quads: generated triangle indices 0,1,2 0,2,3 per quad
         uint32_t nq = (uint32_t)dw->count / 4; if (!nq) return;
         VkBuffer ib; VkDeviceSize io; uint32_t *ix = vk_arena_alloc(&sub->arena, (VkDeviceSize)nq * 24, 16, &ib, &io);
@@ -818,10 +858,39 @@ static int cond_eval(const p_render_cond *c) {
     uint64_t x, y; memcpy(&x, (const void *)(uintptr_t)c->addr, 8); memcpy(&y, (const void *)(uintptr_t)(c->addr + 16), 8);
     return c->mode == 0 ? x == y : x != y;
 }
+/* Per-stage program binding, as the Metal backend does it (nvn_mtl.m prog_bind): NVN BindProgram(p, stages) replaces
+   only the stages in the mask, and a stage p lacks becomes unbound. Scarlet binds vertex-only programs (and unbinds the
+   fragment stage) for its transform feedback captures, so the replay keeps a program per graphics stage and draws with
+   a host program combining them when they differ (one per distinct combination, keyed by the parts and their serials). */
+static int prog_stage_index(const prog_t *p, int stage) {
+    for (unsigned i = 0; p && i < p->nstage; i++) { uint32_t st; memcpy(&st, (const uint8_t *)p->sd[i].control + 0x714, 4); if ((int)st == stage) return (int)i; }
+    return -1;
+}
+extern uint64_t nvn_new_serial(void);
+static const prog_t *prog_combined(void) {
+    typedef struct { const prog_t *part[5]; uint64_t ser[5]; prog_t *prog; } combo_t;
+    static combo_t *tab; static size_t n, cap;
+    uint64_t ser[5]; for (int s = 0; s < 5; s++) ser[s] = S.stage_prog[s] ? S.stage_prog[s]->serial : 0;
+    for (size_t i = 0; i < n; i++) if (!memcmp(tab[i].part, S.stage_prog, sizeof tab[i].part) && !memcmp(tab[i].ser, ser, sizeof ser)) return tab[i].prog;
+    prog_t *c = calloc(1, sizeof *c); if (!c) VKDIE("combined program allocation");
+    c->magic = 0x474f5250;   /* "PROG", as nvnProgramInitialize writes it */
+    for (int s = 0; s < 5; s++) { int k = prog_stage_index(S.stage_prog[s], s); if (k >= 0) c->sd[c->nstage++] = S.stage_prog[s]->sd[k]; }
+    c->serial = nvn_new_serial();
+    if (n == cap) { cap = cap ? cap * 2 : 64; tab = realloc(tab, cap * sizeof *tab); if (!tab) VKDIE("combined program table"); }
+    combo_t *e = &tab[n++]; memcpy(e->part, S.stage_prog, sizeof e->part); memcpy(e->ser, ser, sizeof ser); e->prog = c;
+    if (n <= 4 || n % 1000 == 0) VKLOG("[prog] combined program %zu: %u stages from per-stage binds", n, c->nstage);
+    return c;
+}
+static const prog_t *prog_bind(const prog_t *np, int stages) {
+    if (!(stages & NVN_SHADER_STAGE_ALL_GRAPHICS_BITS)) return np;   // compute only
+    for (int s = 0; s < 5; s++) if (stages & (1 << s)) S.stage_prog[s] = prog_stage_index(np, s) >= 0 ? np : NULL;
+    int mixed = 0; for (int s = 0; s < 5; s++) mixed |= S.stage_prog[s] && S.stage_prog[s] != np;
+    return mixed ? prog_combined() : np;
+}
 static void state_op(uint32_t op, const void *a) {
     switch (op) {
         case OP_SCISSOR: R.sc = *(const p_scissor *)a; R.has_sc = 1; break;
-        case OP_BIND_PROGRAM: S.prog = ((const p_bind_program *)a)->prog; break;
+        case OP_BIND_PROGRAM: { const p_bind_program *bp = a; S.prog = prog_bind(bp->prog, bp->stages); break; }
         case OP_BIND_STATE: {
             const p_bind_state *b = a; blend_st bs;
             switch (b->kind) {
@@ -851,6 +920,14 @@ static void state_op(uint32_t op, const void *a) {
         case OP_RENDER_ENABLE: S.render_disabled = !((const p_flag *)a)->value; break;
         case OP_RENDER_COND: S.render_disabled = !cond_eval(a); break;
         case OP_RASTER_DISCARD: S.raster_discard = ((const p_flag *)a)->value; break;
+        case OP_TF_BIND: { const p_tf_bind *tb = (const p_tf_bind *)a;   // Scarlet: transform feedback buffers (offsets restart at 0)
+            for (int k = 0; k < tb->n && tb->first + k < 4; k++) { int i = tb->first + k; S.tf_addr[i] = tb->addr[k]; S.tf_size[i] = tb->size[k]; S.tf_off[i] = 0; }
+            break; }
+        case OP_TF_STATE: { const p_tf_state *ts = (const p_tf_state *)a;   // 1 begin (from offset 0), 2 end, 3 pause, 4 resume (keeps the offsets)
+            if (ts->mode == 1) { S.tf_active = 1; memset(S.tf_off, 0, sizeof S.tf_off); }
+            else if (ts->mode == 2 || ts->mode == 3) S.tf_active = 0;
+            else if (ts->mode == 4) S.tf_active = 1;
+            break; }
     }
 }
 static int rt_same(const p_set_rt *a, const p_set_rt *b) {

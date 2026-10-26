@@ -52,15 +52,18 @@ class Spirv:
         self.chain_root, self.chains, self.caps, self.exts = {}, [], [], []
         self.entry_name, self.local_size, self.uses_fp64 = 'main', None, False
         self.insns = []   # (word offset, opcode, operands) for rewriting
+        self.functions, self.entry_id, fstart = [], 0, None
         p = 5
         while p < len(words):
             n, op = words[p] >> 16, words[p] & 0xffff
             if n == 0 or p + n > len(words): raise ValueError('SPIR-V: bad instruction at word %d' % p)
             w = words[p + 1:p + n]
             self.insns.append((p, op, w))
+            if op == 54: fstart = p
+            elif op == 56 and fstart is not None: self.functions.append((fstart, p + n)); fstart = None
             if op == 17: self.caps.append(w[0])
             elif op == 10: self.exts.append(_str(w, 0)[0])
-            elif op == 15: self.entry_name = _str(w, 2)[0]
+            elif op == 15: self.entry_name = _str(w, 2)[0]; self.entry_id = w[1]
             elif op == 16:
                 if w[1] == 17 and len(w) >= 5: self.local_size = [w[2], w[3], w[4]]
             elif op == 5: self.names[w[0]] = _str(w, 1)[0]
@@ -119,6 +122,189 @@ class Spirv:
                 s = fn(self.vars[ops[0]])
                 if s is not None: w[p + 3] = s
         return struct.pack('<%dI' % len(w), *w)
+
+# ---------- transform feedback (Scarlet): stores of the captured outputs, as the Metal backend's variant does ----------
+TF_INFO_BINDING, TF_BUF_BINDING = 98, 100   # set 0; nvn_vk_exec.c binds them by kind (tf_info, tf_buf)
+
+def _ins(op, *ops):
+    return [(len(ops) + 1) << 16 | op] + list(ops)
+
+def tf_patch(m, tf):
+    """A vertex shader variant that also writes, before it returns, components 0..comps-1 of the output at location slots[b]
+    into storage buffer b at element ((vertex - first) + (instance - base_instance) * count) * (stride_b / 4) + off_b + c, read
+    from the info block {first, count, base_instance, pad, stride0..3, off0..3} (std140 scalars). Rasterisation is discarded by the
+    pipeline. Returns the new module and the extra reflection bindings."""
+    words = list(m.words); bound = words[3]
+    def new_id():
+        nonlocal bound; bound += 1; return bound - 1
+    types = {}   # existing types by (op, operands after the result id)
+    for _p, op, w in m.insns:
+        if op in (19, 21, 22, 23, 32): types.setdefault((op,) + tuple(w[1:]), w[0])
+    decos, tdefs, iface = [], [], []
+    def ty(op, *ops):
+        k = (op,) + ops
+        if k not in types: i = new_id(); types[k] = i; tdefs.append(_ins(op, i, *ops))
+        return types[k]
+    def const(t, v):
+        i = new_id(); tdefs.append(_ins(43, t, i, v)); return i
+    t_float, t_uint, t_int = ty(22, 32), ty(21, 32, 0), ty(21, 32, 1)
+    # storage buffers: struct { float d[]; } -- StorageBuffer + Block from SPIR-V 1.3, Uniform + BufferBlock before
+    sb_class, sb_deco = (12, 2) if words[1] >= 0x10300 else (2, 3)
+    rarr = new_id(); tdefs.append(_ins(29, rarr, t_float)); decos.append(_ins(71, rarr, 6, 4))           # ArrayStride 4
+    sbs = new_id(); tdefs.append(_ins(30, sbs, rarr)); decos.append(_ins(71, sbs, sb_deco)); decos.append(_ins(72, sbs, 0, 35, 0))   # Offset 0
+    p_sbs = new_id(); tdefs.append(_ins(32, p_sbs, sb_class, sbs))
+    p_uf = new_id(); tdefs.append(_ins(32, p_uf, sb_class, t_float))
+    nb = len(tf['slots']); bufs = []
+    for b in range(nb):
+        v = new_id(); tdefs.append(_ins(59, p_sbs, v, sb_class)); bufs.append(v); iface.append(v) if words[1] >= 0x10400 else None
+        decos.append(_ins(71, v, 34, 0)); decos.append(_ins(71, v, 33, TF_BUF_BINDING + b))
+    # info block: 12 uints {first, count, base_instance, pad, stride0..3, off0..3}; off_b: the buffer's start in floats past the
+    # 64-byte aligned offset the descriptor has to use (storage buffer offset alignment on the Adreno)
+    info_t = new_id(); tdefs.append(_ins(30, info_t, *([t_uint] * 12))); decos.append(_ins(71, info_t, 2))   # Block
+    for k in range(12): decos.append(_ins(72, info_t, k, 35, 4 * k))
+    p_info = new_id(); tdefs.append(_ins(32, p_info, 2, info_t)); p_uu = new_id(); tdefs.append(_ins(32, p_uu, 2, t_uint))
+    info = new_id(); tdefs.append(_ins(59, p_info, info, 2)); decos.append(_ins(71, info, 34, 0)); decos.append(_ins(71, info, 33, TF_INFO_BINDING))
+    if words[1] >= 0x10400: iface.append(info)   # SPIR-V 1.4: every global the entry point uses is in its interface
+    # built-ins: vertex and instance index (an existing declaration is used with its own integer type)
+    def builtin(bi):
+        for v in m.vars.values():
+            if v.builtin == bi and v.storage == 1: return v.id, (t_uint if m.scalar_class(m.elem(v.pointee)[0]) == 'uint' else t_int)
+        p_in = new_id(); tdefs.append(_ins(32, p_in, 1, t_int)); v = new_id(); tdefs.append(_ins(59, p_in, v, 1))
+        decos.append(_ins(71, v, 11, bi)); iface.append(v); return v, t_int
+    vid, vid_t = builtin(42); iid, iid_t = builtin(43)
+    cu = [const(t_uint, k) for k in range(12)]; ci0 = const(t_int, 0)
+    # the outputs to capture
+    outs = {}
+    for v in m.vars.values():
+        if v.storage == 3 and v.location >= 0 and v.builtin < 0: outs[v.location] = v
+    p_of = new_id(); tdefs.append(_ins(32, p_of, 3, t_float)); p_oi = new_id(); tdefs.append(_ins(32, p_oi, 3, t_int)); p_ou = new_id(); tdefs.append(_ins(32, p_ou, 3, t_uint))
+    def store_block():
+        c = []
+        def op(o, t, *a):
+            r = new_id(); c.extend(_ins(o, t, r, *a)); return r
+        def load_u(k):
+            pk = op(65, p_uu, info, cu[k]); return op(61, t_uint, pk)
+        first, count, base = load_u(0), load_u(1), load_u(2)
+        vi = op(124, t_uint, op(61, vid_t, vid)); ii = op(124, t_uint, op(61, iid_t, iid))   # OpBitcast to uint
+        slot = op(128, t_uint, op(130, t_uint, vi, first), op(132, t_uint, op(130, t_uint, ii, base), count))   # IAdd(ISub, IMul(ISub))
+        for b in range(nb):
+            ov = outs.get(tf['slots'][b])
+            if ov is None: raise ValueError('transform feedback buffer %d captures location %d, which the shader does not write' % (b, tf['slots'][b]))
+            cls = m.scalar_class(m.elem(ov.pointee)[0])
+            words4 = op(194, t_uint, load_u(4 + b), cu[2])   # ShiftRightLogical: stride / 4
+            base_i = op(128, t_uint, op(132, t_uint, slot, words4), load_u(8 + b))
+            for k in range(tf['comps'][b]):
+                if cls == 'float': val = op(61, t_float, op(65, p_of, ov.id, cu[k]))
+                else: val = op(124, t_float, op(61, t_int if cls == 'int' else t_uint, op(65, p_oi if cls == 'int' else p_ou, ov.id, cu[k])))
+                ptr = op(65, p_uf, bufs[b], ci0, op(128, t_uint, base_i, cu[k]))
+                c.extend(_ins(62, ptr, val))
+        return c
+    # rebuild: annotations after the last annotation, types after the last global, stores before each OpReturn of main
+    out = words[:5]; last_anno = last_global = -1
+    for idx, (p, op, w) in enumerate(m.insns):
+        if op in (71, 72, 332, 333): last_anno = idx
+        if op in (19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 39, 41, 42, 43, 44, 45, 46, 48, 49, 50, 51, 52, 59) and not _in_function(m, p): last_global = idx
+    in_main = False
+    for idx, (p, op, w) in enumerate(m.insns):
+        n = words[p] >> 16; ins = words[p:p + n]
+        if op == 15 and iface: ins = [((n + len(iface)) << 16) | 15] + ins[1:] + iface   # OpEntryPoint interface
+        if op == 54: in_main = w[1] == m.entry_id
+        if op == 253 and in_main: out.extend(store_block())
+        out.extend(ins)
+        if op == 56: in_main = False
+        if idx == last_anno: [out.extend(d) for d in decos]
+        if idx == last_global: [out.extend(t) for t in tdefs]
+    out[3] = bound
+    extra = [{'name': 'tf_info', 'set': 0, 'binding': TF_INFO_BINDING, 'desc': 'ubo', 'count': 1, 'kind': 'tf_info'}]
+    extra += [{'name': 'tf_b%d' % b, 'set': 0, 'binding': TF_BUF_BINDING + b, 'desc': 'ssbo', 'count': 1, 'kind': 'tf_buf', 'reg': b, 'rw': True} for b in range(nb)]
+    return struct.pack('<%dI' % len(out), *out), extra
+
+SBUF_OFF_BINDING = 97   # set 0 (vertex / compute) or the fragment set; nvn_vk_exec.c fills it (kind sbuf_off)
+_RESULT_TYPED = set(range(43, 47)) | {59, 61, 65, 66, 77, 78, 79, 80, 81, 82, 83, 12, 57, 245} | set(range(109, 205))
+
+def sbuf_offsets(m, stage):
+    """The translator's storage buffer accesses index from the buffer's exact address (16-byte aligned, Metal's rule),
+    but a Vulkan descriptor offset must be a multiple of minStorageBufferOffsetAlignment (64 on the Adreno), so the
+    backend binds each storage buffer at its address rounded down. Every access chain into a storage buffer now adds that
+    binding's distance from the rounded-down start, in 4-byte elements, read from one more storage buffer: o[binding].
+    Returns the new module and the reflection binding, or None when the shader has no storage buffers."""
+    words = list(m.words); bound = words[3]
+    def is_sbuf(v):
+        if v.storage == 12: return True
+        return v.storage == 2 and m.has_deco(v.pointee, 3)
+    sb = {v.id: v for v in m.vars.values() if v.binding >= 0 and is_sbuf(v)}
+    if not sb: return None
+    def new_id():
+        nonlocal bound; bound += 1; return bound - 1
+    rtype = {}
+    for _p, op, w in m.insns:
+        if op in _RESULT_TYPED and len(w) >= 2: rtype[w[1]] = w[0]
+    t_uint = next((w[0] for _p, op, w in m.insns if op == 21 and w[1] == 32 and w[2] == 0), None)
+    t_int = next((w[0] for _p, op, w in m.insns if op == 21 and w[1] == 32 and w[2] == 1), None)
+    tdefs, decos = [], []
+    if t_uint is None: t_uint = new_id(); tdefs.append(_ins(21, t_uint, 32, 0))
+    sb_class, sb_deco = (12, 2) if words[1] >= 0x10300 else (2, 3)
+    set_ = 1 if stage == 'ps' else 0
+    rarr = new_id(); tdefs.append(_ins(29, rarr, t_uint)); decos.append(_ins(71, rarr, 6, 4))
+    st = new_id(); tdefs.append(_ins(30, st, rarr)); decos.append(_ins(71, st, sb_deco)); decos.append(_ins(72, st, 0, 35, 0)); decos.append(_ins(72, st, 0, 24))   # NonWritable
+    p_st = new_id(); tdefs.append(_ins(32, p_st, sb_class, st)); p_u = new_id(); tdefs.append(_ins(32, p_u, sb_class, t_uint))
+    offs = new_id(); tdefs.append(_ins(59, p_st, offs, sb_class)); decos.append(_ins(71, offs, 34, set_)); decos.append(_ins(71, offs, 33, SBUF_OFF_BINDING))
+    c0 = new_id(); tdefs.append(_ins(43, t_uint, c0, 0))
+    cb = {}
+    def cbind(b):
+        if b not in cb: cb[b] = new_id(); tdefs.append(_ins(43, t_uint, cb[b], b))
+        return cb[b]
+    for v in sb.values(): cbind(v.binding)
+    out = words[:5]; last_anno = max(i for i, (p, op, w) in enumerate(m.insns) if op in (71, 72, 332, 333))
+    last_global = max(i for i, (p, op, w) in enumerate(m.insns)
+                      if op in (19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 39, 41, 42, 43, 44, 45, 46, 48, 49, 50, 51, 52, 59) and not _in_function(m, p))
+    patched = 0
+    for idx, (p, op, w) in enumerate(m.insns):
+        n = words[p] >> 16; ins = list(words[p:p + n])
+        if op in (65, 66) and w[2] in sb and len(w) >= 5:   # result type, result, base, member, element[, ...]
+            v = sb[w[2]]; elem = w[4]; et = rtype.get(elem, t_uint)
+            po = new_id(); o = new_id(); ins_pre = _ins(65, p_u, po, offs, c0, cbind(v.binding)) + _ins(61, t_uint, o, po)
+            if et != t_uint:
+                oc = new_id(); ins_pre += _ins(124, et, oc, o); o = oc
+            ne = new_id(); ins_pre += _ins(128, et, ne, elem, o)
+            out.extend(ins_pre); ins[5] = ne; patched += 1
+        out.extend(ins)
+        if idx == last_anno: [out.extend(d) for d in decos]
+        if idx == last_global: [out.extend(t) for t in tdefs]
+    out[3] = bound
+    iface_needed = words[1] >= 0x10400
+    if iface_needed:   # SPIR-V 1.4: the new global joins the entry point's interface
+        raise ValueError('SPIR-V 1.4 interface update not implemented')
+    refl = {'name': 'sbuf_off', 'set': set_, 'binding': SBUF_OFF_BINDING, 'desc': 'ssbo', 'count': 1, 'kind': 'sbuf_off'}
+    return struct.pack('<%dI' % len(out), *out), refl, patched
+
+def vs_out_defaults(m):
+    """Scarlet (as nvn_mtl.m vs_out_defaults): on the GPU a varying component the vertex shader never writes reads as
+    (0, 0, 0, 1); in SPIR-V an unwritten output is undefined. Every float vec4 user output now starts as (0, 0, 0, 1) at
+    the top of the entry function (a write by the shader still replaces it)."""
+    words = list(m.words); bound = words[3]
+    t_float = next((w[0] for _p, op, w in m.insns if op == 22 and w[1] == 32), None)
+    t_vec4 = next((w[0] for _p, op, w in m.insns if op == 23 and w[1] == t_float and w[2] == 4), None) if t_float else None
+    outs = [v for v in m.vars.values() if v.storage == 3 and v.location >= 0 and v.builtin < 0 and t_vec4 and v.pointee == t_vec4]
+    if not outs: return None
+    c0, c1, cv = bound, bound + 1, bound + 2; bound += 3
+    consts = _ins(43, t_float, c0, 0) + _ins(43, t_float, c1, 0x3f800000) + _ins(44, t_vec4, cv, c0, c0, c0, c1)
+    stores = sum((_ins(62, v.id, cv) for v in outs), [])
+    out = words[:5]; last_global = max(i for i, (p, op, w) in enumerate(m.insns)
+                                       if op in (19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 39, 41, 42, 43, 44, 45, 46, 48, 49, 50, 51, 52, 59) and not _in_function(m, p))
+    state = 0   # 1: in the entry function before its first label, 2: after the label (function variables come first), 3: done
+    for idx, (p, op, w) in enumerate(m.insns):
+        n = words[p] >> 16
+        if state == 2 and op != 59: out.extend(stores); state = 3
+        if op == 54 and w[1] == m.entry_id: state = 1
+        if op == 248 and state == 1: state = 2   # OpLabel
+        out.extend(words[p:p + n])
+        if idx == last_global: out.extend(consts)
+    out[3] = bound
+    return struct.pack('<%dI' % len(out), *out)
+
+def _in_function(m, p):
+    return any(fs <= p < fe for fs, fe in m.functions)
 
 # ---------- reflection (Service.cs HandleSpirv) ----------
 TEX_BASE, SAMP_BASE, IMG_BASE, COMBINED_BASE, COMBINED_SLOTS = 0x168, 0x568, 0x120, 0x20, 32
@@ -257,7 +443,7 @@ class Translator:
 
 def handle(tr, rq):
     variant, stage = rq['variant'], rq['stage']
-    code = bytes.fromhex(rq.pop('code_hex'))
+    code = bytes.fromhex(rq.pop('code_hex')); tf = rq.pop('tf', None)
     code_path = os.path.join(tr.out, variant + '.code')
     with open(code_path, 'wb') as f: f.write(code)
     msl_rq = {k: v for k, v in rq.items() if k not in ('caps',)}
@@ -270,7 +456,14 @@ def handle(tr, rq):
     if stage == 'ps':   # the SPIR-V chain's layout: fragment resources in set 1, the shared support buffer in set 0
         spv = m.set_descriptor_sets(lambda v: None if v.name == 'support_buffer' else 1)
         m = Spirv(spv)
+    if stage == 'vs':   # unwritten varying components read (0, 0, 0, 1), as on the GPU
+        d = vs_out_defaults(m)
+        if d: spv = d; m = Spirv(spv)
     refl = reflect(m, rq, res, variant, tr.chain)
+    so = sbuf_offsets(m, stage)   # storage buffers: the descriptor's 64-byte aligned start vs the buffer's address
+    if so: spv, extra, _n = so; m = Spirv(spv); refl['bindings'].append(extra)
+    if tf:   # Scarlet: a transform feedback variant of a vertex shader (nvn_vk_exec.c draws it with rasterisation discarded)
+        spv, extra = tf_patch(m, tf); refl['bindings'] += extra; refl['tf'] = tf
     return spv, json.dumps(refl, indent=1).encode()
 
 def serve(tr, port):

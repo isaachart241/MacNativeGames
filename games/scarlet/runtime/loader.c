@@ -348,9 +348,17 @@ static void crash(int num,siginfo_t *info,void *context) {
  signal_hex("[totk] signal=",num);signal_hex("fault=",(uintptr_t)info->si_addr);signal_hex("esr=",UC_ESR(u));
  {mach_vm_address_t ra=(uintptr_t)info->si_addr;mach_vm_size_t rs=0;vm_region_basic_info_data_64_t ri;mach_msg_type_number_t rc=VM_REGION_BASIC_INFO_COUNT_64;mach_port_t ro=0;
   if(mach_vm_region(mach_task_self(),&ra,&rs,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&ri,&rc,&ro)==KERN_SUCCESS){signal_hex("region=",ra);signal_hex("region size=",rs);signal_hex("region prot=",(uint64_t)ri.protection|((uint64_t)ri.max_protection<<8));}}signal_hex("pc=",pc);signal_hex("lr=",UC_LR(u));signal_hex("fp=",fp);
+#ifdef __ANDROID__
+ /* Thor port: a fault in a system library (the GPU driver, libc) names the library and the nearest exported symbol. */
+ for(int k=0;k<2;k++){uint64_t at=(k?UC_LR(u):pc)&0x00ffffffffffffffull;Dl_info di;if(dladdr((void *)(uintptr_t)at,&di)&&di.dli_fname){char b[512];int n=snprintf(b,sizeof b,"%s in %s+%#llx (%s+%#llx)\n",k?"lr":"pc",di.dli_fname,(unsigned long long)(at-(uint64_t)(uintptr_t)di.dli_fbase),di.dli_sname?di.dli_sname:"?",(unsigned long long)(di.dli_saddr?at-(uint64_t)(uintptr_t)di.dli_saddr:0));if(n>0)write(2,b,(size_t)n<sizeof b?(size_t)n:sizeof b-1);}}
+#endif
  for(unsigned i=0;i<NM;i++)if(pc>=(uintptr_t)modules[i].base&&pc<(uintptr_t)modules[i].base+modules[i].size){write(2,modules[i].name,strlen(modules[i].name));signal_hex(" offset=",pc-(uintptr_t)modules[i].base);}
  for(unsigned i=0;i<29;i++)signal_hex("x=",UC_X(u,i));signal_hex("sp=",UC_SP(u));
- for(unsigned depth=0;depth<24&&fp&&!(fp&15);depth++){uint64_t frame[2];mach_vm_size_t got=0;if(mach_vm_read_overwrite(mach_task_self(),fp,16,(uintptr_t)frame,&got)!=KERN_SUCCESS||got!=16)break;signal_hex("frame lr=",frame[1]);for(unsigned i=0;i<NM;i++)if(frame[1]>=(uintptr_t)modules[i].base&&frame[1]<(uintptr_t)modules[i].base+modules[i].size){write(2,modules[i].name,strlen(modules[i].name));signal_hex(" offset=",frame[1]-(uintptr_t)modules[i].base);}if(frame[0]==fp)break;fp=frame[0];   /* host-stack switch: frames may move between stacks */}
+ for(unsigned depth=0;depth<24&&fp&&!(fp&15);depth++){uint64_t frame[2];mach_vm_size_t got=0;if(mach_vm_read_overwrite(mach_task_self(),fp,16,(uintptr_t)frame,&got)!=KERN_SUCCESS||got!=16)break;signal_hex("frame lr=",frame[1]);
+#ifdef __ANDROID__
+  {Dl_info di;uint64_t at=frame[1]&0x00ffffffffffffffull;if(dladdr((void *)(uintptr_t)at,&di)&&di.dli_fname){char b[400];int n=snprintf(b,sizeof b,"  in %s+%#llx\n",di.dli_fname,(unsigned long long)(at-(uint64_t)(uintptr_t)di.dli_fbase));if(n>0)write(2,b,(size_t)n<sizeof b?(size_t)n:sizeof b-1);}}
+#endif
+  for(unsigned i=0;i<NM;i++)if(frame[1]>=(uintptr_t)modules[i].base&&frame[1]<(uintptr_t)modules[i].base+modules[i].size){write(2,modules[i].name,strlen(modules[i].name));signal_hex(" offset=",frame[1]-(uintptr_t)modules[i].base);}if(frame[0]==fp)break;fp=frame[0];   /* host-stack switch: frames may move between stacks */}
  /* TOTK_CRASH_MEM=<reg>[:<signed offset>[:<bytes>]]: dump words at register+offset; TOTK_CRASH_MEM_FOLLOW=k1,k2,...: for each
     listed word index, dump 0x100 bytes at that pointer and the ASCII of every readable pointer inside it (data-structure faults). */
  {const char *e=getenv("TOTK_CRASH_MEM");if(e){unsigned r=(unsigned)strtoul(e,NULL,0);const char *c=strchr(e,':');int64_t off=c?strtoll(c+1,NULL,0):0;const char *c2=c?strchr(c+1,':'):NULL;

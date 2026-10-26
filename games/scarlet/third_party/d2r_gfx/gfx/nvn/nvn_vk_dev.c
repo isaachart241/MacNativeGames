@@ -25,7 +25,7 @@ void vk_big_unlock(void) { pthread_mutex_unlock(&g_big); }
 static uint64_t g_fence;                       // last committed fence (submit thread)
 static pthread_mutex_t g_done_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_done_cv = PTHREAD_COND_INITIALIZER;
-static vk_sub *g_pend_head, *g_pend_tail, *g_free_subs;   // under g_done_mu
+static vk_sub *g_pend_head, *g_pend_tail;   // under g_done_mu
 static pthread_t g_comp_thread; static int g_comp_started;
 static pthread_cond_t g_pend_cv = PTHREAD_COND_INITIALIZER;
 static VkCommandPool g_oneoff_pool; static pthread_mutex_t g_oneoff_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -269,14 +269,26 @@ void vk_arena_reset(vk_arena *a) {   // keep the newest block, free the rest
 void vk_arena_free(vk_arena *a) { vk_arena_reset(a); if (a->head) { vmaDestroyBuffer(V.vma, a->head->buf, a->head->al); free(a->head); a->head = NULL; } }
 
 // ---------- submissions ----------
+/* Thor port: a command pool is not thread-safe, and submissions are recorded on more than one thread (the game's render
+   thread, and its loading threads when a texture upload opens an implicit submission there). Each recording thread
+   has its own pool; a finished submission goes back to the free list of the thread whose pool its command buffers
+   came from (comp_main), so they are only ever reset and recorded on that thread. Sharing V.cpool crashed the Adreno
+   driver during loads (a NULL dereference inside vulkan.adreno.so, 2026-10-26). */
+typedef struct vk_sub_home { VkCommandPool pool; vk_sub *free; } vk_sub_home;   // free: under g_done_mu
+static _Thread_local vk_sub_home *g_home;
 static vk_sub *sub_new(void) {
+    if (!g_home) {
+        g_home = calloc(1, sizeof *g_home); if (!g_home) VKDIE("submission pool allocation");
+        VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, V.qfam};
+        VKCHECK(vkCreateCommandPool(V.dev, &pci, NULL, &g_home->pool));
+    }
     pthread_mutex_lock(&g_done_mu);
-    vk_sub *s = g_free_subs; if (s) g_free_subs = s->next;
+    vk_sub *s = g_home->free; if (s) g_home->free = s->next;
     pthread_mutex_unlock(&g_done_mu);
     if (!s) {
-        s = calloc(1, sizeof *s);
+        s = calloc(1, sizeof *s); s->home = g_home;
         VkCommandBuffer cbs[2];
-        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, V.cpool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 2};
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, g_home->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 2};
         VKCHECK(vkAllocateCommandBuffers(V.dev, &ai, cbs)); s->pre = cbs[0]; s->cb = cbs[1];
     }
     static uint64_t seq; s->seq = ++seq;
@@ -314,12 +326,18 @@ VkDescriptorSet vk_desc_alloc(VkDescriptorSetLayout l) {
 void vk_sub_defer(vk_sub *s, void (*fn)(void *), void *arg) { vk_defer *d = malloc(sizeof *d); d->fn = fn; d->arg = arg; d->next = s->defer; s->defer = d; }
 typedef struct { void (*fn)(void *); void *arg; uint64_t after; } late_t;
 static late_t *g_late; static int g_nlate, g_clate;   // under g_done_mu: run once g_done >= after
+/* Thor port: another thread may be recording a submission (under the big lock) that still uses the object, e.g. the
+   render thread replaying draws with a texture the game's loading thread releases. Freeing it at once then destroyed an
+   image or view an open command buffer referenced, and the Adreno driver crashed in vkEndCommandBuffer (2026-10-26).
+   While a submission is being recorded the object waits for that submission (the next fence) to complete. */
+static _Atomic int g_recording;
 void vk_defer_free(void (*fn)(void *), void *arg) {
     if (g_sub) { vk_sub_defer(g_sub, fn, arg); return; }
     pthread_mutex_lock(&g_done_mu);
-    if (atomic_load(&g_done) >= g_fence) { pthread_mutex_unlock(&g_done_mu); fn(arg); return; }
+    uint64_t after = g_fence + (atomic_load(&g_recording) ? 1 : 0);
+    if (atomic_load(&g_done) >= after) { pthread_mutex_unlock(&g_done_mu); fn(arg); return; }
     if (g_nlate == g_clate) { g_clate = g_clate ? 2 * g_clate : 64; g_late = realloc(g_late, g_clate * sizeof *g_late); }
-    g_late[g_nlate++] = (late_t){fn, arg, g_fence};
+    g_late[g_nlate++] = (late_t){fn, arg, after};
     pthread_mutex_unlock(&g_done_mu);
 }
 static void retire(vk_sub *s) {
@@ -353,7 +371,7 @@ static void *comp_main(void *arg) {
         pthread_mutex_lock(&g_done_mu);
         g_pend_head = s->next; if (!g_pend_head) g_pend_tail = NULL;
         atomic_store(&g_done, s->fence);
-        s->next = g_free_subs; g_free_subs = s;
+        s->next = s->home->free; s->home->free = s;
         for (int i = 0; i < g_nlate;) if (g_late[i].after <= s->fence) { late_t l = g_late[i]; g_late[i] = g_late[--g_nlate]; pthread_mutex_unlock(&g_done_mu); l.fn(l.arg); pthread_mutex_lock(&g_done_mu); } else i++;
         pthread_cond_broadcast(&g_done_cv);
         pthread_mutex_unlock(&g_done_mu);
@@ -383,6 +401,7 @@ void mtl_sub_begin(void) {
     if (!V.ok) return;
     if (g_sub) { if (g_implicit) { g_implicit = 0; return; } VKDIE("mtl_sub_begin inside a submission"); }
     vk_big_lock();
+    atomic_store(&g_recording, 1);
     g_sub = sub_new();
     vk_pools_sync(g_sub);
     vk_exec_sub_begin();
@@ -431,6 +450,7 @@ uint64_t mtl_sub_commit(void) {
     pthread_cond_signal(&g_pend_cv);
     pthread_mutex_unlock(&g_done_mu);
     g_sub = NULL; g_implicit = 0;
+    atomic_store(&g_recording, 0);
     vk_big_unlock();
     return s->fence;
 }

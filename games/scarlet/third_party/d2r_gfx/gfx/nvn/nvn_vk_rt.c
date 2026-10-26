@@ -380,7 +380,9 @@ int vk_rt_variant(int stage, const uint8_t *control, const uint8_t *code, const 
     uint32_t c1o, c1t; memcpy(&c1o, control + 0x700, 4); memcpy(&c1t, control + 0x704, 4);
     if (!c1t || c1t > 16u << 20 || c1o > c1t || (stage != 5 && c1o < 0x30)) { VKONCE("shader with an implausible code area (%#x / %#x)", c1t, c1o); return 0; }
     uint8_t d[32]; char key[65];
-    sha_ctx c; sha_init(&c); sha_update(&c, control, ctl_key_len(control)); sha_update(&c, code, c1t); sha_final(&c, d); hex(key, d, 32);
+    sha_ctx c; sha_init(&c); sha_update(&c, control, ctl_key_len(control)); sha_update(&c, code, c1t);
+    if (strstr(answers, "\"tf\": {")) sha_update(&c, "transform feedback 2", 20);   /* Scarlet: the capture variant is another shader (2: info block with offsets) */
+    sha_final(&c, d); hex(key, d, 32);
     int dmw = totk_depth_near_minus_w ? totk_depth_near_minus_w() : 0;
     js *ans = js_parse(answers, strlen(answers));
     if (!ans) return 0;
