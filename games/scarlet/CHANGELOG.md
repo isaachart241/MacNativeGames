@@ -355,3 +355,29 @@ Also:
   Metal clear all layers of a layered target. With that a second such pass appears, a 64x64 cube map drawn one face per
   instance (six layers), which before went to face 0 only. Each new layered target is logged once.
 - A save backup is kept in `SCARLET_build/user-data/save-backup/` while a test replays the opening without a save.
+
+### 2026-10-26: Thor port, T0 (device probe) and the Android rewrite
+
+Plan: `~/Games/ThorNative/THOR_SCOPE.md` (outside the repository). The Thor is connected over USB and driven with adb.
+
+**T0, measured on the device** (`android/probe/thor_probe.c`, report in `android/probe/thor-probe-2026-10-26.txt`):
+AYN Thor 12 GB (11.0 GiB usable), Snapdragon 8 Gen 2 (`kalama`), Android 13 / API 33, kernel 5.15, 4 KiB pages, 39-bit
+user address space, 164 GB free. The GPU driver is Qualcomm's Adreno 740 driver 676.53 (Vulkan 1.3.128); the second
+Vulkan library on the system, `vulkan.pastel.so`, is SwiftShader (software). Host checks: `tpidrro_el0` reads 0 (as
+expected on Linux), Bionic's `TLS_SLOT_APP` is free, anonymous memory made executable runs, write faults can be caught
+and retried, `pread` into a write-protected page fails with EFAULT (the case the RomFS retry handles), a 64 GiB
+reservation below 2^39 fits, memfd works. A `dlopen`ed library may not use initial-exec TLS (tested: the linker refuses
+it), which matters for the app stage. Vulkan: BC1–BC7 sampled natively, transform feedback (4 buffers), custom border
+colours, depth clip control, stencil export, vertex-stage stores, buffer device address, dynamic rendering and
+geometry shaders are all there; host memory import, shader layer output and 64-bit shader types are not.
+
+**The rewriter's Android target.** Rewritten code finds its thread slots as "thread pointer + an offset from the key
+page"; on Apple the thread pointer is `tpidrro_el0`. `DM_TARGET=android` makes `patch_nso.py` read `tpidr_el0`
+(Bionic's thread pointer) instead, one instruction per block with every block's length unchanged; the host will keep
+the slots in its executable's static TLS, at a fixed offset from `tpidr_el0` in every thread. The rewrite records
+`# THREAD_REG 1` in `fixups.tsv`, and `structck.py` / `equiv.py` read it (the patch area must then hold `tpidr_el0`
+reads followed by the key-page sequence and no `tpidrro_el0`; the equivalence emulator also requires the real
+`tpidr_el0` to be unchanged after each block). Scarlet has no parameter gates, the only two-word in-place pattern.
+Checked: the Apple rewrite of all three modules is byte-identical to the pinned one; the Android rewrite
+(`SCARLET_build/rewritten/v400-android`) passes the structural check and the equivalence check for sdk (13,993 sites),
+subsdk0 (10,541) and main (25,330), with 0 divergent sites.

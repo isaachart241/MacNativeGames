@@ -1,0 +1,171 @@
+thor_probe (THOR_SCOPE.md step T0)
+
+== host
+  page size 4096
+  tpidr_el0 0x7402331000  tpidrro_el0 0
+  tpidrro_el0 usable as a thread pointer         NO
+  bionic slots 0..7: 0x74035efca8 0x74037114f8 0 0 0 0x3777a6f1e0f8c962 0x7400660a00 0
+  TLS_SLOT_APP (slot 2) empty and writable       yes
+  anonymous memory made executable runs          yes
+  write fault caught, page unprotected, store retried yes
+  pread into a write-protected page: -1 (Bad address)
+  highest mapping ends at 0x7fcd5aa000 (39-bit), largest gap above 4 GiB: 0x62a1870000 bytes at 0x100000000
+  64 GiB PROT_NONE reservation at 0x100000000: ok
+  1 GiB committed inside the reservation         yes
+  memfd_create (page aliasing)                   yes
+  two views of one memfd see the same bytes      yes
+  cpus online 8
+
+== vulkan
+  physical devices: 1
+  device 0: Adreno (TM) 740, type 1, Vulkan 1.3.128, driver Qualcomm Technologies Inc. Adreno Vulkan Driver (Driver Build: 69e13475cb, I1df7ad3aa9, 1703680572
+Date: 12/27/23
+Compiler Version: E031.41.03.47
+Driver Branch: 
+), vendor 0x5143 device 0x43050a01, raw driver version 0x802a4035
+  subgroup size 64, 113 extensions
+
+== core features
+  textureCompressionBC                           yes
+  textureCompressionASTC_LDR                     yes
+  textureCompressionETC2                         yes
+  geometryShader                                 yes
+  tessellationShader                             yes
+  shaderClipDistance                             yes
+  shaderCullDistance                             yes
+  depthClamp                                     yes
+  depthBiasClamp                                 yes
+  depthBounds                                    yes
+  fillModeNonSolid                               yes
+  wideLines                                      yes
+  largePoints                                    yes
+  logicOp                                        yes
+  dualSrcBlend                                   yes
+  independentBlend                               yes
+  multiViewport                                  yes
+  samplerAnisotropy                              yes
+  fragmentStoresAndAtomics                       yes
+  vertexPipelineStoresAndAtomics                 yes
+  shaderStorageImageWriteWithoutFormat           yes
+  shaderStorageImageReadWithoutFormat            yes
+  shaderFloat64                                  NO
+  shaderInt64                                    NO
+  shaderInt16                                    yes
+  imageCubeArray                                 yes
+  multiDrawIndirect                              yes
+  drawIndirectFirstInstance                      yes
+  occlusionQueryPrecise                          yes
+  sampleRateShading                              yes
+  shaderImageGatherExtended                      yes
+  variableMultisampleRate                        yes
+  robustBufferAccess                             yes
+
+== 1.1 / 1.2 / 1.3 features
+  shaderDrawParameters                           yes
+  storageBuffer16BitAccess                       yes
+  shaderOutputLayer                              NO
+  shaderOutputViewportIndex                      NO
+  bufferDeviceAddress                            yes
+  descriptorIndexing                             yes
+  runtimeDescriptorArray                         yes
+  timelineSemaphore                              yes
+  shaderFloat16                                  yes
+  shaderInt8                                     yes
+  scalarBlockLayout                              yes
+  samplerFilterMinmax                            yes
+  drawIndirectCount                              yes
+  hostQueryReset                                 yes
+  samplerMirrorClampToEdge                       yes
+  vulkanMemoryModel                              yes
+  uniformBufferStandardLayout                    yes
+  dynamicRendering                               yes
+  synchronization2                               yes
+  maintenance4                                   yes
+  shaderDemoteToHelperInvocation                 yes
+  inlineUniformBlock                             yes
+  robustImageAccess                              yes
+
+== extensions the backend cares about
+  VK_EXT_transform_feedback                      yes
+  VK_EXT_custom_border_color                     yes
+  VK_EXT_external_memory_host                    NO
+  VK_ANDROID_external_memory_android_hardware_buffer yes
+  VK_KHR_external_memory_fd                      yes
+  VK_EXT_external_memory_dma_buf                 NO
+  VK_EXT_depth_clip_control                      yes
+  VK_EXT_depth_clip_enable                       yes
+  VK_EXT_shader_viewport_index_layer             NO
+  VK_EXT_index_type_uint8                        yes
+  VK_EXT_extended_dynamic_state                  yes
+  VK_EXT_extended_dynamic_state2                 yes
+  VK_EXT_extended_dynamic_state3                 NO
+  VK_EXT_line_rasterization                      yes
+  VK_EXT_provoking_vertex                        yes
+  VK_EXT_shader_stencil_export                   yes
+  VK_EXT_vertex_attribute_divisor                yes
+  VK_KHR_push_descriptor                         yes
+  VK_EXT_descriptor_buffer                       NO
+  VK_EXT_robustness2                             yes
+  VK_EXT_primitive_topology_list_restart         yes
+  VK_EXT_conservative_rasterization              yes
+  VK_EXT_fragment_shader_interlock               NO
+  VK_EXT_shader_subgroup_ballot                  NO
+  VK_EXT_sampler_filter_minmax                   yes
+  VK_EXT_4444_formats                            yes
+  VK_EXT_vertex_input_dynamic_state              yes
+  VK_EXT_multi_draw                              NO
+  VK_EXT_depth_range_unrestricted                NO
+  VK_KHR_fragment_shader_barycentric             NO
+  VK_EXT_pipeline_creation_cache_control         yes
+  VK_KHR_pipeline_executable_properties          yes
+  VK_EXT_memory_budget                           NO
+  VK_EXT_shader_demote_to_helper_invocation      yes
+  VK_KHR_dynamic_rendering_local_read            NO
+  VK_KHR_maintenance5                            NO
+  transform feedback: 4 streams, 4 buffers, query 1, draw indirect 1
+
+== formats (sampled / color attachment / blend / storage / depth)
+  BC1              sampled yes linear-filter yes color no  blend no  storage no  depth no 
+  BC3              sampled yes linear-filter yes color no  blend no  storage no  depth no 
+  BC4              sampled yes linear-filter yes color no  blend no  storage no  depth no 
+  BC5              sampled yes linear-filter yes color no  blend no  storage no  depth no 
+  BC6H unsigned    sampled yes linear-filter yes color no  blend no  storage no  depth no 
+  BC6H signed      sampled yes linear-filter yes color no  blend no  storage no  depth no 
+  BC7              sampled yes linear-filter yes color no  blend no  storage no  depth no 
+  BC7 sRGB         sampled yes linear-filter yes color no  blend no  storage no  depth no 
+  ASTC 4x4         sampled yes linear-filter yes color no  blend no  storage no  depth no 
+  R11G11B10 float  sampled yes linear-filter yes color yes blend yes storage yes depth no 
+  RGBA16 float     sampled yes linear-filter yes color yes blend yes storage yes depth no 
+  RGBA32 float     sampled yes linear-filter no  color yes blend yes storage yes depth no 
+  RGB10A2          sampled yes linear-filter yes color yes blend yes storage yes depth no 
+  RGBA8            sampled yes linear-filter yes color yes blend yes storage yes depth no 
+  RGBA8 sRGB       sampled yes linear-filter yes color yes blend yes storage yes depth no 
+  RGB9E5           sampled yes linear-filter yes color yes blend yes storage no  depth no 
+  R8 uint          sampled yes linear-filter no  color yes blend no  storage yes depth no 
+  D32F S8          sampled yes linear-filter no  color no  blend no  storage no  depth yes
+  D24 S8           sampled yes linear-filter yes color no  blend no  storage no  depth yes
+  D32F             sampled yes linear-filter no  color no  blend no  storage no  depth yes
+  D16              sampled yes linear-filter no  color no  blend no  storage no  depth yes
+  S8               sampled yes linear-filter yes color no  blend no  storage no  depth yes
+
+== limits
+  image 2D 16384, 3D 2048, cube 16384, layers 2048, framebuffer layers 2048, color attachments 8, viewports 16
+  storage buffer range 134217728, uniform buffer range 65536, push constants 256, bound sets 7
+  per stage: samplers 16777216, sampled images 16777216, storage buffers 16777216, uniform buffers 16777216, storage images 16777216, resources 50331648
+  vertex attributes 32, bindings 32, stride 2048; uniform offset align 64, storage offset align 64, texel buffer elements 134217728
+  compute: group size 1024 x 1024 x 1024, invocations 1024, shared memory 32768; timestamp period 52.08 ns, point size range 1..4092
+
+== memory
+  heap 0: 11265 MiB flags 0x1
+  heap 1: 256 MiB flags 0x1
+  type 0 heap 0: device-local
+  type 1 heap 0: device-local
+  type 2 heap 0: device-local
+  type 3 heap 0: device-local host-visible cached
+  type 4 heap 0: device-local host-visible coherent
+  type 5 heap 0: device-local host-visible coherent
+  type 6 heap 0: device-local host-visible coherent cached
+  type 7 heap 1: device-local
+  type 8 heap 0: device-local lazy
+
+  vkCreateDevice with every supported 1.0-1.3 feature: ok (0)

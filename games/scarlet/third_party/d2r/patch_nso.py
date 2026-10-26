@@ -274,7 +274,13 @@ def STUR(t, n, off): return 0xF8000000 | ((off & 0x1FF) << 12) | (n << 5) | t   
 def LDUR(t, n, off): return 0xF8400000 | ((off & 0x1FF) << 12) | (n << 5) | t   # ldur xt,[xn,#off]
 def LDRX(t, n, imm12=0): return 0xF9400000 | (imm12 << 10) | (n << 5) | t
 def STRX(t, n, imm12=0): return 0xF9000000 | (imm12 << 10) | (n << 5) | t
-def MRS_TPIDRRO(t): return 0xD53BD060 | t
+# DM_TARGET=android (Thor port, THOR_SCOPE.md): Linux keeps tpidrro_el0 zero for 64-bit processes, so thread slots are found
+# from tpidr_el0 (Bionic's thread pointer) instead; the host puts them in its static TLS at a fixed offset from it and
+# writes those offsets to the key page. Every emitted block keeps its length: only this one instruction differs.
+TARGET = os.environ.get('DM_TARGET', 'apple')
+assert TARGET in ('apple', 'android'), f'DM_TARGET must be apple or android, not {TARGET}'
+THREAD_REG = 1 if TARGET == 'android' else 0
+def MRS_TPIDRRO(t): return (0xD53BD040 if THREAD_REG else 0xD53BD060) | t   # mrs xt, tpidr_el0 | mrs xt, tpidrro_el0
 def ADRP(dd, pc, target):
     imm = ((target & ~0xFFF) - (pc & ~0xFFF)) >> 12; assert -(1 << 20) <= imm < (1 << 20)
     return 0x90000000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7FFFF) << 5) | dd
@@ -1083,6 +1089,7 @@ elif os.path.exists(P('rules.tsv')):
 with open(P('fixups.tsv'), 'w') as f:
     f.write(f'# PATCH_OFF\t{PATCH_OFF:#x}\n# KEY_PAGE_OFF\t{KEY_PAGE_OFF:#x}\n# KEY_PAGE_SIZE\t0x4000\n# TEXT_END\t{TEXT_END:#x}\n# RO_OFF\t{RO_OFF:#x}\n# DATA_OFF\t{DATA_OFF:#x}\n')
     for k in KEY_INDEX: f.write(f'# KEY_{k}_IDX\t{KEY_INDEX[k]}\n')
+    if THREAD_REG: f.write(f'# THREAD_REG\t{THREAD_REG}\n')   # 1: thread slots are based on tpidr_el0 (DM_TARGET=android)
 with open(P('gates.tsv'), 'w') as f:
     for ret, k, arg, orig in gates: f.write(f'{ret:#x}\t{k}\t{arg}\t{orig:#x}\n')
 with open(P('sites.tsv'), 'w') as f:

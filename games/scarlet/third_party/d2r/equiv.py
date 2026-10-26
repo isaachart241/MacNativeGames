@@ -35,6 +35,7 @@ KEY_IDX = {k[4:-4]: v for k, v in hdr.items() if k.startswith('KEY_') and k.ends
 KEY_SLOT = {k: 300 + i for i, k in enumerate(sorted(KEY_IDX, key=KEY_IDX.get))}
 SLOT18, SLOTTLS, SLOTTLR = (KEY_SLOT[k] for k in ('K18', 'KTLS', 'KTLR'))
 KEY_PAGE_OFF = hdr['KEY_PAGE_OFF']
+TREG = hdr.get('THREAD_REG', 0)               # 1: Android rewrite, slots based on tpidr_el0 (tpidrro_el0 then reads as Linux leaves it: 0)
 pat = bytearray(open(f'{DIR}/{MOD}.patched.bin', 'rb').read())
 orig = nsoimg.load(A.nso)
 ncut = sum(1 for l in open(f'{DIR}/{MOD}.cuts.tsv') if not l.startswith('#'))
@@ -121,7 +122,7 @@ def mk(image, arena0):
     u.mem_map(IB, sz, UC_PROT_ALL); u.mem_write(IB, bytes(image))
     u.mem_map(ARENA, ARENA_SZ); u.mem_write(ARENA, arena0)
     u.mem_map(TSD, 0x10000)
-    u.reg_write(UC_ARM64_REG_TPIDRRO_EL0, TSD)
+    u.reg_write(UC_ARM64_REG_TPIDRRO_EL0, 0 if TREG else TSD)
     st = {'w': [], 'fault': None, 'arena': arena0}
     def wr(uc, acc, addr, size, val, d): st['w'].append((addr, size, val & ((1 << (8 * size)) - 1)))
     def bad(uc, acc, addr, size, val, d): st['fault'] = (acc, addr); return False
@@ -145,6 +146,7 @@ def state(u, st, patched):
     g = [u.reg_read(r) for r in GP]
     tp = u.reg_read(UC_ARM64_REG_TPIDR_EL0)
     if patched: g[18] = struct.unpack('<Q', u.mem_read(TSD + 8 * SLOT18, 8))[0]; tp = struct.unpack('<Q', u.mem_read(TSD + 8 * SLOTTLS, 8))[0]
+    if patched and TREG and u.reg_read(UC_ARM64_REG_TPIDR_EL0) != TSD: tp = ('tpidr_el0 changed by the patch block', u.reg_read(UC_ARM64_REG_TPIDR_EL0))   # the host's thread pointer must survive
     g = g + [tp]
     # Only the runtime's actual TLS slots are private. A guest register-offset
     # store may legitimately land elsewhere in the mapped TSD page (v1.1.2
@@ -158,8 +160,9 @@ def run(u, st, start, patched, init):
     for r, v in zip(GP, init['g']): u.reg_write(r, v)
     for r, v in zip(VR, init['v']): u.reg_write(r, v)
     u.reg_write(UC_ARM64_REG_SP, SP0); u.reg_write(UC_ARM64_REG_NZCV, init['nzcv'])
-    u.reg_write(UC_ARM64_REG_TPIDR_EL0, init['tls'])
+    u.reg_write(UC_ARM64_REG_TPIDR_EL0, TSD if patched and TREG else init['tls'])
     if not patched: u.reg_write(UC_ARM64_REG_TPIDRRO_EL0, init['tlr'])
+    elif TREG: u.reg_write(UC_ARM64_REG_TPIDRRO_EL0, 0)
     if patched:
         for key, idx in KEY_IDX.items():
             u.mem_write(IB + KEY_PAGE_OFF + 8 * idx, struct.pack('<Q', KEY_SLOT[key] * 8))

@@ -40,6 +40,8 @@ out_dir, mod, nso = sys.argv[1:4]
 orig = nsoimg.load(nso)
 h = nsoimg.header(out_dir, mod)
 PO, TE = h['PATCH_OFF'], h['TEXT_END']
+TREG = h.get('THREAD_REG', 0)                 # 1: Android rewrite, thread slots based on tpidr_el0 instead of tpidrro_el0
+TREG_NAME, TREG_WORD, TREG_KIND = ('tpidr_el0', 0xD53BD040, 'tpidr_r') if TREG else ('tpidrro_el0', 0xD53BD060, 'tpidrro_r')
 pat = open(f'{out_dir}/{mod}.patched.bin', 'rb').read()
 W = lambda b, o: struct.unpack_from('<I', b, o)[0]
 fails = []
@@ -233,7 +235,7 @@ nwin_ref = sum(1 for o in ind if o in inwin)
 # ④ 补丁区干净
 # ④ Patch area is clean
 P = llvm_dis(pat[PO:], PO)
-left = sorted(o for o, t in P.items() if RX18.search(t) or sysk(t) not in (None, 'tpidrro_r'))
+left = sorted(o for o, t in P.items() if RX18.search(t) or sysk(t) not in (None, TREG_KIND))
 if left: bad(f'补丁区残留 x18/系统寄存器/svc：{len(left)} 例 {[(hex(x), P[x]) for x in left[:5]]}')
 
 # ⑤ 宿主门
@@ -243,7 +245,7 @@ from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
 _md = Cs(CS_ARCH_ARM64, CS_MODE_ARM); _md.detail = True
 def keyseq(at):
     q = list(_md.disasm(pat[at:at + 20], at))
-    if len(q) < 5 or q[0].mnemonic != 'mrs' or 'tpidrro_el0' not in q[0].op_str \
+    if len(q) < 5 or q[0].mnemonic != 'mrs' or q[0].op_str.split(', ')[-1] != TREG_NAME \
             or q[1].mnemonic != 'adrp' or q[1].operands[1].imm != h['KEY_PAGE_OFF'] \
             or q[2].mnemonic != 'ldr' or q[2].operands[1].mem.base != q[1].operands[0].reg \
             or q[3].mnemonic != 'add' or q[3].operands[0].reg != q[0].operands[0].reg \
@@ -281,7 +283,7 @@ def paramseq(at, r):
     if len(q) < 8 or q[0].mnemonic not in ('stur', 'str') or rn(q[0], 0) != f'x{tmp}' \
             or q[0].operands[1].mem.base != capstone.arm64_const.ARM64_REG_SP or q[0].operands[1].mem.disp not in (-16, -24) \
             or q[1].mnemonic != 'mrs' or rn(q[1], 0) != f'x{r}' \
-            or 'tpidrro_el0' not in q[1].op_str or q[2].mnemonic != 'adrp' \
+            or q[1].op_str.split(', ')[-1] != TREG_NAME or q[2].mnemonic != 'adrp' \
             or q[2].operands[1].imm != h['KEY_PAGE_OFF'] or q[3].mnemonic != 'ldr' \
             or q[3].operands[1].mem.base != q[2].operands[0].reg or q[4].mnemonic != 'add' \
             or q[4].operands[0].reg != q[1].operands[0].reg or q[4].operands[1].reg != q[1].operands[0].reg \
@@ -372,7 +374,7 @@ if set(KEY) != {'K18', 'KTLS', 'KTLR', 'KGATE', 'KRES0', 'KRES1', 'KASPECT', 'KA
 kv = {v: k for k, v in KEY.items()}; nk = {}
 for o in range(PO, len(pat) - 4, 4):
     w = W(pat, o)
-    if w & 0xFFFFFFE0 != 0xD53BD060: continue           # mrs xN, tpidrro_el0
+    if w & 0xFFFFFFE0 != TREG_WORD: continue            # mrs xN, tpidrro_el0 (Android: tpidr_el0)
     n = w & 31; ks = keyseq(o); k = kv.get(ks[1]) if ks else None
     if not ks or k is None:
         bad(f'补丁区 {o:#x} 读 tpidrro 后不是键页间接槽序列'); continue
