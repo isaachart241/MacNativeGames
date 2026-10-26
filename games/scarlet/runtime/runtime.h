@@ -63,6 +63,7 @@ void runtime_thread_init(void);
 void runtime_dispatch(uint64_t ret, uint64_t *regs);
 
 uint64_t runtime_image_bytes(void);
+uintptr_t runtime_main_stack_top(uintptr_t *lo);   /* services.c: the guest main thread's stack (top; *lo its base) */
 
 void runtime_fs_init(void);
 void *runtime_fs_override(const char *name);

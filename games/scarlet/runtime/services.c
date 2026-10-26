@@ -124,7 +124,26 @@ static void memory_init(void) {
  }
 #endif
  heap=low_space+HEAP_OFF;
- fprintf(stderr,"[totk] guest layout: alias %#llx+%#llx stack %#llx+%#llx heap %#llx (cap %#llx)\n",(unsigned long long)ALIAS_START,ALIAS_SIZE,(unsigned long long)STACK_START,STACK_SIZE,(unsigned long long)(uintptr_t)heap,HEAP_CAP);
+ fprintf(stderr,"[totk] guest layout: alias %#llx+%#llx stack %#llx+%#llx heap %#llx (cap %#llx)\n",(unsigned long long)ALIAS_START,(unsigned long long)ALIAS_SIZE,(unsigned long long)STACK_START,STACK_SIZE,(unsigned long long)(uintptr_t)heap,HEAP_CAP);
+}
+/* The guest main thread's stack. Horizon gives the main thread a fresh, zero-filled stack; the main thread here used to run
+   guest code on its native stack, below frames the host had left there during startup, and with no host-stack switch,
+   so host functions it called wrote their frames among the game's. Scarlet then read an uninitialised local holding a
+   host stack address as a time (0x7f_ffff_d4d0 on the Thor, 2^39 territory; the Mac's 0x16f... addresses happened to stay
+   below the game's 2^31 * 180 limit) and aborted in its Lua int() helper, 2026-10-26. Now the main thread gets 8 MiB just
+   below the stack region (inside the ASLR range the game is told about), and its host calls switch to the native stack
+   like every other guest thread's (loader.c boot). */
+#define MAIN_STACK_SIZE (8ULL<<20)
+static uintptr_t main_stack_lo;
+uintptr_t runtime_main_stack_top(uintptr_t *lo){
+ memory_init();
+ if(!main_stack_lo){
+  uintptr_t at=STACK_START-MAIN_STACK_SIZE;
+  if(mach_vm_protect(mach_task_self(),(mach_vm_address_t)at,MAIN_STACK_SIZE,FALSE,VM_PROT_READ|VM_PROT_WRITE)!=KERN_SUCCESS)runtime_fail("guest main thread stack");
+  main_stack_lo=at;
+ }
+ if(lo)*lo=main_stack_lo;
+ return main_stack_lo+MAIN_STACK_SIZE;
 }
 /* Scoped stack moves: independent host backing, copy back on unmap.
  * Logical accounting is 4 KiB; Darwin protections are rounded to 16 KiB.
@@ -230,7 +249,15 @@ static void observed_os_init(uint64_t h,uint64_t args) {
 }
 static void observed_sdk_init(void) { fprintf(stderr,"[totk] ENTER nninitInitializeSdkModule\n");((void(*)(void))runtime_symbol("nninitInitializeSdkModule"))();fprintf(stderr,"[totk] RETURN nninitInitializeSdkModule\n"); }
 static void observed_startup(void) { fprintf(stderr,"[totk] ENTER nninitStartup\n");((void(*)(void))runtime_symbol("nninitStartup"))();fprintf(stderr,"[totk] RETURN nninitStartup\n"); }
-static void observed_main(void) { fprintf(stderr,"[totk] ENTER nnMain\n");((void(*)(void))runtime_symbol("nnMain"))();fprintf(stderr,"[totk] RETURN nnMain\n"); }
+/* Not wrapped onto the host stack (loader.c relocate): nnMain runs on the guest main stack. What startup left below this
+   frame (SDK init, module constructors, host callbacks, this fprintf) is zeroed first, without touching the stack while
+   doing it, so the game starts from the clean stack Horizon would give it. */
+static void observed_main(void) {
+ fprintf(stderr,"[totk] ENTER nnMain\n");
+ uintptr_t lo=0,top=runtime_main_stack_top(&lo),sp;__asm__ volatile("mov %0, sp":"=r"(sp));
+ if(sp>lo&&sp<=top)__asm__ volatile("1: cmp %0, %1\n b.hs 2f\n stp xzr, xzr, [%0], #16\n b 1b\n 2:":"+r"(lo):"r"(sp&~(uintptr_t)15):"cc","memory");
+ ((void(*)(void))runtime_symbol("nnMain"))();fprintf(stderr,"[totk] RETURN nnMain\n");
+}
 static void cpu_boost(int mode) { if(mode<0||mode>2)runtime_fail("unknown CPU boost mode");fprintf(stderr,"[totk] CPU boost request %d: macOS manages CPU frequency\n",mode); }
 /* TOTK_OPERATION_MODE=handheld reports the Switch handheld mode (oe OperationMode 0, PerformanceMode Normal 0) instead of
    docked (1, Boost 1): the game then uses its own handheld settings (1280x720 output, lower internal resolution), which
@@ -303,9 +330,32 @@ static uint32_t observed_region(uint64_t *out,uint64_t size){
  return r;
 }
 static uint32_t observed_pages(uint64_t addr,uint64_t size){uint32_t r=((uint32_t(*)(uint64_t,uint64_t))runtime_symbol("_ZN2nn2os19AllocateMemoryPagesEmm"))(addr,size);fprintf(stderr,"[totk] AllocateMemoryPages address=%llx size=%llx result=%x\n",(unsigned long long)addr,(unsigned long long)size,r);return r;}
+/* Game aborts (nn::diag::detail::AbortImpl, the three forms main imports): the condition, function, file, line and, when
+   there is one, the message are logged before the SDK's own abort runs. The message is formatted with the first
+   variadic arguments only (up to three, integers and pointers; they arrive in x5..x7 / x6..x7 under the guest's calling
+   convention), so a float argument prints wrong; the original is called with every register unchanged. */
+static const char *abort_str(uint64_t p){return p?(const char *)(uintptr_t)p:"(null)";}
+static void abort_log(uint64_t cond,uint64_t fn,uint64_t file,uint64_t line,const uint64_t *result,uint64_t fmt,uint64_t a,uint64_t b,uint64_t c){
+ fprintf(stderr,"[totk] game abort: %s in %s (%s:%d)",abort_str(cond),abort_str(fn),abort_str(file),(int)line);
+ if(result)fprintf(stderr," result=%#x",(unsigned)*result);
+ if(fmt){char msg[512];snprintf(msg,sizeof msg,abort_str(fmt),a,b,c);fprintf(stderr,": %s",msg);}
+ fputc('\n',stderr);
+}
+typedef void (*abort_fn)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
+static void observed_abort(uint64_t x0,uint64_t x1,uint64_t x2,uint64_t x3,uint64_t x4,uint64_t x5,uint64_t x6,uint64_t x7){
+ abort_log(x0,x1,x2,x3,NULL,0,0,0,0);((abort_fn)runtime_symbol("_ZN2nn4diag6detail9AbortImplEPKcS3_S3_i"))(x0,x1,x2,x3,x4,x5,x6,x7);
+}
+static void observed_abort_fmt(uint64_t x0,uint64_t x1,uint64_t x2,uint64_t x3,uint64_t x4,uint64_t x5,uint64_t x6,uint64_t x7){
+ abort_log(x0,x1,x2,x3,NULL,x4,x5,x6,x7);((abort_fn)runtime_symbol("_ZN2nn4diag6detail9AbortImplEPKcS3_S3_iS3_z"))(x0,x1,x2,x3,x4,x5,x6,x7);
+}
+static void observed_abort_result(uint64_t x0,uint64_t x1,uint64_t x2,uint64_t x3,uint64_t x4,uint64_t x5,uint64_t x6,uint64_t x7){
+ abort_log(x0,x1,x2,x3,x4?(const uint64_t *)(uintptr_t)x4:NULL,x5,x6,x7,0);((abort_fn)runtime_symbol("_ZN2nn4diag6detail9AbortImplEPKcS3_S3_iPKNS_6ResultES3_z"))(x0,x1,x2,x3,x4,x5,x6,x7);
+}
 void *runtime_observer(const char *name) {
  static const struct {const char *name;void *fn;} entries[]={
- {"_ZN2nn2os21AllocateAddressRegionEPmm",observed_region},{"_ZN2nn2os19AllocateMemoryPagesEmm",observed_pages},{"nnosInitialize",observed_os_init},{"nninitInitializeSdkModule",observed_sdk_init},{"nninitStartup",observed_startup},{"nnMain",observed_main}};
+ {"_ZN2nn2os21AllocateAddressRegionEPmm",observed_region},{"_ZN2nn2os19AllocateMemoryPagesEmm",observed_pages},{"nnosInitialize",observed_os_init},{"nninitInitializeSdkModule",observed_sdk_init},{"nninitStartup",observed_startup},{"nnMain",observed_main},
+ {"_ZN2nn4diag6detail9AbortImplEPKcS3_S3_i",observed_abort},{"_ZN2nn4diag6detail9AbortImplEPKcS3_S3_iS3_z",observed_abort_fmt},
+ {"_ZN2nn4diag6detail9AbortImplEPKcS3_S3_iPKNS_6ResultES3_z",observed_abort_result}};
  for(size_t i=0;i<sizeof(entries)/sizeof(entries[0]);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;return NULL;
 }
 void *runtime_override(const char *name) {
@@ -369,8 +419,9 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
   uint64_t addr=r[2],base=addr&~0xfffULL,size=0x1000;unsigned state=0,perm=0,attr=0;
   uintptr_t top=(uintptr_t)pthread_get_stackaddr_np(pthread_self());size_t stack=pthread_get_stacksize_np(pthread_self());
   if(addr>=top-stack&&addr<top){base=top-stack;size=stack;state=0xb;perm=3;}
+  else if(main_stack_lo&&addr>=main_stack_lo&&addr<main_stack_lo+MAIN_STACK_SIZE){base=main_stack_lo;size=MAIN_STACK_SIZE;state=0xb;perm=3;}
   else if(addr>=(uintptr_t)heap&&addr<(uintptr_t)heap+heap_size){base=(uintptr_t)heap;size=heap_size;state=5;perm=3;}
-  else if(addr>=(uintptr_t)low_space&&addr<(uintptr_t)low_space+LOW_SIZE){base=(uintptr_t)low_space;size=LOW_SIZE;if(addr<(uintptr_t)heap){size=(uintptr_t)heap-base;}else{base=(uintptr_t)heap+heap_size;size=(uintptr_t)low_space+LOW_SIZE-base;}}
+  else if(addr>=(uintptr_t)low_space&&addr<(uintptr_t)low_space+LOW_SIZE){base=(uintptr_t)low_space;size=LOW_SIZE;if(addr<(uintptr_t)heap){if(main_stack_lo&&addr>=main_stack_lo+MAIN_STACK_SIZE){base=main_stack_lo+MAIN_STACK_SIZE;}size=(main_stack_lo&&addr<main_stack_lo?main_stack_lo:(uintptr_t)heap)-base;}else{base=(uintptr_t)heap+heap_size;size=(uintptr_t)low_space+LOW_SIZE-base;}}
   else if(addr>=(uintptr_t)low_space+LOW_SIZE&&addr<ALIAS_START){base=(uintptr_t)low_space+LOW_SIZE;size=ALIAS_START-base;state=0x10;perm=0;}   /* host-owned: Inaccessible */
   else if(!addr){base=0;size=ASLR_START;state=0;perm=0;}
   else if(runtime_module_query(addr,&base,&size,&state,&perm,&attr)){}

@@ -381,3 +381,54 @@ reads followed by the key-page sequence and no `tpidrro_el0`; the equivalence em
 Checked: the Apple rewrite of all three modules is byte-identical to the pinned one; the Android rewrite
 (`SCARLET_build/rewritten/v400-android`) passes the structural check and the equivalence check for sdk (13,993 sites),
 subsdk0 (10,541) and main (25,330), with 0 divergent sites.
+
+### 2026-10-26: Thor port, T1: the game runs on the device (no picture yet)
+
+**The link.** The Android build (`android/Makefile`, `make -f android/Makefile`, then `push` / `boot`) compiles every
+runtime and graphics source except the Objective-C ones, with three stand-ins: `nvn_null.c` (the TotK tree's null
+graphics backend: every `mtl_*` entry with the CPU-visible effects of a submission done at once — event writes, counter
+reports, buffer copies, uniform updates — and fences signalled when committed; Scarlet's diagnostics hooks added),
+`runtime/frontend_android.c` (no window: boot progress on stderr, a placeholder VI window, a 60 Hz vsync thread, text
+input answered from `SCARLET_TEXT`, default "Thor") and `runtime/gamepad_android.c` (no controller yet; the input
+script of `runtime/input.c` works). The Mac Makefile leaves those three out. Assembly takes its own rule (no C prelude).
+
+**First run: an SDK abort in `NvOsDrvOpen`.** The game reached `nnMain`, made its threads, and then opened the real
+NVN driver: `nvnBootstrapLoader` was not replaced. `HLE_FORCE` (`host/hle.h`) still put its table entries in the Mach-O
+section name `__DATA,totkgfx`, which on ELF is a different section from the `totkgfx` that `gfx_bridge.c` reads. Fixed
+the same way as the other registration sections.
+
+**Second run: the main loop.** 4,200 frames at 33.3 ms (the game's own 30 fps, present interval 2), the title screen
+waiting for input. Module bases are now printed at load (`mapped main at …`).
+
+**Third run, with the Mac save copied over (`user-data/account.uid` and the save folder): Continue aborted** with a
+guest `Break`. `runtime/services.c` now logs `nn::diag::detail::AbortImpl` (all three forms main imports: condition,
+function, file, line, message), which named it: a Lua error, `bad argument #1 to 'band' (number has no integer
+representation)`. Ruled out one at a time, each by a run on the Mac or the Thor: the GPU output (the Mac without GPU
+submission continues), audio (the Mac with `SCARLET_AUDIO=0 TOTK_AUDIO_OFF=1` continues), the silent Opus stand-in
+(the Mac built with `-DSCARLET_OPUS_SILENT`, now a switch in `opus_codec.c`, continues), the guest address layout (the
+Thor with the low region moved still aborts), timing (the Thor pinned to its big cores still aborts), FPCR (both start
+threads at 0; the game sets flush-to-zero itself), the rewrite (the Apple and Android rewrites differ only in the 50,172
+thread-register reads, and neither leaves a `tpidr_el0` access). Decisive: the Thor's exact file set (null backend,
+headless front end) built natively for the Mac continues, so the difference was the platform.
+
+Under `lldb-server` on the Thor (the NDK's), a breakpoint on Lua's "no integer representation" path
+(`luaL_checkinteger`, main+0x24390) and a small Lua 5.4 stack walker (bytecode and constants decoded) showed the game's
+own `int()` helper failing on `timeT / 180` with `timeT = 549,755,802,832 = 0x7f_ffff_d4d0`: a host stack address (ASLR
+off under the debugger, the main thread's native stack right under 2^39). The game reads an uninitialised local there.
+The cause was ours: the game's main thread ran guest code on its native stack, below what the host had left there
+during startup, and with no host-stack switch, so host functions it called wrote their frames among the game's. On the
+Mac the leftovers are `0x16f…` addresses, small enough that `int()` takes its `math.floor` branch and nothing shows.
+
+Fix (both platforms): the main thread now gets a fresh, zero-filled 8 MiB guest stack just below the stack region
+(`runtime_main_stack_top`, reported as a stack by `svcQueryMemory`); `boot()` switches to it before `nn::init::Start`
+and gives the thread a host stack on its native one, as every created thread has; the `nnMain` observer is no longer
+moved to the host stack and zeroes the guest stack below itself before entering the game, so it starts from the clean
+stack Horizon gives it.
+
+Checked: on the Thor, Continue loads the save and the game runs on (frames 1,200–4,200: 59–63 NVN functions and about
+3,700 calls a frame, the Mac's numbers for the same point; 1.35 GB footprint without textures in GPU memory). On the
+Mac, the regression run (two A presses, screenshot at 60 s, GPU on) reaches the house as before.
+
+Not checked: anything visible on the Thor (no graphics backend yet), the new-game path with an empty save on the Thor
+(it sat idle after the first A on the title before this fix; not retried), sound (no AAudio output, Opus silent until
+libopus is built for Android), controllers.

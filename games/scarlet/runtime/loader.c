@@ -207,7 +207,7 @@ static void map_module(Module *m,const char *dir) {
  uint64_t *key=(void *)(m->base+m->key_off);
  for(unsigned i=0;i<8;i++)key[i]=runtime_slot_offset(i);
  make_hash(m);
- fprintf(stderr,"[totk] mapped %s size=%zu symbols=%u\n",m->name,m->size,m->nsym);
+ fprintf(stderr,"[totk] mapped %s at %p size=%zu symbols=%u\n",m->name,(void *)m->base,m->size,m->nsym);
 }
 /* TOTK_EXPORT_IOS=<dir>: after the game patches, write each module's text [0, page_up(TEXT_END)) for ios/tools/gen_embed.py.
    Relocations never reach the text (they start at DATA_OFF), so the exported bytes differ from the verified image only at
@@ -238,7 +238,7 @@ static void relocate(Module *m) {
    need(r->kind==257||r->kind==1025||r->kind==1026,"relocation kind");
    const Symbol *s=&m->symbols[r->symbol];void *p=r->kind==1026?runtime_observer(s->name):NULL;
    if(!p)p=runtime_override(s->name);
-   if(p)p=runtime_hle_wrap_named(p,s->name);   /* host replacements run on the thread's host stack */
+   if(p&&strcmp(s->name,"nnMain"))p=runtime_hle_wrap_named(p,s->name);   /* host replacements run on the thread's host stack; the nnMain observer stays on the guest stack (services.c) */
    if(!p)p=s->defined?(s->value<m->key_off?m->base+s->value:NULL):runtime_symbol(s->name);
    if(!p&&s->binding!=2){fprintf(stderr,"%s unresolved %s\n",m->name,s->name);runtime_fail("strong import unresolved");}
    if(!p)m->weak++;
@@ -438,13 +438,22 @@ void runtime_startup_checkpoint(uintptr_t caller) {
  printf("{\"status\":\"pass\",\"phase\":4,\"caller_main_offset\":\"0x%llx\",\"scope\":\"all DT_INIT constructor loops completed; original nnMain prefix executed; stops at focus setup\"}\n",(unsigned long long)(caller-(uintptr_t)modules[0].base));fflush(stdout);_exit(0);
 }
 static void module_finis(void) { runtime_fail("guest exited: module finalizers not yet implemented"); }
+static uint32_t boot_main_handle;
+static __attribute__((noreturn,noinline)) void boot_start(void) {   /* on the guest main stack */
+ fprintf(stderr,"[totk] ENTER original nn::init::Start sdk+0xfa060\n");
+ ((void(*)(uint64_t,uint64_t,void(*)(void),void(*)(void),void(*)(void)))required("_ZN2nn4init5StartEmmPFvvES2_S2_"))(boot_main_handle,0,loader_ready,module_inits,module_finis);
+ runtime_fail("SDK Start unexpectedly returned");
+}
 static void boot(void) {
  fprintf(stderr,"[totk] game version %s\n", TOTK_GAME_VERSION);
  runtime_boot_status(TOTK_UI("启动游戏运行环境","Starting the game runtime"),TOTK_UI("连接游戏代码与 macOS 系统服务","Connecting the game code to macOS system services"));
- runtime_thread_init();uint32_t main_handle=svc_thread_main_init();
- fprintf(stderr,"[totk] ENTER original nn::init::Start sdk+0xfa060\n");
- ((void(*)(uint64_t,uint64_t,void(*)(void),void(*)(void),void(*)(void)))required("_ZN2nn4init5StartEmmPFvvES2_S2_"))(main_handle,0,loader_ready,module_inits,module_finis);
- runtime_fail("SDK Start unexpectedly returned");
+ runtime_thread_init();boot_main_handle=svc_thread_main_init();
+ /* The game's main thread runs on its own guest stack (services.c runtime_main_stack_top); host functions it calls
+    run here on the native stack, below this frame, as for every thread threads.c creates. */
+ { volatile char marker=0; runtime_hle_stack_set((uintptr_t)&marker-1024); }
+ uintptr_t top=runtime_main_stack_top(NULL);
+ __asm__ volatile("mov sp, %0\n mov x29, xzr\n mov x30, xzr\n br %1"::"r"(top),"r"(boot_start):"memory");
+ __builtin_unreachable();
 }
 /* Host aborts (e.g. Metal validation assertions) print the host call stack before the process ends. */
 #include <execinfo.h>

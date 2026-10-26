@@ -85,3 +85,6 @@ int proc_listallpids(void *buffer, int buffersize) {
     closedir(d);
     return buffer && n > cap ? cap : n;
 }
+
+/* For assembly callers (nvn_entry.S profiling): darwin_compat.h's mach_absolute_time is an inline, this is the symbol. */
+uint64_t mach_absolute_time(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }

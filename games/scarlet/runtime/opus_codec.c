@@ -4,11 +4,11 @@
    recorded value: none of the 280,723 packets in 1.4.3's English voice streams has it, while a fan dub's encoder
    writes 0 into every packet (all 186,758 of the PKG PT-BR dub, which decode without error). Those are not checked. */
 #include "runtime.h"
-#if __has_include(<opus.h>)
+#if __has_include(<opus.h>) && !defined(SCARLET_OPUS_SILENT)   /* SCARLET_OPUS_SILENT: the Android stand-in on the Mac too (A/B tests) */
 #include <opus.h>
 #define OPUS_SILENT 0
 #else
-#include "opus_silent.h"   /* Android without libopus (Thor port): exact sample counts, silent output */
+#include "../android/compat/opus_silent.h"   /* Android without libopus (Thor port): exact sample counts, silent output */
 #define OPUS_SILENT 1
 #endif
 #include <pthread.h>
