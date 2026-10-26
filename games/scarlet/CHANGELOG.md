@@ -331,3 +331,27 @@ tested either way yet.
 Seen, not fixed yet: the room is overexposed too; outdoor scenes in the opening are washed out (sky white, characters pale) and the sky has large
 dark / purple rectangles; some characters are drawn grey and white in some shots and fully coloured in others; the
 enrollment photo is black.
+
+### 2026-10-26: the sky, the exposure and the colours
+
+Three problems turned out to be one. Outdoors the opening was nearly white, indoors overbright, characters grey and
+white in some shots, and the sky split into four flat quadrants (dark green, purple, blue, navy) with the split exactly
+at the screen centre. The pass dump and render-target dump of one cloud frame showed the quadrants already in the
+480x270 sky buffer the sky pass draws. That pass's vertex shader writes only `.xy` of its varying; its fragment shader
+divides by `.w` of the same varying. On the GPU an unwritten varying component reads as (0, 0, 0, 1); the translated MSL
+starts from `main0_out out = {}`, so `.w` was 0, and x/0, y/0 became infinities whose signs depended on the quadrant. The
+infinite sky also fed the exposure and the lighting, hence the white outdoors and the pale characters (the G-buffer
+albedo had the right colours all along: black hair, red and white gear).
+
+`vs_out_defaults` now starts every float4 user output of a vertex shader with w = 1, both for the shader as loaded and
+for the variants built from its source (`sh_src`); a write by the shader still replaces it. Checked in the same frames:
+blue sky with clouds over Naranja Academy, the battle court in its real colours, Nemona with black hair, the player's
+room in natural light (school uniform, red tie). The enrollment photo has not been rechecked.
+
+Also:
+- A same-size copy between the sRGB and linear forms of RGBA8 / BGRA8 (1919x1080, seen in the room) copies the bits
+  through a view in the destination's format instead of being dropped.
+- `lay_self` (the vertex shader picks its layer) now keeps a pending clear: the view covers every layer and both NVN and
+  Metal clear all layers of a layered target. With that a second such pass appears, a 64x64 cube map drawn one face per
+  instance (six layers), which before went to face 0 only. Each new layered target is logged once.
+- A save backup is kept in `SCARLET_build/user-data/save-backup/` while a test replays the opening without a save.

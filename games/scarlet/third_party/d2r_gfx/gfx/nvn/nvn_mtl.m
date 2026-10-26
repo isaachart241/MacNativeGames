@@ -4585,7 +4585,9 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     if (lay_n) { g_lay.active = 1; g_lay.base = g_lay.cur = lay_first; g_lay.count = lay_n; if (g_cg_force_layers) g_lay.cur = g_cg_cur;
         if (!g_lay.passes++) MLOG("[totk] layered pass: first one covers layers %d-%d of a %lux%lu level", lay_first, lay_first + lay_n - 1, (unsigned long)g_pass.tw, (unsigned long)g_pass.th);
         PD("L %llu 分层通道 层 %d-%d", g_stat_pass, lay_first, lay_first + lay_n - 1); }
-    if (self_n) { static int once; if (!once++) MLOG("[layer] first pass whose vertex shader picks the layer: %d layers from %d of a %lux%lu level", self_n, self_first, (unsigned long)g_pass.tw, (unsigned long)g_pass.th);
+    if (self_n) { static uint64_t seen[8]; static int nseen; uint64_t k = (uint64_t)g_pass.tw << 32 | (uint64_t)g_pass.th << 8 | (uint64_t)self_n; int known = 0;
+        for (int i = 0; i < nseen; i++) known |= seen[i] == k;
+        if (!known && nseen < 8) { seen[nseen++] = k; MLOG("[layer] pass whose vertex shader picks the layer: %d layers from %d of a %lux%lu level%s", self_n, self_first, (unsigned long)g_pass.tw, (unsigned long)g_pass.th, R.clear_c[0] ? " (with a clear)" : ""); }
         PD("L %llu 着色器自选层的分层通道 %d 层（起 %d）", g_stat_pass, self_n, self_first); }
     if (enc_label_on()) { id<MTLTexture> lt = pd.colorAttachments[0].texture ?: pd.depthAttachment.texture ?: pd.stencilAttachment.texture; g_el_w = (int)lt.width; g_el_h = (int)lt.height; g_el_draws = 0; g_el_key[0] = 0; }
     return g_enc;
@@ -4686,10 +4688,26 @@ static void shmap_load(void) {
 /* TOTK: a shader's MSL source is needed only to build derived functions (varying patches, layered vertex, depth-less and
    MetalFX UI fragment variants). The Mac keeps it; iOS keeps only the path and reads it when needed (thousands of sources
    held as strings cost on the order of 100 MB on a device that may use about 4 GB in total). */
+/* Scarlet: on the GPU a varying component the vertex shader never writes reads as (0, 0, 0, 1) in the fragment shader; the
+   translated MSL starts from `main0_out out = {}`, so an unwritten .w was 0. The sky pass's vertex shader writes only .xy of
+   its varying and the fragment shader divides by .w: x/0 and y/0 became infinities whose signs split the sky into four flat
+   quadrants. Every float4 user output now starts with w = 1 (a write by the shader still replaces it). */
+static NSString *vs_out_defaults(NSString *src) {
+    if (!src) return src;
+    NSRange init = [src rangeOfString:@"main0_out out = {};"], st = [src rangeOfString:@"struct main0_out\n{\n"];
+    if (init.location == NSNotFound || st.location == NSNotFound || [src rangeOfString:@"vertex main0_out main0("].location == NSNotFound) return src;
+    NSRange body = NSMakeRange(st.location, [src rangeOfString:@"};" options:0 range:NSMakeRange(st.location, src.length - st.location)].location - st.location);
+    static NSRegularExpression *re; static dispatch_once_t once;
+    dispatch_once(&once, ^{ re = [NSRegularExpression regularExpressionWithPattern:@"\\n\\s*float4\\s+(\\w+)\\s*\\[\\[user\\(locn[0-9]+\\)" options:0 error:nil]; });
+    NSMutableString *add = [NSMutableString string];
+    for (NSTextCheckingResult *m in [re matchesInString:src options:0 range:body]) [add appendFormat:@" out.%@.w = 1.0;", [src substringWithRange:[m rangeAtIndex:1]]];
+    return add.length ? [src stringByReplacingCharactersInRange:NSMakeRange(init.location + init.length, 0) withString:add] : src;
+}
 static NSString *sh_src(NvShader *s) {
     if (!s) return nil;
     if (s->src) return s->src;
-    return s->src_path ? [NSString stringWithContentsOfFile:s->src_path encoding:NSUTF8StringEncoding error:nil] : nil;
+    NSString *t = s->src_path ? [NSString stringWithContentsOfFile:s->src_path encoding:NSUTF8StringEncoding error:nil] : nil;
+    return s->stage == 0 ? vs_out_defaults(t) : t;
 }
 static int sh_has_src(NvShader *s) { return s && (s->src || s->src_path); }
 #include "nvn_pso_skey.h"
@@ -5060,6 +5078,7 @@ static NvShader *shader_load(NSString *pc, int stage) {
                     if (raw && (lib = shader_lib_prebuilt(raw))) atomic_fetch_add(&g_rt_prebuilt, 1);
 #endif
                     NSString *src = raw && !lib ? [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding] : nil;
+                    if (src && stage == 0) src = vs_out_defaults(src);   // Scarlet: unwritten varying components
                     if (src) { lib = totk_msl_library(src, &e); atomic_fetch_add(&g_rt_compiled, 1); } }
     } else lib = lib_from_file(lp, &e);
     if (rt) { uint64_t pre = atomic_load(&g_rt_prebuilt), com = atomic_load(&g_rt_compiled);
@@ -7650,7 +7669,8 @@ static int lay_decide(int clear_only, int *first) {
 }
 /* Scarlet: a draw whose vertex shader writes the layer itself (the colour grading LUT: one triangle, 32 instances, layer =
    instance + 1 into a 32-deep 3D texture; the tone-map pass samples it one slice up) needs a layered pass over every layer
-   of its targets, else Metal ignores the layer and every instance lands on the first one. No depth, no pending clear. */
+   of its targets, else Metal ignores the layer and every instance lands on the first one. No depth. A pending clear is
+   kept: the view covers every layer, and both NVN and Metal clear all layers of a layered target. */
 static int lay_self(int clear_only, int *first) {
     if (clear_only || !g_exec_cur || R.rt.depth || R.rt.n < 1) return 0;
     op_hdr h; memcpy(&h, g_exec_cur, sizeof h);
@@ -7661,7 +7681,7 @@ static int lay_self(int clear_only, int *first) {
     for (int i = 0; i < R.rt.n && i < 8; i++) {
         if (!R.rt.color[i]) continue;
         id<MTLTexture> t = tex_mtl(R.rt.color[i]);
-        if (R.clear_c[i] || !t || t.sampleCount != 1) return 0;
+        if (!t || t.sampleCount != 1) return 0;
         const view_t *v = R.rt.has_cview[i] ? &R.rt.cview[i] : NULL;
         NSUInteger lv = v && v->set_levels ? v->base_level : 0;
         int f = v && v->set_layers ? v->min_layer : 0;
@@ -10996,6 +11016,20 @@ static void copy_t2t(const p_copy_t2t *c) {
     if ((c->sr.width != c->dr.width || c->sr.height != c->dr.height) && nz == 1 && (c->dr.depth ? c->dr.depth : 1) == 1 && !s3 && !d3 && s.pixelFormat == d.pixelFormat
         && !(c->flags & ~NVN_COPY_FLAGS_ENGINE_2D_BIT & ~NVN_COPY_FLAGS_LINEAR_FILTER_BIT) && c->sr.width > 0 && c->sr.height > 0 && c->dr.width > 0 && c->dr.height > 0
         && (d.usage & MTLTextureUsageRenderTarget) && copy_t2t_scaled_depth(s, d, sl, sz0 + c->sr.zoffset, dl, dz0 + c->dr.zoffset, c)) return;   // Scarlet: scaling depth copy
+    {   /* Scarlet: a same-size copy between the sRGB and linear forms of one layout (1919x1080 RGBA8 sRGB -> RGBA8) copies the
+           bits: the source is read through a view in the destination's format, which Metal allows for sRGB pairs. */
+        MTLPixelFormat a = s.pixelFormat, b = d.pixelFormat;
+        int pair = (a == MTLPixelFormatRGBA8Unorm_sRGB && b == MTLPixelFormatRGBA8Unorm) || (a == MTLPixelFormatRGBA8Unorm && b == MTLPixelFormatRGBA8Unorm_sRGB)
+                || (a == MTLPixelFormatBGRA8Unorm_sRGB && b == MTLPixelFormatBGRA8Unorm) || (a == MTLPixelFormatBGRA8Unorm && b == MTLPixelFormatBGRA8Unorm_sRGB);
+        if (pair && !s3 && !d3 && c->sr.width == c->dr.width && c->sr.height == c->dr.height) {
+            id<MTLTexture> v = [s newTextureViewWithPixelFormat:b];
+            if (v) { static int once; if (!once++) MLOG("[copy] first sRGB / linear bit copy: %dx%d, format %lu -> %lu", c->sr.width, c->sr.height, (unsigned long)a, (unsigned long)b);
+                id<MTL4ComputeCommandEncoder> e = blit();
+                for (int z = 0; z < nz; z++)
+                    enc_b_copy_texture(e, v, sz0 + c->sr.zoffset + z, sl, MTLOriginMake(c->sr.xoffset, c->sr.yoffset, 0), MTLSizeMake(c->sr.width, c->sr.height, 1), d, dz0 + c->dr.zoffset + z, dl, MTLOriginMake(c->dr.xoffset, c->dr.yoffset, 0));
+                defer_obj_unref(v); return; }
+        }
+    }
     if (c->sr.width != c->dr.width || c->sr.height != c->dr.height || (c->sr.depth ? c->sr.depth : 1) != (c->dr.depth ? c->dr.depth : 1) || (c->flags & ~NVN_COPY_FLAGS_ENGINE_2D_BIT & ~NVN_COPY_FLAGS_LINEAR_FILTER_BIT)
         || s.pixelFormat != d.pixelFormat || s3 != d3) {
         RED_ONCE(33, "贴图→贴图拷贝未实现的形态：%dx%dx%d→%dx%dx%d 标志 %#x 格式 %lu→%lu 3D %d→%d", c->sr.width, c->sr.height, c->sr.depth, c->dr.width, c->dr.height, c->dr.depth,
