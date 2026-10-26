@@ -201,21 +201,24 @@ static void cam_seen(uint64_t addr, uint64_t size) {
     g_cam[g_ncam].addr = addr; g_cam[g_ncam].n = 1; memcpy(g_cam[g_ncam].m, (const void *)(uintptr_t)(addr + 0x100), 64); g_ncam++;
 }
 void bottom_map_set_player(double x, double y, double dir) __attribute__((weak));
-static void vk_map_capture(void); static double g_cam_x, g_cam_z;
+static void vk_map_capture(void), vk_minimap_frame_end(void), vk_map_frame_reset(void); static double g_cam_x, g_cam_z;
+static int g_cam_fresh;   /* the camera was read in this frame: positions noted for the bottom map are only taken then */
 void vk_camera_frame_end(void) {   /* nvn_vk_dev.c, at each present */
-    vk_map_capture();
+    g_cam_fresh = 0;
     int best = -1; for (int i = 0; i < g_ncam; i++) if (best < 0 || g_cam[i].n > g_cam[best].n) best = i;
     if (best >= 0 && g_cam[best].n >= 50 && bottom_map_set_player) {
         const float *m = g_cam[best].m;   /* rows: right, up, back, position */
         float fx = -m[8], fz = -m[10], h = sqrtf(fx * fx + fz * fz);
         if (h > 0.01f && isfinite(m[12]) && isfinite(m[14])) {
             fx /= h; fz /= h;
-            g_cam_x = m[12] + 4 * fx; g_cam_z = m[14] + 4 * fz;
+            g_cam_x = m[12] + 4 * fx; g_cam_z = m[14] + 4 * fz; g_cam_fresh = 1;
             bottom_map_set_player(g_cam_x, g_cam_z, atan2f(fx, -fz));   /* map: x east, y = world z; 0 = up */
             uint64_t n = mtl_present_count(); if (n % 150 == 0) VKLOG("camera: player about %.2f %.2f %.2f (camera %.2f %.2f %.2f, %d draws)", m[12] + 4 * fx, m[13], m[14] + 4 * fz, m[12], m[13], m[14], g_cam[best].n);
         }
     }
     g_ncam = 0;
+    if (g_cam_fresh) { vk_map_capture(); vk_minimap_frame_end(); }
+    else vk_map_frame_reset();
 }
 /* Uniform buffer log (diagnostics): TOTK_VK_UBO_LOG=<present> logs every distinct uniform buffer binding of that frame
    (stage, slot, guest address, size, draws), to find which buffer carries what (the camera, for the bottom map). */
@@ -330,7 +333,125 @@ static void map_asset_seen(const vk_tex *x, int st, int reg) {
    once) and its offset from the player in tile units (the map's rotation and scale undone; x east, y north), one line
    each in map-cache/marks.txt: "<kind> <player x> <player z> <east> <north> <width> <height> <hash>", kind O for the
    objective (the bottom map keeps the latest capture's only) and L for place names (kept). */
+static int g_mm_hide = -1; static float g_mm_cx, g_mm_cy, g_mm_r;
+/* What the minimap shows this frame, for the bottom map (vk_minimap_frame_end): it is drawn in every frame of normal
+   play, around the player, from the same tiles as the game's closer map, so the bottom map fills itself as the player
+   walks without the map screen. Its tiles (with the map's rotation and scale) and the colour icons inside its circle. */
+static struct { uint64_t serial; float tx, ty; } g_mmt[64]; static int g_nmmt; static float g_mmt_a, g_mmt_c;
+static struct { uint64_t serial; float tx, ty, rw, rh; } g_mmi[32]; static int g_nmmi; static int g_mm_frame;
 void bottom_map_assets_changed(void) __attribute__((weak));
+static uint64_t img_hash(const uint8_t *px, size_t n);
+/* Decoding a tile (700x700 BC7) takes a while, so in play it happens on a thread of its own, from a copy of the
+   texture's storage in guest memory (deswizzled and BC-decoded on the CPU, as the image itself was uploaded): the image
+   once (map-cache/tile_ or icon_<hash>.rgba) and its line in tiles.txt or marks.txt. */
+typedef struct mm_job { nvn_texdesc d; uint8_t *mem; size_t n; int kind; char line[160]; struct mm_job *next; } mm_job;
+static mm_job *g_mmq, *g_mmq_tail; static pthread_mutex_t g_mmq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_mmq_cv = PTHREAD_COND_INITIALIZER;
+#include "../tex/nvn_deswizzle.h"
+static uint8_t *decode_storage(const nvn_texdesc *d, const uint8_t *mem) {
+    int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh); uint32_t pf; int obpp;
+    if (bpb == 4 && bw == 1 && bh == 1 && !nvn_bc_unpacked((uint32_t)d->format, &pf, &obpp)) {   /* 8-bit RGBA: deswizzled only */
+        uint8_t *px = malloc((size_t)d->width * d->height * 4);
+        if (px && nvn_deswizzle(d, 0, 0, mem, px, (size_t)d->width * 4)) { free(px); px = NULL; }
+        return px;
+    }
+    if (!bpb || !nvn_bc_unpacked((uint32_t)d->format, &pf, &obpp) || obpp != 4) return NULL;
+    size_t pitch = (size_t)((d->width + bw - 1) / bw) * bpb;
+    uint8_t *lin = malloc(pitch * ((d->height + bh - 1) / bh)), *px = malloc((size_t)d->width * d->height * 4);
+    if (!lin || !px || nvn_deswizzle(d, 0, 0, mem, lin, pitch) || nvn_bc_decode((uint32_t)d->format, lin, pitch, d->width, d->height, px, (size_t)d->width * 4)) { free(lin); free(px); return NULL; }
+    free(lin); return px;
+}
+static void *mm_worker(void *arg) {
+    (void)arg; pthread_setname_np(pthread_self(), "map tiles");
+    for (;;) {
+        pthread_mutex_lock(&g_mmq_mu);
+        while (!g_mmq) pthread_cond_wait(&g_mmq_cv, &g_mmq_mu);
+        mm_job *j = g_mmq; g_mmq = j->next; if (!g_mmq) g_mmq_tail = NULL;
+        pthread_mutex_unlock(&g_mmq_mu);
+        uint8_t *px = j->d.width == 1 && j->d.height == 1 ? NULL : decode_storage(&j->d, j->mem);
+        uint8_t one[4] = {0, 0, 0, 0};
+        if (!px && j->d.width == 1 && j->d.height == 1) {   /* open sea: one BC7 block, its first texel */
+            uint8_t b[64]; if (!nvn_bc_decode((uint32_t)j->d.format, j->mem, 16, 4, 4, b, 16)) memcpy(one, b, 4); px = one; }
+        if (px) {
+            uint64_t h = img_hash(px, (size_t)j->d.width * j->d.height * 4);
+            char p[256]; snprintf(p, sizeof p, "map-cache/%s_%016llx.rgba", j->kind ? "icon" : "tile", (unsigned long long)h);
+            if (access(p, F_OK)) { FILE *f = fopen(p, "wb"); if (f) { uint32_t hd[3] = {0x3150414d, j->d.width, j->d.height}; fwrite(hd, 4, 3, f); fwrite(px, 4, (size_t)j->d.width * j->d.height, f); fclose(f); } }
+            FILE *f = fopen(j->kind ? "map-cache/marks.txt" : "map-cache/tiles.txt", "a");
+            if (f) { fprintf(f, "%s %016llx\n", j->line, (unsigned long long)h); fclose(f); }
+            if (px != one) free(px);
+            if (bottom_map_assets_changed) bottom_map_assets_changed();
+        }
+        free(j->mem); free(j);
+    }
+    return NULL;
+}
+static void mm_enqueue(const vk_tex *x, int kind, const char *line) {
+    static int started;
+    if (!x->t.mem || !x->t.L.size) return;
+    if (!started) { started = 1; pthread_t t; if (!pthread_create(&t, NULL, mm_worker, NULL)) pthread_detach(t); }
+    mm_job *j = calloc(1, sizeof *j); if (!j) return;
+    j->d = x->t.d; j->n = (size_t)x->t.L.size; j->mem = malloc(j->n); j->kind = kind;
+    if (!j->mem) { free(j); return; }
+    memcpy(j->mem, x->t.mem, j->n); snprintf(j->line, sizeof j->line, "%s", line);
+    pthread_mutex_lock(&g_mmq_mu); if (g_mmq_tail) g_mmq_tail->next = j; else g_mmq = j; g_mmq_tail = j; pthread_cond_signal(&g_mmq_cv); pthread_mutex_unlock(&g_mmq_mu);
+}
+/* At each present, from the minimap: tiles not noted yet in this session go to the worker with their centre's offset
+   from the player (tile units, east and north: the map's rotation and scale undone around the minimap's centre); the
+   colour icons inside the circle are noted as M marks every two seconds when they or the player changed (the bottom map
+   replaces earlier M marks inside the circle's reach); and the scale between tile units and world units is measured as the player walks (the player's
+   place against a tile seen in both frames, against the camera's position), into map-cache/scale.txt. */
+static void vk_minimap_frame_end(void) {
+    static int steady;   /* frames in a row with the minimap and the camera: during the load into the field the minimap is
+                            drawn while the camera read is still the title screen's, so nothing is noted before 60 */
+    if (!g_mm_frame || !g_nmmt) { g_nmmt = g_nmmi = g_mm_frame = 0; steady = 0; return; }
+    if (++steady < 60) { g_nmmt = g_nmmi = g_mm_frame = 0; return; }
+    float sc = hypotf(g_mmt_a, g_mmt_c), cs = g_mmt_a / sc, sn = g_mmt_c / sc;
+    static struct { uint64_t serial; double x, z; } done[1024]; static int ndone;   /* noted again 150 units further on */
+    for (int i = 0; i < g_nmmt; i++) {
+        float ex = g_mmt[i].tx - g_mm_cx, ey = g_mmt[i].ty - g_mm_cy;
+        float e = (cs * ex + sn * ey) / sc, n = (-sn * ex + cs * ey) / sc;
+        if (i == 0) {   /* the scale: the player against tile 0, when the same tile was the reference and the player walked 30 units */
+            static uint64_t rs; static float re, rn; static double rx, rz, num, den, lastp;
+            double dx = g_cam_x - rx, dz = g_cam_z - rz;
+            if (rs == g_mmt[0].serial && dx * dx + dz * dz >= 30 * 30) {
+                num += -(e - re) * dx + (n - rn) * dz; den += dx * dx + dz * dz;
+                double p = num / den;
+                if (den > 200 * 200 && fabs(p - lastp) > 0.0005 * p && p > 0.5 && p < 10) {
+                    lastp = p; FILE *f = fopen("map-cache/scale.txt", "w"); if (f) { fprintf(f, "%.6f %.1f\n", p, sqrt(den)); fclose(f); }
+                    VKLOG("map scale: %.5f tile units a world unit (over %.0f units walked)", p, sqrt(den));
+                    if (bottom_map_assets_changed) bottom_map_assets_changed();
+                }
+            }
+            if (rs != g_mmt[0].serial || dx * dx + dz * dz >= 30 * 30) { rs = g_mmt[0].serial; re = e; rn = n; rx = g_cam_x; rz = g_cam_z; }
+        }
+        int k = 0; while (k < ndone && done[k].serial != g_mmt[i].serial) k++;
+        if (k < ndone && hypot(g_cam_x - done[k].x, g_cam_z - done[k].z) < 150) continue;
+        if (k == ndone) { if (ndone == 1024) continue; done[ndone++].serial = g_mmt[i].serial; }
+        done[k].x = g_cam_x; done[k].z = g_cam_z;
+        vk_tex *x = vk_tex_by_serial(g_mmt[i].serial); if (!x) continue;
+        char line[160]; snprintf(line, sizeof line, "%.3f %.3f %.2f %.2f", g_cam_x, g_cam_z, e, n);
+        mm_enqueue(x, 0, line);
+    }
+    /* the icons: every 60 frames when the set changed or the player moved 10 units (they move with the player) */
+    static uint64_t sig_l; static int every; static double ix, iz; uint64_t sig = (uint64_t)g_nmmi;
+    for (int i = 0; i < g_nmmi; i++) sig = sig * 31 + g_mmi[i].serial;
+    static int had;   /* icons in the last note: without icons now or then there is nothing to note */
+    if (++every >= 60 && (g_nmmi || had) && (sig != sig_l || hypot(g_cam_x - ix, g_cam_z - iz) >= 10)) {
+        every = 0; sig_l = sig; ix = g_cam_x; iz = g_cam_z; had = g_nmmi > 0;
+        float reach = g_mm_r / sc;   /* tile units */
+        char line[160]; snprintf(line, sizeof line, "C %.3f %.3f 0 0 %.1f %.1f", g_cam_x, g_cam_z, reach, reach);
+        FILE *f = fopen("map-cache/marks.txt", "a"); if (f) { fprintf(f, "%s 0\n", line); fclose(f); }   /* clears the M marks in reach */
+        for (int i = 0; i < g_nmmi; i++) {
+            vk_tex *x = vk_tex_by_serial(g_mmi[i].serial); if (!x) continue;
+            float ex = g_mmi[i].tx - g_mm_cx, ey = g_mmi[i].ty - g_mm_cy;
+            snprintf(line, sizeof line, "M %.3f %.3f %.2f %.2f %.1f %.1f", g_cam_x, g_cam_z, (cs * ex + sn * ey) / sc, (-sn * ex + cs * ey) / sc, g_mmi[i].rw, g_mmi[i].rh);
+            mm_enqueue(x, 1, line);
+        }
+    }
+    g_nmmt = g_nmmi = g_mm_frame = 0;
+}
+static void vk_map_frame_reset(void) {   /* a frame without the camera: what it saw of the maps is not noted */
+    g_map_ov_seen = g_map_marker_seen = g_tile_seen = g_centre_seen = g_nmk = g_ntl = 0; g_nmmt = g_nmmi = g_mm_frame = 0;
+}
 static uint64_t img_hash(const uint8_t *px, size_t n) { uint64_t h = 1469598103934665603ull; for (size_t i = 0; i < n; i++) h = (h ^ px[i]) * 1099511628211ull; return h; }
 static void marks_capture(void) {
     static uint64_t sig_c, sig_l; static int held;
@@ -931,22 +1052,28 @@ static int bind_descriptors(vk_prog *pr, VkPipelineBindPoint bp) {
    the frame (a 340x340 quad) gives the circle's centre and radius, and the rings, heading cone, follower icons and the
    player's marker drawn after it inside that circle go too. Other screens (the map, menus, battles) draw no masked quad,
    so nothing of theirs is touched. */
-static int g_mm_hide = -1; static float g_mm_cx, g_mm_cy, g_mm_r;
 static int minimap_draw(void) {
     if (g_mm_hide < 0) { const char *a = getenv("SCARLET_MINIMAP"), *b = getenv("SCARLET_BOTTOM"); g_mm_hide = !(a && !strcmp(a, "1")) && !(b && !strcmp(b, "0")); }
-    if (!g_mm_hide || P.cfmt[0] != VK_FORMAT_R8G8B8A8_SRGB) return 0;
+    if (P.cfmt[0] != VK_FORMAT_R8G8B8A8_SRGB) return 0;
     const p_bind_buf *u = &S.ubo[0][0];
     if (!u->addr || u->size < 136 * 4) return 0;
     const float *f = (const float *)(uintptr_t)u->addr;
+    const view_t *v; int hv; vk_tex *x0 = (S.tex[1][0] & 0xfffff) ? vk_tex_by_id((int)(S.tex[1][0] & 0xfffff), &v, &hv) : NULL;
     int mask = 0;
-    if ((S.tex[1][1] & 0xfffff)) { const view_t *v; int hv; vk_tex *x = vk_tex_by_id((int)(S.tex[1][1] & 0xfffff), &v, &hv); mask = x && x->w == 400 && x->h == 400 && x->t.d.format == 0x49; }
+    if ((S.tex[1][1] & 0xfffff)) { vk_tex *x = vk_tex_by_id((int)(S.tex[1][1] & 0xfffff), &v, &hv); mask = x && x->w == 400 && x->h == 400 && x->t.d.format == 0x49; }
     if (mask) {
-        if (f[132] == 340 && f[133] == 340) { g_mm_cx = f[19]; g_mm_cy = f[23]; g_mm_r = 170 * fabsf(f[16]); g_mm_active = 1; }
-        return 1;
+        if (f[132] == 340 && f[133] == 340) { g_mm_cx = f[19]; g_mm_cy = f[23]; g_mm_r = 170 * fabsf(f[16]); g_mm_active = 1; g_mm_frame = 1; }
+        else if (x0 && x0->t.d.format == 0x4d && ((x0->w == 700 && x0->h == 700) || (x0->w == 1 && x0->h == 1)) && f[132] == 1000 && g_nmmt < 64)
+            { g_mmt[g_nmmt].serial = x0->serial; g_mmt[g_nmmt].tx = f[19]; g_mmt[g_nmmt].ty = f[23]; g_nmmt++; g_mmt_a = f[16]; g_mmt_c = f[20]; }
+        return g_mm_hide;
     }
     if (!g_mm_active) return 0;
     float dx = f[19] - g_mm_cx, dy = f[23] - g_mm_cy;
-    return dx * dx + dy * dy <= g_mm_r * g_mm_r && fabsf(f[132]) <= 2 * g_mm_r && fabsf(f[133]) <= 2 * g_mm_r;
+    int in = dx * dx + dy * dy <= g_mm_r * g_mm_r && fabsf(f[132]) <= 2 * g_mm_r && fabsf(f[133]) <= 2 * g_mm_r;
+    /* colour icons (not the masks and shapes in BC4 / BC5, the followers' 100x100 icons or the player's marker) */
+    if (in && x0 && x0->t.d.format != 0x49 && x0->t.d.format != 0x4b && !(x0->w == 100 && x0->h == 100) && !(x0->w == 352) && x0->w >= 16 && g_nmmi < 32)
+        { g_mmi[g_nmmi].serial = x0->serial; g_mmi[g_nmmi].tx = f[19]; g_mmi[g_nmmi].ty = f[23]; g_mmi[g_nmmi].rw = f[132] * hypotf(f[16], f[20]); g_mmi[g_nmmi].rh = f[133] * hypotf(f[17], f[21]); g_nmmi++; }
+    return in && g_mm_hide;
 }
 
 // ---------- draws ----------

@@ -154,7 +154,10 @@ static void load_image(image *im, const char *path) {
    the samples spread over 100 units. Until then, 2026-10-26's measurement at Cabo Poco: the marker at (420.33, 826.50) for
    the player at (2323.33, -741.52), 0.1746 texels a unit (east 12 units: 2.17 texels). */
 static double mapScale = 0.1746, mapU0 = 420.33 - 2323.33 * 0.1746, mapV0 = 826.50 + 741.52 * 0.1746;
+static double tileScale;   /* tile units a world unit, measured from the minimap as the player walks (map-cache/scale.txt); 0: 12 x mapScale */
 static void load_calibration(void) {
+    FILE *g = fopen("map-cache/scale.txt", "r");
+    if (g) { double p; if (fscanf(g, "%lf", &p) == 1 && p > 0.5 && p < 10) { tileScale = p; mapScale = p / 12; } fclose(g); }
     FILE *f = fopen("map-cache/calib.txt", "r"); if (!f) return;
     double x, z, u, v, sx = 0, sz = 0, su = 0, sv = 0; int n = 0;
     static double X[4096], Z[4096], U[4096], Vv[4096];
@@ -164,7 +167,7 @@ static void load_calibration(void) {
     sx /= n; sz /= n; su /= n; sv /= n;
     double num = 0, den = 0;
     for (int i = 0; i < n; i++) { num += (X[i] - sx) * (U[i] - su) + (Z[i] - sz) * (Vv[i] - sv); den += (X[i] - sx) * (X[i] - sx) + (Z[i] - sz) * (Z[i] - sz); }
-    if (den > 100.0 * 100.0 && num / den > 0.05 && num / den < 1) mapScale = num / den;
+    if (!tileScale && den > 100.0 * 100.0 && num / den > 0.05 && num / den < 1) mapScale = num / den;   /* the measured scale wins */
     mapU0 = su - mapScale * sx; mapV0 = sv - mapScale * sz;
     fprintf(stderr, "[totk] bottom map: %d calibration samples, %.4f texels a unit, origin %.2f %.2f\n", n, mapScale, mapU0, mapV0);
 }
@@ -181,10 +184,15 @@ static void load_marks(void) {
     char k; double px, pz, e, n; float w, h; unsigned long long hash; int cap = 0;
     double lastOx = 1e30, lastOz = 1e30;
     while (fscanf(f, " %c %lf %lf %lf %lf %f %f %llx", &k, &px, &pz, &e, &n, &w, &h, &hash) == 8) {
-        double t = 12 * mapScale;   /* tile units a world unit */
+        double t = tileScale ? tileScale : 12 * mapScale;   /* tile units a world unit */
         if (k == 'O' && (px != lastOx || pz != lastOz)) {   /* a newer capture: the older objective pins go */
             int j = 0; for (int i = 0; i < nmarks; i++) if (marks[i].kind != 'O') marks[j++] = marks[i]; nmarks = j;
             lastOx = px; lastOz = pz;
+        }
+        if (k == 'C') {   /* the minimap's view of this moment: earlier minimap icons within its reach go */
+            double r = w / t; int j = 0;
+            for (int i = 0; i < nmarks; i++) if (!(marks[i].kind == 'M' && hypot(marks[i].x - px, marks[i].z - pz) <= r)) marks[j++] = marks[i];
+            nmarks = j; continue;
         }
         int i = 0; if (k == 'L') while (i < nmarks && !(marks[i].kind == 'L' && marks[i].hash == hash)) i++; else i = nmarks;
         if (i == nmarks) { if (nmarks == cap) { cap = cap ? 2 * cap : 32; marks = realloc(marks, sizeof *marks * (size_t)cap); } memset(&marks[nmarks++], 0, sizeof *marks); }
@@ -210,9 +218,9 @@ static void blit(canvas *c, const image *im, double cx, double cy, double w, dou
 }
 static void draw_marks(canvas *c, double cx, double cy, double z) {
     for (int pass = 0; pass < 2; pass++) for (int i = 0; i < nmarks; i++) {   /* names first, pins over them */
-        const mark *m = &marks[i]; if ((m->kind == 'O') != pass) continue;
+        const mark *m = &marks[i]; if ((m->kind != 'L') != pass) continue;
         if (m->kind == 'L' && z < 0.6) continue;   /* names only once zoomed in, as on the game's map */
-        double sx = c->w / 2.0 + (m->x - cx) * z, sy = c->h / 2.0 + (m->z - cy) * z, k = m->kind == 'O' ? 0.8 : 0.9;
+        double sx = c->w / 2.0 + (m->x - cx) * z, sy = c->h / 2.0 + (m->z - cy) * z, k = m->kind == 'L' ? 0.9 : 0.8;
         blit(c, &m->img, sx, sy, m->w * k, m->h * k);
     }
 }
@@ -271,7 +279,7 @@ static void load_tiles(void) {
     FILE *f = fopen("map-cache/tiles.txt", "r"); if (!f) return;
     double px, pz, e, n; unsigned long long hash; int cap = 0;
     while (fscanf(f, "%lf %lf %lf %lf %llx", &px, &pz, &e, &n, &hash) == 5) {
-        double t = 12 * mapScale, L = 1000 / t, x = px + e / t, z = pz - n / t; int i = 0;   /* the same image in the same place: one tile */
+        double t = tileScale ? tileScale : 12 * mapScale, L = 1000 / t, x = px + e / t, z = pz - n / t; int i = 0;   /* the same image in the same place: one tile */
         while (i < ntiles && !(tiles[i].hash == hash && fabs(tiles[i].x - x) < L / 2 && fabs(tiles[i].z - z) < L / 2)) i++;
         if (i == ntiles) { if (ntiles == cap) { cap = cap ? 2 * cap : 64; tiles = realloc(tiles, sizeof *tiles * (size_t)cap); } memset(&tiles[ntiles++], 0, sizeof *tiles); }
         tiles[i].x = x; tiles[i].z = z; tiles[i].hash = hash;
@@ -295,15 +303,16 @@ static void draw_art(canvas *c, double cx, double cy, double z) {
     }
     for (int y = 0; y < c->h; y++) memcpy(c->px + (size_t)y * c->stride, bgFrame + (size_t)y * c->w, (size_t)c->w * 4);
     double wx0 = cx - c->w / 2.0 / z, wz0 = cy - c->h / 2.0 / z;   /* the world at the screen's top left */
-    double L = 1000 / (12 * mapScale);   /* a tile's side in world units */
+    double L = 1000 / (tileScale ? tileScale : 12 * mapScale);   /* a tile's side in world units */
     int covered = z >= 0.45 && ntiles;   /* the overview only where the tiles leave gaps (checked every 40 pixels) */
     for (int y = 0; covered && y <= c->h; y += 40) for (int x = 0; covered && x <= c->w; x += 40) {
         double wx = wx0 + (x < c->w ? x : c->w - 1) / z, wz = wz0 + (y < c->h ? y : c->h - 1) / z; int hit = 0;
         for (int i = 0; i < ntiles && !hit; i++) hit = fabs(wx - tiles[i].x) <= L / 2 && fabs(wz - tiles[i].z) <= L / 2;
         covered = hit;
     }
-    if (!covered) draw_image(c, &overview, mapU0 + wx0 * mapScale, mapV0 + wz0 * mapScale, mapScale / z, 0, 0, c->w, c->h);
-    if (z < 0.45) return;   /* the tiles once one of their texels spans more than about a third of a screen pixel */
+    if (!covered && overview.px) draw_image(c, &overview, mapU0 + wx0 * mapScale, mapV0 + wz0 * mapScale, mapScale / z, 0, 0, c->w, c->h);
+    if (z < 0.45 && overview.px) return;   /* the tiles once one of their texels spans more than about a third of a screen pixel
+                                              (without the region map: always, what has been explored) */
     for (int i = 0; i < ntiles; i++) {
         const tile *t = &tiles[i]; const image *im = t->shared >= 0 ? &tiles[t->shared].img : &t->img; if (!im->px) continue;
         double k = im->w / L, tx0 = t->x - L / 2, tz0 = t->z - L / 2;   /* texels a world unit; the tile's corner */
@@ -313,7 +322,7 @@ static void draw_art(canvas *c, double cx, double cy, double z) {
     }
 }
 static void draw_map(canvas *c, double cx, double cy, double z, double px, double py, double pdir, const float (*t)[2], int nt) {
-    if (overview.px) draw_art(c, cx, cy, z); else draw_grid(c, cx, cy, z);
+    if (overview.px || ntiles) draw_art(c, cx, cy, z); else draw_grid(c, cx, cy, z);
     draw_marks(c, cx, cy, z);
     /* The player, in the map screen's colours: a white disc in a dark outline with a yellow pointer the way they face */
     double sx = c->w / 2.0 + (px - cx) * z, sy = c->h / 2.0 + (py - cy) * z, s = sin(pdir), k = cos(pdir);

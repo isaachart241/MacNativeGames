@@ -908,3 +908,29 @@ landed just offshore). The game's closer map is drawn from tiles, so those are t
 Checked on the Thor (Cabo Poco): the bottom map matches the game's closer map (Cabo Poco, Poco Path, Inlet Grotto,
 Los Platos, the objective's pin, the open sea and the map's edge), north up, following the player while walking.
 Not done: the follower icons and other marks the game adds later (they need the same treatment once they appear).
+
+### 2026-10-26: Thor port: the bottom map fills itself from the minimap
+
+The user: having to open the game's map screen to get anything onto the bottom map "kind of defeats the purpose". The
+minimap is drawn in every frame of normal play (only left out of the top screen), around the player, from the same
+700x700 tiles as the closer map, so the backend now takes it from there:
+
+- `minimap_draw` notes the minimap's tiles (with the map's rotation and scale: 0.6 there) and, after its frame, the
+  colour icons inside its circle, whether or not the minimap is drawn.
+- At the present, tiles not noted yet go to a worker thread with their centre's offset from the player: it copies
+  nothing from the GPU but decodes the texture's storage in guest memory itself (copied on the render thread, 0.1 ms;
+  deswizzled and BC7-decoded on the worker; a 1x1 open-sea tile is one block), so play does not stutter. A tile is
+  noted again 150 units further on. Icons are noted every two seconds while they or the player change, after a line
+  that clears the earlier ones within the minimap's reach.
+- The scale between tile units and world units is measured as the player walks (the player's place against a tile seen
+  in both frames, against the camera's position, over steps of 30 units), into `map-cache/scale.txt`, and used by the
+  bottom map instead of 12 x the overview's scale. The short test walks never gave it the 200 units it waits for.
+- Without the region map (never captured), the bottom map draws the explored tiles at every zoom.
+- **Two mistakes on the way.** Every tile was first noted with the player at (0, 0): the minimap is drawn during the
+  load into the field while the camera read is still the title screen's, and the note was taken before the frame's
+  camera. Now the notes need this frame's camera and 60 frames in a row of minimap and camera.
+
+Checked on the Thor: with `map-cache/` emptied and the map screen never opened, two minutes of walking gave the bottom
+map Cabo Poco's tiles around the player (21 tiles noted, drawings 13 ms). The earlier map-screen captures (names,
+objective, region map) were merged back into the app's cache. Not checked: minimap icons (none appeared in reach on
+these walks: the objective is just beyond it), the walked scale.

@@ -44,10 +44,10 @@ The game's rumble drives the Thor's vibration motor. It has one motor, so it get
 
 The bottom screen shows the game's own map while the game is in focus, north up and following you (drag to look
 around, pinch to zoom; it follows you again a few seconds after the last touch), and the minimap leaves the top screen;
-leaving the game gives the bottom screen back to whatever was there. The map's art comes from the game's map screen:
-open it once (Y) and zoom all the way out (ZL); it is kept in the data folder's `map-cache/` (a grid shows until then).
-Each time the zoomed-out map is open, your marker's place on it is noted there too, which keeps the bottom map's
-position right as you travel. `SCARLET_BOTTOM=0` leaves the bottom screen alone and keeps the minimap;
+leaving the game gives the bottom screen back to whatever was there. The map is the game's own art, gathered as you
+play from the minimap (hidden from the top screen but still drawn by the game), and kept in the data folder's
+`map-cache/`: places appear once you have been near them. There is no need to open the game's map screen; when you
+do (Y), its place names, the objective and the whole-Paldea view (zoomed out) are added too. `SCARLET_BOTTOM=0` leaves the bottom screen alone and keeps the minimap;
 `SCARLET_MINIMAP=1` keeps the minimap as well.
 
 ## Shaders
