@@ -35,6 +35,7 @@ MIDDLEWARE = {   # a marker string in the image -> what it means for the host
     'Pia (P2P)': rb'nn::pia|pia::',
     'Movie: VP9': rb'vp9|libvpx',
     'Movie: H.264': rb'avc|h264|H264',
+    'Movie: Bink (decoded by the game itself)': rb'Bink header|BinkAsy',
     'Unreal': rb'UnrealEngine|UE4',
     'Unity': rb'UnityEngine|il2cpp',
 }

@@ -206,12 +206,18 @@ static void export_ios_text(const char *rewritten,const char *out) {
   printf("%s text_bytes=%zu patched_words=%u\n",m->name,n,diff);}
 }
 #endif
+/* A relative relocation outside the image is accepted only if prepare_runtime.py pinned it (Scarlet: the end of main's
+   .tbss, a bound passed to __nnmusl_init_dso and never dereferenced). */
+static int relative_beyond(const Module *m,const Reloc *r) {
+ for(const RelativeBeyond *b=relative_beyond_image;b->module;b++)if(!strcmp(b->module,m->name)&&b->where==r->where&&b->addend==r->addend)return 1;
+ return 0;
+}
 static void relocate(Module *m) {
  for(unsigned i=0;i<m->nreloc;i++) {
   const Reloc *r=&m->relocs[i];
   need(r->where>=m->data_off&&r->where+8<=m->key_off&&r->symbol<m->nsym,"relocation bounds");
   uintptr_t v;
-  if(r->kind==1027) { need(r->addend>=0&&(uint64_t)r->addend<m->key_off,"relative addend");v=(uintptr_t)m->base+r->addend;m->relative++; }
+  if(r->kind==1027) { need(r->addend>=0&&((uint64_t)r->addend<m->key_off||relative_beyond(m,r)),"relative addend");v=(uintptr_t)m->base+r->addend;m->relative++; }
   else {
    need(r->kind==257||r->kind==1025||r->kind==1026,"relocation kind");
    const Symbol *s=&m->symbols[r->symbol];void *p=r->kind==1026?runtime_observer(s->name):NULL;

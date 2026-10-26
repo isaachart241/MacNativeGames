@@ -9,9 +9,9 @@ result. Game data, keys and saves are never committed.
 | Stage | Goal | State |
 |---|---|---|
 | 0 | Feasibility: does the game fit the by3 architecture? | done 2026-10-25 |
-| 1 | Code and data out of the dump; code rewritten for Apple silicon | |
-| 2 | The runtime fork boots to `nnMain` | |
-| 3 | Every unknown service / NVN call answered until the first `nvnQueuePresentTexture` | |
+| 1 | Code and data out of the dump; code rewritten for Apple silicon | done 2026-10-25 |
+| 2 | The runtime fork boots to `nnMain` | done 2026-10-25 |
+| 3 | Every unknown service / NVN call answered until the first `nvnQueuePresentTexture` | in progress |
 | 4 | Picture, audio, input, saves; frame-rate patches | |
 | 5 | Performance, shaders, packaging as an app | |
 
@@ -84,3 +84,60 @@ Tooling fixed on the way, in `scripts/survey.py`: names taken over by `HLE_FORCE
 `g_nops` list were counted as missing; the services section said "never mentioned by the host" for services the host
 answers by replacing SDK functions. It now reports per-library import coverage instead. Both are covered by
 `tests/test_scarlet_survey.py`.
+
+### 2026-10-25: stage 1, verified code and data
+
+- **equiv.py** on all three rewrites, every rewritten site run against the original in an emulator: sdk 13,993 sites,
+  subsdk0 10,541, main 25,330; 0 divergent; every site at least 2 effective trials; 300 of 300 mutation controls
+  caught per module (the 118 + 190 host-gate sites are structck's). A second rewrite gives the pinned bytes again.
+- **RomFS**: `scripts/extract_update_romfs.py` (Scarlet's copy of TotK's; only the Program NCA picker takes the title)
+  merges base 1.0.0 + the 4.0.0 BKTR patch with the pinned, patched hactool from `build_app.build_hactool`. 99 s,
+  9,925,204,188 bytes, all six IVFC levels GOOD, 30 files: `arc/data.trpfs` (7.47 GiB, Trinity) and `data.trpfd`,
+  Wwise `.bnk` / `.pck` under `audio/wwise/bin/Switch`, Bink 2 movies (`.bk2`) under `demo`, small `event` and
+  `system` files. Bink is linked into main (its strings are there), so the game decodes its own movies.
+- `scripts/pin_version.py` (new) writes `assets/expected-v4.0.0.json` from the verified work folder. Hand-checked
+  entries (below) are carried over, never regenerated. `.gitignore` covers the formats seen.
+
+### 2026-10-25: stage 2, the game reaches `nnMain`
+
+- `make prepare` stopped at one relative relocation in main pointing past the image: main+0x46cb7d8 holds
+  main+0x47eb8e8, 0x188e8 past the end (0x47d3000). The neighbouring relocations are TLS bounds, main+0xbc..0x118 loads
+  them and passes them to `__nnmusl_init_dso`, and nothing dereferences this one: it is the end of main's thread-local
+  `.tbss`, which takes addresses but no image space. Rather than drop the check, `prepare_runtime.py` and the loader
+  now accept exactly the relocations pinned in `relative_beyond_image` (with the reason in the pin file); anything
+  else still stops.
+- 337,026 relocations, the 30-file RomFS index and the six shared fonts. The runtime builds with Xcode 27.1.
+- Headless boot: SDK init, `nninitStartup` (a 3.1 GiB heap). It called `nn::fs::SetAllocator`, which no host
+  answered (the SDK version reaches `fsp-srv` to check the access log): answered as a no-op, since the host answers fs
+  by name. Also `IsSaveDataExisting(Uid)` (one-argument form) mapped to the existing check.
+- Then all module constructors (main 2,133, subsdk0 45, sdk 112) and **`nnMain`**.
+
+### 2026-10-25: stage 3 (in progress)
+
+Answered so far, in order:
+
+- `nn::aoc::GetAddOnContentListChangedEvent`: the SDK's version reads the aoc service object `host_aoc_init` never
+  made (null dereference). Now a system event that is never signalled (no DLC here).
+- The game needs a window (VI). Windowed runs need the display awake: with the Mac's display asleep
+  `CGGetActiveDisplayList` reports none and the display link cannot start ("native display link initialization").
+  `make boot` is always headless (`TOTK_HEADLESS` set, even empty), so windowed runs call the binary directly.
+- With a window: Metal device (Apple M3), NVN context, a 268 MiB memory pool, the NVN window (2 images,
+  1920x1080), then **present interval 2: Scarlet presents at 30 fps**.
+- NVN calls answered (`third_party/d2r_gfx`, only what the game called): `nvnTexturePoolGetSize` with the other
+  texture / sampler pool getters, `nvnQueueBuilderSetQueuePriority` (1000, stored in the builder's padding; one Metal
+  queue), `nvnBufferBuilderGet{Size,MemoryOffset,MemoryPool}`, `nvnMemoryPoolBuilderGet{Size,Flags,Memory}`. Two
+  prototypes in `nvn_protos.h` are wrong (GetMemoryPool returns the pointer, GetMemory returns `void *`); those use
+  `NVN_NOPROTO`.
+- Audio comes up: Wwise opens `audren:u` (REV10, 48 kHz stereo through CoreAudio) and loads `PM.bnk` (the
+  `English(US)` path first, as expected).
+
+Where it stops now (GPU submission still off): a null dereference in `nn::os::LockMutex` from main+0x14fe804, at
+offset 0xe0 of what main+0x14ff4dc returned. That function finds or creates a 0x128-byte object by name in a
+manager: it returns null when the manager's cache (`this+0x58`) is missing. Under lldb at the crash, the manager's
+`this+0x58` is null and the name it was asked for is the empty string (hash 0xcbf29ce484222645). Something earlier
+left the cache uncreated and the name empty; not found yet. The init sequence that calls it is at main+0x11bce9c..
+0x11bcec4 (five direct calls, then a virtual call at +0x58).
+
+Tools for the next step: `TOTK_FS_LOG=1` (every RomFS open), `TOTK_INPUT_FILE` with `hletrace 2` (first call of each
+host function, in order), and lldb `--batch` with the inspection commands as `-k` (they run when the process stops on
+the crash).

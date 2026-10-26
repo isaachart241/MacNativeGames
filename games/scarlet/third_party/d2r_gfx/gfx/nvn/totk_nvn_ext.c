@@ -130,6 +130,14 @@ NVN(nvnTextureViewCompare, NVNboolean, const NVNtextureView *a, const NVNtexture
 }
 
 
+// ---------- Descriptor pool queries (Scarlet): the pool, offset and count nvn*PoolInitialize stored (dpool_t) ----------
+NVN(nvnTexturePoolGetMemoryPool, const NVNmemoryPool *, const NVNtexturePool *o) { return (const NVNmemoryPool *)((const dpool_t *)o)->pool; }
+NVN(nvnTexturePoolGetMemoryOffset, ptrdiff_t, const NVNtexturePool *o) { return (ptrdiff_t)((const dpool_t *)o)->off; }
+NVN(nvnTexturePoolGetSize, int, const NVNtexturePool *o) { return ((const dpool_t *)o)->n; }
+NVN(nvnSamplerPoolGetMemoryPool, const NVNmemoryPool *, const NVNsamplerPool *o) { return (const NVNmemoryPool *)((const dpool_t *)o)->pool; }
+NVN(nvnSamplerPoolGetMemoryOffset, ptrdiff_t, const NVNsamplerPool *o) { return (ptrdiff_t)((const dpool_t *)o)->off; }
+NVN(nvnSamplerPoolGetSize, int, const NVNsamplerPool *o) { return ((const dpool_t *)o)->n; }
+
 // ---------- Sampler queries ----------
 #define CSB(b) (&((const samp_builder_t *)(b))->p)
 #define CSP(s) (&((const samp_t *)(s))->p)

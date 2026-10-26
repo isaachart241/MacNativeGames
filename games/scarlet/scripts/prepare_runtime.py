@@ -61,6 +61,7 @@ def module_table(work, name):
     relocs = [dict(where=where, kind=1027, symbol=0, addend=addend)
               for where, addend in decode_relr(image, tags, layout['DATA_OFF'], layout['KEY_PAGE_OFF'])]
     relocated = {reloc['where'] for reloc in relocs}
+    beyond = []   # relative relocations whose target lies outside the module image
     for address, size in [(tags[7], tags[8]), (tags[23], tags[2])]:
         assert size % 24 == 0
         for offset in range(address, address + size, 24):
@@ -68,17 +69,23 @@ def module_table(work, name):
             kind, si = info & 0xffffffff, info >> 32
             assert kind in [257, 1025, 1026, 1027] and si < nsym
             assert layout['DATA_OFF'] <= where <= layout['KEY_PAGE_OFF'] - 8
-            assert kind != 1027 or 0 <= addend < layout['KEY_PAGE_OFF']
+            if kind == 1027 and not 0 <= addend < layout['KEY_PAGE_OFF']:
+                beyond.append([hex(where), hex(addend)])
             assert where not in relocated, 'Duplicate RELR/RELA relocation'
             relocated.add(where)
             relocs.append(dict(where=where, kind=kind, symbol=si, addend=addend))
+    # Scarlet's main points one relative relocation past its image: the end of its thread-local .tbss, which takes
+    # addresses but no image space. It is passed to __nnmusl_init_dso as a bound and never dereferenced. Each such
+    # relocation must be pinned (expected-v*.json relative_beyond_image) after checking what uses it.
+    pinned = EXPECTED.get('relative_beyond_image', {}).get(name, [])
+    assert beyond == pinned, f'{name}: relative relocations outside the image {beyond}, pinned {pinned}'
     gates = []
     for line in (work / f'rewritten/{VERSION}/{name}.gates.tsv').read_text().splitlines():
         ret, kind, arg, original = line.split()
         assert kind in ['cntpct', 'cntvct', 'svc']
         gates.append(dict(ret=int(ret, 0), timer=kind != 'svc', arg=int(arg), original=int(original, 0)))
     return dict(name=name, sha256=digest, size=len(image), layout=layout, tags=tags, symbols=symbols,
-                relocs=relocs, gates=gates, ctor_flag=ctor_flag(image, tags, layout, name))
+                relocs=relocs, gates=gates, beyond=beyond, ctor_flag=ctor_flag(image, tags, layout, name))
 
 
 def ctor_flag(image, tags, layout, name):
@@ -135,6 +142,11 @@ def runtime_tables(work, out):
         lines.append('{' + f'.name={json.dumps(m["name"])},.digest={json.dumps(m["sha256"])},.file_size={m["size"]}ULL,.text_end={l["TEXT_END"]}ULL,.ro_off={l["RO_OFF"]}ULL,.data_off={l["DATA_OFF"]}ULL,.patch_off={l["PATCH_OFF"]}ULL,.key_off={l["KEY_PAGE_OFF"]}ULL,.symbols=symbol_{n},.nsym={len(m["symbols"])},.relocs=reloc_{n},.nreloc={len(m["relocs"])},.gates=gate_{n},.ngate={len(m["gates"])},.init={m["tags"].get(12,0)}ULL,.ctor_flag={m["ctor_flag"]}ULL,.init_array={m["tags"].get(25,0)}ULL,.init_size={m["tags"].get(27,0)}ULL' + '},')
     lines.append('};')
     lines.append(f'#define PROBE_PLT {plt[0]}ULL\n#define PROBE_SLOT {slot}ULL')
+    # The pinned relative relocations outside a module image (module_table): the loader accepts exactly these.
+    lines.append('typedef struct { const char *module; uint64_t where; int64_t addend; } RelativeBeyond;')
+    lines.append('static const RelativeBeyond relative_beyond_image[] = {')
+    lines.extend(f'{{{json.dumps(m["name"])},{w}ULL,{a}LL}},' for m in modules for w, a in m['beyond'])
+    lines.append('{0,0,0},\n};')
     (out / 'runtime_tables.h').write_text('\n'.join(lines) + '\n')
     (work / 'analysis').mkdir(exist_ok=True)
     (work / 'analysis/runtime-layout.json').write_text(json.dumps(modules, indent=2) + '\n')

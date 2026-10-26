@@ -1,0 +1,38 @@
+{
+    "_comment": "Verified 4.0.0 code (ExeFS of the update), rewrite bytes and merged RomFS. Written by scripts/pin_version.py; checks are recorded in CHANGELOG.md.",
+    "title_id": "0100A3D008C5C000",
+    "update_title_id": "0100A3D008C5C800",
+    "display_version": "4.0.0",
+    "main_build_id": "421C5411B487EB4D049DD065FEC9547773E8E598",
+    "update_program_nca": {
+        "name": "7e5b9bbfe2e72e23a63d42bcba9a2e3b.nca",
+        "nca_offset": 965196,
+        "size": 5234486272
+    },
+    "exefs_sha256": {
+        "main": "f5f4771ff1e37ac55dcfe5698aa956a4762184b864727ed61e74b1867d1dbfc2",
+        "main.npdm": "edf2bbf506a3619ccb1702d390dda609959b5192646791a6374dbee232322dc5",
+        "rtld": "3e9fefe2e12bd1ade68618c73c5cca79d7bc67bb0ec293b2e92a20ffb81c77f6",
+        "sdk": "526b093704bff89fae71ee4c4f58f58ad5baf09df0fef4f5c05dd23ce0138517",
+        "subsdk0": "f68908a29e021f26ea4a63e1be927162a5aa2f02c72d83d69317ea30326104f2"
+    },
+    "rewritten_sha256": {
+        "main.patched.bin": "8d77a7bc12603c819d7c37313a01446288d391e3af11180f6af3eef101e32ed2",
+        "sdk.patched.bin": "6f01c6749cd1d8ed4cb93322266422aa1a491747b98b29db8ff1163d2bb42543",
+        "subsdk0.patched.bin": "8b0238a5eec978ee338b35c34ce8aacdb171b96e9adc77732c90a23b2ff97a23"
+    },
+    "romfs": {
+        "size": 9925204188,
+        "sha256": "6258fef05541524698eff21b444dfb7c17b5e2c4af6419a5d6cbcba4a3fa041e",
+        "files": 30
+    },
+    "relative_beyond_image": {
+        "main": [
+            [
+                "0x46cb7d8",
+                "0x47eb8e8"
+            ]
+        ]
+    },
+    "relative_beyond_image_reason": "main+0x47eb8e8 is past the image end (0x47d3000): the end of main's thread-local .tbss. main+0xbc..0x118 loads it with the other TLS bounds and passes it to __nnmusl_init_dso; no code dereferences it. Checked 2026-10-25."
+}

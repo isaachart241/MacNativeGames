@@ -210,6 +210,9 @@ static void host_diag_init(void) { fprintf(stderr,"[totk] native diagnostics ini
 static void host_oe_init(void) { fprintf(stderr,"[totk] application environment: local macOS process\n"); }
 static void host_aoc_init(void) { fprintf(stderr,"[totk] add-on content: no DLC\n"); }
 static int host_aoc_count(void) { return 0; }
+/* Scarlet: the add-on content list never changes here, so its event is created and never signalled (the SDK's own
+   version reads the aoc service object host_aoc_init never made). */
+static void host_aoc_changed_event(void *event) { if(!event)runtime_fail("aoc list-changed event"); hle_bind_system_event(event,0); }
 static int host_aoc_list(int *out,int offset,int count) {
  (void)out;if(offset<0||count<0)runtime_fail("invalid add-on content list range");return 0;
 }
@@ -296,6 +299,7 @@ void *runtime_override(const char *name) {
   {"_ZN2nn2oe28SetResumeNotificationEnabledEb",resume_enabled},{"_ZN2nn2oe42SetOperationModeChangedNotificationEnabledEb",operation_enabled},{"_ZN2nn2oe44SetPerformanceModeChangedNotificationEnabledEb",performance_enabled},
   {"nndiagStartup",host_diag_init},{"_ZN2nn2oe10InitializeEv",host_oe_init},{"_ZN2nn3aoc10InitializeEv",host_aoc_init},
   {"_ZN2nn3aoc17CountAddOnContentEv",host_aoc_count},{"_ZN2nn3aoc16ListAddOnContentEPiii",host_aoc_list},
+  {"_ZN2nn3aoc31GetAddOnContentListChangedEventEPNS_2os11SystemEventE",host_aoc_changed_event},
   {"_ZN2nn3err26InitializeContextWriterApiEv",host_error_init},{"_ZN2nn2fs24InitializeForApplicationEv",host_fs_init},
   {"_ZN2nn4pctl10InitializeEv",host_pctl_init},{"_ZN2nn4diag34InitializeApplicationAbortObserverEv",host_abort_init}};
  for(size_t i=0;i<sizeof(entries)/sizeof(entries[0]);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;

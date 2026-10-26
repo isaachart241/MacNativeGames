@@ -340,6 +340,10 @@ static void close_directory(uint64_t h) {
 }
 /* The fs priority only orders I/O inside the system fs process; host I/O is unordered. */
 static void set_priority(int priority) { (void)priority; }
+/* Scarlet: nninitStartup hands the SDK's fs its allocator; the host answers fs by name, so the SDK's fs never allocates.
+   Unreplaced, SetAllocator checks the access log over fsp-srv. The one-argument IsSaveDataExisting means this title. */
+static void set_allocator(void *alloc, void *release) { (void)alloc; (void)release; }
+static unsigned char own_save_exists(const uint64_t *uid) { return save_exists(TOTK_APPLICATION_ID, uid); }
 
 /* make probe-save: the "save in progress" state the window close waits on, through the fs entry points the game uses
    (a fresh profile in build/probe-save-profile; no game). */
@@ -397,6 +401,8 @@ void *runtime_fs_host_override(const char *name) {
         {"_ZN2nn2fs20ReadCacheStorageListEPiPNS0_16CacheStorageInfoENS0_22CacheStorageListHandleEi", read_cache_list},
         {"_ZN2nn2fs21CloseCacheStorageListENS0_22CacheStorageListHandleE", close_cache_list},
         {"_ZN2nn2fs26SetPriorityOnCurrentThreadENS0_8PriorityE", set_priority},
+        {"_ZN2nn2fs12SetAllocatorEPFPvmEPFvS1_mE", set_allocator},   /* Scarlet */
+        {"_ZN2nn2fs18IsSaveDataExistingERKNS_7account3UidE", own_save_exists},   /* Scarlet */
     };
     for (size_t i = 0; i < sizeof map / sizeof *map; i++) if (!strcmp(name, map[i].name)) return map[i].fn;
     return NULL;

@@ -9,6 +9,12 @@ SCARLET_build/
 romfs.bin
 *.pkz
 *.pchtxt
-# Scarlet / Violet archives (Trinity engine; unverified until stage 0)
+# Scarlet / Violet data by format (seen in the 4.0.0 RomFS): Trinity archives, Wwise audio, Bink movies
 *.trpfs
 *.trpfd
+*.trpre
+*.trevt
+*.trmdd
+*.pck
+*.bnk
+*.bk2
