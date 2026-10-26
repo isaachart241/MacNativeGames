@@ -214,6 +214,31 @@ layered passes get. Checked with submission off: 0 refused pipelines.
 Still seen: a scaling texture-to-texture copy (1920x1080 to 480x270, not implemented), per-viewport scissors, one
 pre-swizzled texture outside a memory pool (CPU fallback).
 
+### 2026-10-25: input; past the language screen
+
+A press (`key 38`, J = A) had no effect at first: the game only asked about the handheld pad (0x20), never player 1.
+Scarlet reads a pad's style only after that pad's style-set update event fires; on the console it fires when a
+controller connects, the ones connected at start included, and the stub from earlier never signalled it.
+`bind_style_event` now signals it once for the pad in use. Then, in order:
+
+- `nn::hid::GetNpadJoyAssignment`: dual (the keyboard / Pro Controller style pad is one unit).
+- `nn::os::CreateThread` aborted in the SDK: it moves a thread stack into the stack region with svcMapMemory, and the
+  host only accepted heap or alias memory as the source. Scarlet keeps one stack in main's .bss (main+0x46fd000);
+  `stack_move` now also accepts a module's data / .bss (`runtime_module_data` in loader.c).
+- Vibration: Scarlet imports the public `nn::hid::InitializeVibrationDevice` / `SendVibrationValue` (TotK the
+  `detail::` ones); both now reach `hid_feedback.c` the same way (rumble off by default: no vibration devices).
+- **Transform feedback (not emulated)**: Bind / Begin / End (and Pause / Resume / DrawTransformFeedback) record nothing,
+  reported once each. The captured buffers stay empty and DrawTransformFeedback draws are dropped; whatever the game
+  uses it for will be missing until it is emulated (Metal has no stream-out: a vertex function writing to a buffer, or
+  compute, is the way).
+
+Short run with GPU submission on (50 s, no crash, frames 331..1060 at about 30 fps): A on the language screen gives
+**"Choose a look for yourself."** with the eight character portraits drawn and shaded, the button prompts' icons (from
+`beluga_font`) and the animated "Use the Left Stick". The screen waits for a stick direction.
+
+Audio: the renderer path's level monitor reads 0 throughout; Wwise mixes to AudioOut, which has no level monitor, so
+whether sound is heard is not checked yet.
+
 Tools for the next step: `TOTK_FS_LOG=1` (every RomFS open), `TOTK_INPUT_FILE` with `hletrace 2` (first call of each
 host function, in order), and lldb `--batch` with the inspection commands as `-k` (they run when the process stops on
 the crash).

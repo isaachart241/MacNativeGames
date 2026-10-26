@@ -399,6 +399,13 @@ uintptr_t runtime_frame_controller_return_pc(void) {
  return 0; /* The graphics diagnostic reads TotK's frame controller; Bayonetta 3 has none. */
 }
 uint64_t runtime_image_bytes(void) { uint64_t total=0;for(unsigned i=0;i<NM;i++)total+=modules[i].key_off;return page_up(total); }
+/* Scarlet: 1 when [addr, addr+size) lies in a module's writable data or .bss (data_off..key_off). The console lets a
+   thread stack there be moved into the stack region (svcMapMemory); Scarlet keeps a stack in main's .bss. */
+int runtime_module_data(uint64_t addr,uint64_t size) {
+ for(unsigned i=0;i<NM;i++){uint64_t lo=(uintptr_t)modules[i].base+modules[i].data_off,hi=(uintptr_t)modules[i].base+modules[i].key_off;
+  if(modules[i].base&&addr>=lo&&size<=hi-lo&&addr-lo<=hi-lo-size)return 1;}
+ return 0;
+}
 static void loader_ready(void) { fprintf(stderr,"[totk] rtld callback: modules linked\n"); }
 static void module_inits(void) {
  fprintf(stderr,"[totk] SDK startup returned; running module constructors\n");

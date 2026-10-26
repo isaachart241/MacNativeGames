@@ -52,6 +52,8 @@ uint64_t runtime_module_lock_permission(uint64_t address,uint64_t size,unsigned 
 int runtime_module_query(uint64_t address,uint64_t *base,uint64_t *size,unsigned *state,unsigned *permission,unsigned *attribute);
 void runtime_oe_push_message(uint32_t message);
 void hle_bind_system_event(void *event, int autoclear);
+void hle_signal_system_event(void *event);   /* runtime/threads.c; binds as manual clear if not bound yet */
+int runtime_module_data(uint64_t addr, uint64_t size);   /* runtime/loader.c: range inside a module's data or .bss */
 uint64_t runtime_svc(unsigned num, uint64_t *regs, const char *module, uint64_t offset);
 void runtime_gate(void);
 void runtime_thread_init(void);

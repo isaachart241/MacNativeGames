@@ -151,7 +151,10 @@ void *runtime_hid_feedback_override(const char *name) {
         {"_ZN2nn3hid6detail18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", (void *)six_start, true},
         {"_ZN2nn3hid6detail17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", (void *)six_stop, true},
         {"_ZN2nn3hid6detail22GetSixAxisSensorStatesEPiPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE", (void *)six_states, true},
-        {"_ZN2nn3hid6detail21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", (void *)six_state, true}};
+        {"_ZN2nn3hid6detail21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", (void *)six_state, true},
+        /* Scarlet imports the public names of these two (same arguments; the public ones return void) */
+        {"_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", (void *)vib_init, false},
+        {"_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", (void *)vib_send, false}};
     for (unsigned i = 0; i < sizeof entries / sizeof *entries; i++)
         if (!strcmp(name, entries[i].name)) return (entries[i].gyro ? gyro : rumble) ? entries[i].fn : NULL;
     return NULL;

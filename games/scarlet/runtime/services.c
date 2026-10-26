@@ -135,7 +135,8 @@ static uint64_t stack_move(int unmap,uint64_t dst,uint64_t src,uint64_t size){
  int inHeap=src>=(uintptr_t)heap&&size<=heap_size&&src-(uintptr_t)heap<=heap_size-size;
  uint64_t aliasStart=ALIAS_START;
  int inAlias=src>=aliasStart&&size<=ALIAS_SIZE&&src-aliasStart<=ALIAS_SIZE-size;
- if(!inHeap&&!inAlias)return 0xdc01;
+ int inModule=!inHeap&&!inAlias&&runtime_module_data(src,size);   /* Scarlet: a stack in a module's .bss (loader.c) */
+ if(!inHeap&&!inAlias&&!inModule)return 0xdc01;
  pthread_mutex_lock(&memory_lock);
  if(inAlias){unsigned first=(unsigned)((src-aliasStart)/4096);for(uint64_t i=0;i<size/4096;i++)if(!alias_pages[first+i]){pthread_mutex_unlock(&memory_lock);return 0xdc01;}}
 
