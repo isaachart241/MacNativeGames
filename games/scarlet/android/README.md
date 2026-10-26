@@ -44,7 +44,9 @@ The game's rumble drives the Thor's vibration motor. It has one motor, so it get
 
 The bottom screen is the game's second screen while it is in focus: its menus, battle commands, dialogue and map
 screen are drawn there (the top screen shows the game without them; screens that are all interface, such as the
-title, show on both), with a strip of your map below them. Otherwise it shows the game's own map, north up and following you (drag to look
+title, show on both), with a strip of your map below them. They are laid out for this screen: the empty space between
+the game's boxes is taken out and what is left is scaled up to the screen's width, so dialogue and battle text read at
+the size the game gives them on a TV, or larger; screens that are all menu fill the width. Otherwise it shows the game's own map, north up and following you (drag to look
 around, pinch to zoom; it follows you again a few seconds after the last touch), and the minimap leaves the top screen;
 leaving the game gives the bottom screen back to whatever was there. The map is the game's own art, gathered as you
 play from the minimap (hidden from the top screen but still drawn by the game), and kept in the data folder's

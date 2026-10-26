@@ -993,3 +993,26 @@ first version left the menu's text on top (the text's own uniform buffer).
   32-bit restart index). Checked on the Thor from the same position and camera as the broken screenshot: clear sky
   with clouds, and the dark patch was gone (it was the triangle's shadow). Not checked: which mesh it was, or other
   places that had the same fault.
+
+### 2026-10-26: Thor port: the bottom screen laid out to be read
+
+The user: "Make all of that easily readable by a human, laid out properly so it isn't ugly like it is right now."
+The game's interface was fitted to the bottom screen's width as it is, a 16:9 TV picture with its boxes in the corners
+and navy between them: text at 0.65 of its size, most of the area empty.
+
+- **Layout** (`ui_layout` in `runtime/bottom_android.c`). The interface now arrives at full size (1920x1080; three
+  buffers, so the game's present thread never waits for the bottom screen's drawing). Columns and rows holding nothing
+  that stands out from the navy (text, borders, panels; a test strict enough that the faint dark backdrop of battle
+  messages does not count) shrink to a 40-pixel gap, 16 at the edges; the boxes keep their places relative to each
+  other, and the result is scaled to the screen's width, at most 1.5 times the game's size and leaving the map at least
+  300 rows. Screens that are mostly interface (under 30% navy) fill the width as before. Tried first on screenshots
+  (a prototype in Python), then on the Thor with a copy of the save: dialogue 1.14 times the game's size (was 0.65),
+  battle messages 1.5, the battle's command and move menus about 1.0 with both HP boxes; the X menu and its screens as
+  before.
+- **Place names** on the map at 1.4 of their size on the game's map screen (were 0.9, which this narrower screen made
+  about 0.6).
+- **Navy holes in the map.** The region map is left out where the closer tiles cover the screen; a tile whose image was
+  not written yet counted as covering, which showed the background as navy blocks for a moment. It no longer counts.
+
+Not checked: how the layout looks on screens not seen yet (shops, Pokémon Centers, the Pokédex, later battles); the
+layout changes at once when the interface changes shape (no animation).
