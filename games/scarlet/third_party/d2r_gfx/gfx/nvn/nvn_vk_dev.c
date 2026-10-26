@@ -270,32 +270,29 @@ void vk_arena_free(vk_arena *a) { vk_arena_reset(a); if (a->head) { vmaDestroyBu
 
 // ---------- submissions ----------
 /* Thor port: a command pool is not thread-safe, and submissions are recorded on more than one thread (the game's render
-   thread, and its loading threads when a texture upload opens an implicit submission there). Each recording thread
-   has its own pool; a finished submission goes back to the free list of the thread whose pool its command buffers
-   came from (comp_main), so they are only ever reset and recorded on that thread. Sharing V.cpool crashed the Adreno
-   driver during loads (a NULL dereference inside vulkan.adreno.so, 2026-10-26). */
-typedef struct vk_sub_home { VkCommandPool pool; vk_sub *free; } vk_sub_home;   // free: under g_done_mu
-static _Thread_local vk_sub_home *g_home;
+   thread, and its loading threads when a texture upload opens an implicit submission there). Sharing V.cpool crashed the
+   Adreno driver during loads (a NULL dereference inside vulkan.adreno.so, 2026-10-26). Each submission has a command pool
+   of its own, used by one thread at a time: the thread recording it, then comp_main, which resets the whole pool once the
+   GPU is done with it (retire). Resetting the two command buffers one by one at the next begin cost the render thread
+   about 3 ms a frame outdoors on the Thor. */
+static vk_sub *g_free_subs;   // under g_done_mu
 static vk_sub *sub_new(void) {
-    if (!g_home) {
-        g_home = calloc(1, sizeof *g_home); if (!g_home) VKDIE("submission pool allocation");
-        VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, V.qfam};
-        VKCHECK(vkCreateCommandPool(V.dev, &pci, NULL, &g_home->pool));
-    }
     pthread_mutex_lock(&g_done_mu);
-    vk_sub *s = g_home->free; if (s) g_home->free = s->next;
+    vk_sub *s = g_free_subs; if (s) g_free_subs = s->next;
     pthread_mutex_unlock(&g_done_mu);
     if (!s) {
-        s = calloc(1, sizeof *s); s->home = g_home;
+        s = calloc(1, sizeof *s); if (!s) VKDIE("submission allocation");
+        VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, 0, V.qfam};
+        VKCHECK(vkCreateCommandPool(V.dev, &pci, NULL, &s->pool));
         VkCommandBuffer cbs[2];
-        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, g_home->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 2};
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, s->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 2};
         VKCHECK(vkAllocateCommandBuffers(V.dev, &ai, cbs)); s->pre = cbs[0]; s->cb = cbs[1];
     }
     static uint64_t seq; s->seq = ++seq;
     s->next = NULL; s->npost = s->nrb = 0; s->dcur = 0; s->defer = NULL;
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    VKCHECK(vkResetCommandBuffer(s->pre, 0)); VKCHECK(vkBeginCommandBuffer(s->pre, &bi));
-    VKCHECK(vkResetCommandBuffer(s->cb, 0)); VKCHECK(vkBeginCommandBuffer(s->cb, &bi));
+    VKCHECK(vkBeginCommandBuffer(s->pre, &bi));   // both in the initial state: new, or their pool reset by retire
+    VKCHECK(vkBeginCommandBuffer(s->cb, &bi));
     {   // everything submitted before (earlier submissions, presents that blit a rendering) completes its memory accesses first:
         // nothing waits on the CPU for the GPU between submissions any more
         VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
@@ -354,6 +351,7 @@ static void retire(vk_sub *s) {
     }
     while (s->defer) { vk_defer *d = s->defer; s->defer = d->next; d->fn(d->arg); free(d); }
     for (int i = 0; i < s->ndpool; i++) vkResetDescriptorPool(V.dev, s->dpool[i], 0);
+    VKCHECK(vkResetCommandPool(V.dev, s->pool, 0));
     vk_arena_reset(&s->arena);
 }
 static void *comp_main(void *arg) {
@@ -371,7 +369,7 @@ static void *comp_main(void *arg) {
         pthread_mutex_lock(&g_done_mu);
         g_pend_head = s->next; if (!g_pend_head) g_pend_tail = NULL;
         atomic_store(&g_done, s->fence);
-        s->next = s->home->free; s->home->free = s;
+        s->next = g_free_subs; g_free_subs = s;
         for (int i = 0; i < g_nlate;) if (g_late[i].after <= s->fence) { late_t l = g_late[i]; g_late[i] = g_late[--g_nlate]; pthread_mutex_unlock(&g_done_mu); l.fn(l.arg); pthread_mutex_lock(&g_done_mu); } else i++;
         pthread_cond_broadcast(&g_done_cv);
         pthread_mutex_unlock(&g_done_mu);

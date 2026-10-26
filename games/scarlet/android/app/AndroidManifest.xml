@@ -5,6 +5,7 @@
   No resources either (no resources.arsc): the label is a plain string and the theme is the framework's.
   android/tools/build_apk.py compiles this file to Android's binary XML; it knows the attributes used here.
   INTERNET: the shader translator bridge on the Mac (android/tools/shader_bridge.py) over adb reverse on localhost.
+  VIBRATE: the game's rumble (runtime/activity_android.c).
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="org.macnativegames.scarlet"
@@ -13,6 +14,7 @@
 
     <uses-sdk android:minSdkVersion="33" android:targetSdkVersion="33" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
         android:label="Scarlet"

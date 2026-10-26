@@ -56,7 +56,7 @@ static _Atomic int focused = 1;
    loses focus (nn::oe message 15), held buttons are let go, and the sound is silent while out of focus. */
 void runtime_android_focus(int on) {
     if (atomic_exchange(&focused, on) == on) return;
-    if (!on) runtime_input_clear();
+    if (!on) { runtime_input_clear(); void runtime_rumble_set(unsigned, float, float, float, float); runtime_rumble_set(0, 0, 160, 0, 320); runtime_rumble_set(1, 0, 160, 0, 320); }
     runtime_oe_push_message(15);
     fprintf(stderr, "[totk] app %s\n", on ? "in focus" : "out of focus: sound off");
 }

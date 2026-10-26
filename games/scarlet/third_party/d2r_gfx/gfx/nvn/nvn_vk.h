@@ -75,7 +75,7 @@ typedef struct vk_sub {
     vk_readback *rb; int nrb, crb;
     vk_defer *defer;
     struct vk_sub *next;
-    struct vk_sub_home *home;        // Thor port: the recording thread's command pool and free list (see sub_new)
+    VkCommandPool pool;              // Thor port: the submission's own command pool (see sub_new)
 } vk_sub;
 extern _Thread_local vk_sub *g_sub;               // the submission being recorded (submit thread), NULL outside begin/commit
 vk_sub *vk_sub_current(void);       // g_sub, or an implicit one (begun on demand)

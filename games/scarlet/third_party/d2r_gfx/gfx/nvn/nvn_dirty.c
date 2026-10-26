@@ -67,15 +67,63 @@ static int busy_wait(range_t *r, uintptr_t p) {
     }
     return 1;
 }
+/* TOTK: the live ranges sorted by base, for a binary search (ranges never overlap: nvn_dirty_add_range refuses that).
+   The Vulkan backend's pool sync asks about every pool at every submission, one pool after the other, so the recent hits
+   below never helped there and the scan over the ~4,000 live pools of the world cost the replay thread about 5 ms a frame
+   on the Thor. Changed under g_slot_mu, together with the ranges' live flags, inside an odd g_idx_seq (a sequence lock):
+   a search that saw the same even number before and after is a true answer, a found range or none; otherwise (a change
+   was under way, maybe on this very thread when the fault handler interrupts it) find() falls back to the scan. Entries
+   are atomic pointers stored one by one, so a search racing a change reads only whole pointers into g_r. */
+static _Atomic(range_t *) g_idx[MAX_RANGE];
+static _Atomic int g_idx_n;
+static _Atomic unsigned g_idx_seq;
+static int idx_pos(uintptr_t base) {   // first entry whose base is >= base (under g_slot_mu)
+    int lo = 0, hi = atomic_load_explicit(&g_idx_n, memory_order_relaxed);
+    while (lo < hi) { int m = (lo + hi) / 2; if (atomic_load_explicit(&g_idx[m], memory_order_relaxed)->base < base) lo = m + 1; else hi = m; }
+    return lo;
+}
+static void idx_begin(void) { atomic_fetch_add_explicit(&g_idx_seq, 1, memory_order_relaxed); atomic_thread_fence(memory_order_release); }
+static void idx_end(void) { atomic_fetch_add_explicit(&g_idx_seq, 1, memory_order_release); }
+static void idx_insert(range_t *r) {
+    int n = atomic_load_explicit(&g_idx_n, memory_order_relaxed), at = idx_pos(r->base);
+    for (int i = n; i > at; i--) atomic_store_explicit(&g_idx[i], atomic_load_explicit(&g_idx[i - 1], memory_order_relaxed), memory_order_relaxed);
+    atomic_store_explicit(&g_idx[at], r, memory_order_relaxed);
+    atomic_store_explicit(&g_idx_n, n + 1, memory_order_relaxed);
+}
+static void idx_remove(range_t *r) {
+    int n = atomic_load_explicit(&g_idx_n, memory_order_relaxed), at = idx_pos(r->base);
+    if (at >= n || atomic_load_explicit(&g_idx[at], memory_order_relaxed) != r) return;
+    for (int i = at; i < n - 1; i++) atomic_store_explicit(&g_idx[i], atomic_load_explicit(&g_idx[i + 1], memory_order_relaxed), memory_order_relaxed);
+    atomic_store_explicit(&g_idx_n, n - 1, memory_order_relaxed);
+}
+static range_t *idx_find(uintptr_t a, int *sure) {
+    unsigned s0 = atomic_load_explicit(&g_idx_seq, memory_order_acquire);
+    *sure = 0;
+    if (s0 & 1) return NULL;
+    range_t *hit = NULL;
+    int lo = 0, hi = atomic_load_explicit(&g_idx_n, memory_order_relaxed);
+    if (hi > MAX_RANGE) hi = MAX_RANGE;
+    while (lo < hi) {   // the last entry whose base is <= a: the only range that can hold a
+        int m = (lo + hi) / 2; range_t *r = atomic_load_explicit(&g_idx[m], memory_order_relaxed);
+        if (!r) break;
+        if (r->base <= a) { hit = r; lo = m + 1; } else hi = m;
+    }
+    if (hit && !(atomic_load_explicit(&hit->live, memory_order_acquire) && a < hit->end)) hit = NULL;
+    atomic_thread_fence(memory_order_acquire);
+    *sure = atomic_load_explicit(&g_idx_seq, memory_order_relaxed) == s0;
+    return hit;
+}
 static range_t *find(uintptr_t a) {
     /* TOTK: the replay asks about the same few pools over and over; the last hits per thread (8, round robin) are checked
-       first (a slot reused for another pool fails the bounds or live test and falls through to the scan), so the scan over
-       the ~4,000 live pools of the world mostly runs for the first touch of a pool. */
+       first (a slot reused for another pool fails the bounds or live test and falls through), then the sorted index, and
+       the scan over all slots only when a change of the ranges raced the search. */
     static __thread range_t *recent[8]; static __thread unsigned next;
     for (int k = 0; k < 8; k++) {
         range_t *l = recent[k];
         if (l && atomic_load_explicit(&l->live, memory_order_acquire) && a >= l->base && a < l->end) return l;
     }
+    int sure; range_t *h = idx_find(a, &sure);
+    if (sure) { if (h) recent[next++ & 7] = h; return h; }
     int n = atomic_load(&g_nr);
     for (int i = 0; i < n; i++) if (atomic_load_explicit(&g_r[i].live, memory_order_acquire) && a >= g_r[i].base && a < g_r[i].end) { recent[next++ & 7] = &g_r[i]; return &g_r[i]; }
     return NULL;
@@ -202,9 +250,12 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     } else {
         memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen);
     }
+    idx_begin();
     r->base = base; r->end = end; r->state = state; r->gen = gen; atomic_store(&r->latest, 0);
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
+    idx_insert(r);
+    idx_end();
     pthread_mutex_unlock(&g_slot_mu);
 }
 // 池销毁：先把仍受保护的页还原成可写（池内存归还游戏后可能另作他用），再标失效
@@ -212,7 +263,9 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
 void nvn_dirty_remove_range(const void *mem) {
     pthread_mutex_lock(&g_slot_mu);
     range_t *r = find((uintptr_t)mem);
-    if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); }
+    if (r) { prep_write((void *)r->base, r->end - r->base);
+        idx_begin(); atomic_store_explicit(&r->live, 0, memory_order_release); idx_remove(r); idx_end();
+        atomic_fetch_sub(&g_live, 1); }
     pthread_mutex_unlock(&g_slot_mu);
 }
 int nvn_dirty_tracked(const void *addr, size_t len) {
@@ -221,8 +274,8 @@ int nvn_dirty_tracked(const void *addr, size_t len) {
 // 设只读：先把页标成 BUSY，mprotect 落地后才标 PROT（次序与不变式见文件头的状态说明）
 // Set read-only: mark the page BUSY first, and mark it PROT only after mprotect has landed (for the order and the invariant see the state notes at the top of the file)
 void nvn_dirty_protect(const void *addr, size_t len) {
-    if (!len || !nvn_dirty_tracked(addr, len)) return;
-    range_t *r = find((uintptr_t)addr);
+    range_t *r = len ? find((uintptr_t)addr) : NULL;
+    if (!r || (uintptr_t)addr + len > r->end) return;   // not tracked (nvn_dirty_tracked)
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
     // 连续置成 PROT 的页合成一次 mprotect（逐页调用在首传大贴图时一帧上千次；选角页启动帧 5：4888 次）。
     // 已是 PROT / BUSY 的页断开连续段：不重复保护，也不碰别的线程正在改的页
@@ -243,8 +296,8 @@ void nvn_dirty_protect(const void *addr, size_t len) {
 uint64_t nvn_dirty_now(void) { return atomic_load(&g_now); }
 int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) {
     if (!len) return 0;
-    if (!nvn_dirty_tracked(addr, len)) return 1;   // 未跟踪时保守视为脏，宁可多传也不显示旧内容 | When untracked, conservatively treat as dirty: better to upload more than to show stale content
     range_t *r = find((uintptr_t)addr);
+    if (!r || (uintptr_t)addr + len > r->end) return 1;   // 未跟踪时保守视为脏，宁可多传也不显示旧内容 | When untracked, conservatively treat as dirty: better to upload more than to show stale content
     if (atomic_load(&r->latest) <= stamp) return 0;   // TOTK: nothing in the whole pool was written since the stamp (no per-page scan)
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
     for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) return 1;   // 上传前最后一次写的代号 ≤ 戳；之后的写必 > 戳 | The generation of the last write before upload is <= the stamp; any later write must be > the stamp

@@ -39,6 +39,9 @@ as on the Mac (`runtime/controller_map.h`). The pad's back button does nothing i
 game pauses and goes on when you come back. Text the game asks for (names, nicknames) is
 typed in a dialog with the on-screen keyboard.
 
+The game's rumble drives the Thor's vibration motor. It has one motor, so it gets the stronger of the game's two;
+`TOTK_RUMBLE=0` turns rumble off, and `SCARLET_RUMBLE_TEST=<1-255>` buzzes once at start to check the motor.
+
 ## Shaders
 
 The game's shaders are translated to SPIR-V on the Thor itself, the first time each one is drawn, and kept in the app's

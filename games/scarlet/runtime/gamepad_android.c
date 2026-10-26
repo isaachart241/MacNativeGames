@@ -4,7 +4,7 @@
    d-pad keys). They become the same physical buttons as on the Mac (runtime/controller_map.h: face buttons by position,
    so the button on the right is the Switch's A) and go through the player's layout (TOTK_CONTROLS, the modes hold, tap,
    toggle and aim) as in runtime/gamepad.m. The command-line build gets no events: there the game sees the keyboard
-   script of runtime/input.c (TOTK_INPUT_FILE) only. Rumble is accepted and dropped. */
+   script of runtime/input.c (TOTK_INPUT_FILE) only, and its rumble is dropped. */
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -126,7 +126,23 @@ void runtime_gamepad_read(RuntimeGamepadState *out) {
     pthread_mutex_unlock(&gamepadLock);
 }
 
+#ifdef SCARLET_APK
+/* Rumble: the game's two motors (left, right; each a low and a high band) as one strength for the Thor's single vibrator,
+   the stronger of the four amplitudes; below 3 % it is off (a faint constant buzz otherwise). Nothing while the app is out
+   of focus: the paused game sends no update that would stop it. runtime/activity_android.c applies it. */
+void runtime_android_rumble(int level);
+static float rumbleAmp[2];
+void runtime_rumble_set(unsigned side, float al, float fl, float ah, float fh) {
+    (void)fl; (void)fh;
+    if (side > 1) return;
+    rumbleAmp[side] = al > ah ? al : ah;
+    float a = rumbleAmp[0] > rumbleAmp[1] ? rumbleAmp[0] : rumbleAmp[1];
+    if (a > 1) a = 1;
+    runtime_android_rumble(a < 0.03f || !runtime_front_focus() ? 0 : (int)(a * 254.0f) + 1);
+}
+#else
 void runtime_rumble_set(unsigned side, float al, float fl, float ah, float fh) { (void)side; (void)al; (void)fl; (void)ah; (void)fh; }
+#endif
 
 #ifdef SCARLET_APK
 /* Physical button of an Android key code (bit of controller_physical_names), -1 for the face buttons (kept by name),

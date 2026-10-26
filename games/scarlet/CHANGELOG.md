@@ -695,3 +695,49 @@ also logs each draw's shaders and depth, stencil, coverage and alpha state):
 So the backend uses alpha to coverage only on multisampled targets (`nvn_vk_exec.c`; `TOTK_VK_A2C=1` keeps it on). At
 the same spot, looking at the academy and at the orange trees: no seams on the path, the cliffs or the grass, and the
 trees in leaf. Not checked: the house after the change (its alpha-to-coverage draws now use the shaders' own cut-out).
+
+### 2026-10-26: Thor port: outdoor frame time; rumble
+
+**Measuring.** `perf_walk.sh` (scratchpad, not committed) walks the player in a square at the start of Cabo Poco with
+the Thor's left stick (`sendevent` on `/dev/input/event9`), turns the camera each lap, and every 20 s logs the game's
+300-frame timing line, GPU busy and clock (`/sys/class/kgsl/kgsl-3d0`), the hottest CPU and GPU zones and the cluster
+clocks. Sound muted, the save backed up first and compared afterwards (unchanged). Before this entry, 15 minutes docked:
+frame time p50 34.9 ms, p95 38.4 ms (about 29 fps), NVN replay 28.4 ms a frame, GPU 87 % busy at its 680 MHz top
+clock, CPU 94-96 °C, GPU 83 °C; the clocks never dropped.
+
+**Profile** (simpleperf, `app_profiler.py`; the NDK's binary cache matches libraries by name, so it must hold the
+installed `libscarlet.so`, not a newer build: the first report was against the wrong one). The game's render thread was
+busy 85 % of the time, 92 % of it inside `nvnQueueSubmitCommands`, which replays the frame there. The largest parts:
+- 17 %: `find()` in `nvn_dirty.c`. The pool sync (`vk_pools_sync`) asks the dirty tracker about each 64 KiB chunk of
+  each memory pool at every submission (about 19,000 chunks a frame); the 8 recent hits per thread helped within a
+  pool, but each new pool cost a scan over the ~4,000 live ranges.
+- 12 %: `vkResetCommandBuffer` at the start of each submission (the Adreno driver frees the buffers' memory there).
+- 18 %: descriptor sets (allocation, writes, binding per draw); 9 %: `vkCmdBeginRendering` (about 114 passes a frame).
+
+**Changes.**
+- `nvn_dirty.c`: the live ranges are also kept sorted by base for a binary search. Adds and removes change it under the
+  slot mutex inside an odd sequence number; a search that sees the same even number before and after gives a true
+  answer (a range or none), otherwise (a change under way, possibly on the same thread when the fault handler
+  interrupts it) the old scan runs. `nvn_dirty_since` / `nvn_dirty_protect` look the range up once instead of twice.
+  Shared with the Mac build (built). A stress test (random adds and removes of 3,000 pools, 4 reader threads) gave
+  824,000 checks without a wrong answer, as the old code; ThreadSanitizer reports the same plain reads of a range's
+  bounds for both (the scan read them that way already).
+- `nvn_vk_dev.c`: each submission has its own command pool; `comp_main` resets the whole pool once the GPU has
+  finished with it (in `retire`), instead of the render thread resetting the two buffers at the next begin.
+
+After both, 10 minutes on the same walk: frame time p50 33.7 ms, p95 37.9 ms, NVN replay 19.0 ms (from 28.4), GPU
+85 %. The frame is now at the game's 30 fps cap most of the time and GPU-bound: the GPU is the limit at full clock.
+Handheld mode (`TOTK_OPERATION_MODE=handheld`, 720p output, lower internal resolution), same walk: frame p50 33.2 ms,
+p95 37.9 ms, GPU 66 % busy at 615 MHz, GPU 79 °C, CPU still 94 °C; the render thread was busy 54 % of the time
+(docked: 76 %). The p95 is the same in both modes, so the slow frames left are not GPU time.
+
+60 fps is out of reach on this path: docked, the GPU alone needs about 30 ms a frame; handheld about 18 ms of GPU at
+full clock and 16-19 ms of replay on the CPU, before the game's own work and a game patch to lift its 30 fps cap.
+
+**Rumble.** `runtime_rumble_set` (from `hid_feedback.c`, on unless `TOTK_RUMBLE=0`) becomes one strength for the
+Thor's single vibrator: the stronger of the game's two motors and two bands, off below 3 % and while the app is out of
+focus. A thread attached to the VM renews a 100 ms one-shot vibration every 50 ms while it is above 0 and cancels it at
+0 (`activity_android.c`), as media usage (without attributes Android files it under touch feedback, which the touch
+haptics setting turns off). The manifest asks for `VIBRATE`. `SCARLET_RUMBLE_TEST=<1-255>` buzzes once at start:
+`dumpsys vibrator_manager` showed the app's vibrations at amplitude 0.094 (24), renewed every 50 ms and cancelled after
+300 ms, usage MEDIA. Not checked: rumble from the game itself (none came during the walks).

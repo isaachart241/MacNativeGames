@@ -75,6 +75,8 @@ static void *game_thread(void *arg) {
     fprintf(stderr, "[totk] Scarlet for the Thor: data folder %s\n", dir);
     load_env("env.txt");
     runtime_env_input_script(); runtime_env_input_file(); runtime_env_autoload(); runtime_env_thread_dumps();
+    const char *buzz = getenv("SCARLET_RUMBLE_TEST");   // 1..255: one 300 ms vibration at that strength, to check the motor
+    if (buzz && atoi(buzz) > 0) { void runtime_android_rumble(int); runtime_android_rumble(atoi(buzz) > 255 ? 255 : atoi(buzz)); usleep(300000); runtime_android_rumble(0); }
     const char *rewritten = getenv("SCARLET_REWRITTEN"); if (!rewritten || !*rewritten) rewritten = "rewritten/v400-android";
     struct stat st;
     if (stat(rewritten, &st) || stat("extracted", &st)) {
@@ -244,6 +246,53 @@ void runtime_android_text_test(const char *op, const char *text) {
     pthread_mutex_unlock(&textLock);
 }
 
+/* Rumble (runtime/gamepad_android.c): one strength, 0..255, for Android's vibrator (the Thor has one, with amplitude
+   control). A thread of its own, attached to the VM, applies it, so no Java call happens on a game thread: while the
+   strength is above 0 it renews a 100 ms one-shot vibration every 50 ms, and 0 cancels it. */
+static JavaVM *appVM; static jobject appContext;   /* the application context (a global reference), for the vibrator */
+static pthread_mutex_t rumbleLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t rumbleCond = PTHREAD_COND_INITIALIZER;
+static int rumbleLevel, rumbleStarted;
+static void *rumble_thread(void *arg) {
+    (void)arg; pthread_setname_np(pthread_self(), "rumble");
+    JNIEnv *env; if ((*appVM)->AttachCurrentThread(appVM, &env, NULL) != JNI_OK) return NULL;
+    jclass cc = (*env)->GetObjectClass(env, appContext);
+    jobject vib = (*env)->CallObjectMethod(env, appContext, (*env)->GetMethodID(env, cc, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;"),
+                                           (*env)->NewStringUTF(env, "vibrator"));
+    jclass vc = (*env)->FindClass(env, "android/os/Vibrator"), ec = (*env)->FindClass(env, "android/os/VibrationEffect");
+    if ((*env)->ExceptionCheck(env) || !vib || !vc || !ec) { (*env)->ExceptionClear(env); fprintf(stderr, "[totk] rumble: no vibrator\n"); return NULL; }
+    /* Media usage, as for games (without attributes Android files it under touch feedback, which the touch haptics
+       setting turns off); the media vibration setting applies. */
+    jclass ac = (*env)->FindClass(env, "android/os/VibrationAttributes");
+    jobject attrs = ac ? (*env)->CallStaticObjectMethod(env, ac, (*env)->GetStaticMethodID(env, ac, "createForUsage", "(I)Landroid/os/VibrationAttributes;"),
+                                                        (*env)->GetStaticIntField(env, ac, (*env)->GetStaticFieldID(env, ac, "USAGE_MEDIA", "I"))) : NULL;
+    if ((*env)->ExceptionCheck(env) || !attrs) { (*env)->ExceptionClear(env); fprintf(stderr, "[totk] rumble: no vibration attributes\n"); return NULL; }
+    jmethodID vibrate = (*env)->GetMethodID(env, vc, "vibrate", "(Landroid/os/VibrationEffect;Landroid/os/VibrationAttributes;)V"), cancel = (*env)->GetMethodID(env, vc, "cancel", "()V");
+    jmethodID oneshot = (*env)->GetStaticMethodID(env, ec, "createOneShot", "(JI)Landroid/os/VibrationEffect;");
+    fprintf(stderr, "[totk] rumble: the game's vibration goes to Android's vibrator\n");
+    int on = 0;
+    for (;;) {
+        pthread_mutex_lock(&rumbleLock);
+        if (!rumbleLevel && !on) pthread_cond_wait(&rumbleCond, &rumbleLock);
+        else { struct timespec t; clock_gettime(CLOCK_REALTIME, &t); t.tv_nsec += 50000000; if (t.tv_nsec >= 1000000000) { t.tv_nsec -= 1000000000; t.tv_sec++; } pthread_cond_timedwait(&rumbleCond, &rumbleLock, &t); }
+        int level = rumbleLevel;
+        pthread_mutex_unlock(&rumbleLock);
+        (*env)->PushLocalFrame(env, 8);
+        if (level > 0) { jobject eff = (*env)->CallStaticObjectMethod(env, ec, oneshot, (jlong)100, (jint)level); if (eff) (*env)->CallVoidMethod(env, vib, vibrate, eff, attrs); on = 1; }
+        else if (on) { (*env)->CallVoidMethod(env, vib, cancel); on = 0; }
+        if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); }
+        (*env)->PopLocalFrame(env, NULL);
+    }
+    return NULL;
+}
+void runtime_android_rumble(int level) {
+    if (!appVM || !appContext) return;
+    pthread_mutex_lock(&rumbleLock);
+    if (level != rumbleLevel) { rumbleLevel = level; pthread_cond_broadcast(&rumbleCond); }
+    if (!rumbleStarted && level > 0) { rumbleStarted = 1; pthread_t t; if (!pthread_create(&t, NULL, rumble_thread, NULL)) pthread_detach(t); }
+    pthread_mutex_unlock(&rumbleLock);
+}
+
 static void window_created(ANativeActivity *a, ANativeWindow *w) { (void)a; runtime_android_window(w); }
 static void window_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; runtime_android_window(NULL); }
 static void focus_changed(ANativeActivity *a, int on) { if (on) immersive(a); runtime_android_focus(on); }
@@ -264,6 +313,13 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     ANativeActivity_setWindowFlags(a, AWINDOW_FLAG_KEEP_SCREEN_ON | AWINDOW_FLAG_FULLSCREEN, 0);
     immersive(a);
     activity = a;
+    if (!appContext) {   /* for the rumble thread: the application context outlives any one activity */
+        appVM = a->vm;
+        jclass ac = (*a->env)->GetObjectClass(a->env, a->clazz);
+        jobject app = (*a->env)->CallObjectMethod(a->env, a->clazz, (*a->env)->GetMethodID(a->env, ac, "getApplicationContext", "()Landroid/content/Context;"));
+        if (app) appContext = (*a->env)->NewGlobalRef(a->env, app);
+        if ((*a->env)->ExceptionCheck(a->env)) (*a->env)->ExceptionClear(a->env);
+    }
     if (uiPipe[0] < 0) {   /* the text entry dialog's wake-ups on the UI thread's looper (the same looper for every activity) */
         ALooper *ui = ALooper_forThread();
         if (pipe2(uiPipe, O_NONBLOCK | O_CLOEXEC) == 0) ALooper_addFd(ui, uiPipe[0], 2, ALOOPER_EVENT_INPUT, on_ui, NULL);
