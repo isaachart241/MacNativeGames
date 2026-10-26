@@ -676,3 +676,22 @@ waits for its shader (up to 5 s, `TOTK_SHADER_WAIT_MS`); from an empty cache the
 translated during the load (frames up to 94 ms). The bridge-made cache was merged in: 433 variants of 371 shaders.
 Draws still wait for nothing while a pipeline is created past the 8 ms a frame budget (`TOTK_PIPE_BUDGET_MS`); no run
 went wrong for that.
+
+### 2026-10-26: Thor port: outdoors, black seams and trees without leaves
+
+Outside the house the Thor showed thin black seams along the edges of paths, cliffs and grass, and trees with fruit and
+trunks but no leaves. Render-target dumps of one frame at the start of Cabo Poco (`TOTK_VK_DUMP_RT`; the dump frame now
+also logs each draw's shaders and depth, stencil, coverage and alpha state):
+- The seams are already in the G-buffer (pass 16's colour and material targets keep their clear values there), so they
+  are pixels no geometry coloured, not a lighting fault. The ground has a depth pre-pass (pass 13) and an `EQUAL`
+  colour pass (pass 16) whose height textures and samplers are the same; the pixels lost lie along edge meshes drawn
+  with alpha to coverage, and both passes of those meshes use it.
+- 111 draws of the frame use alpha to coverage, all on single-sample targets, with NVN's dither on: the leaves (46
+  draws), the path and cliff meshes (31), and the edge meshes' pre-pass and colour pass. No draw uses NVN's alpha test.
+- With alpha to coverage off (`TOTK_VK_A2C=0`) the leaves are back, with their shapes (these materials also cut out by
+  alpha in the shader), and the seams are gone. On one sample Vulkan leaves the coverage it makes to the driver; the
+  Adreno's dropped the pixels the Switch's dithered coverage keeps.
+
+So the backend uses alpha to coverage only on multisampled targets (`nvn_vk_exec.c`; `TOTK_VK_A2C=1` keeps it on). At
+the same spot, looking at the academy and at the orange trees: no seams on the path, the cliffs or the grass, and the
+trees in leaf. Not checked: the house after the change (its alpha-to-coverage draws now use the shaders' own cut-out).

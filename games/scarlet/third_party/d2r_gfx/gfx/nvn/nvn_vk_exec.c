@@ -426,7 +426,14 @@ static VkPipeline pso_get(vk_prog *pr, VkPrimitiveTopology topo) {
         VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, VK_FALSE, 0, 0, 0, 1.0f};
     j->dcs = (VkPipelineRasterizationDepthClipStateCreateInfoEXT){VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT, NULL, 0, VK_FALSE};
     int dcs = S.depth_clamp && V.f_depth_clip;
-    j->ms = (VkPipelineMultisampleStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, P.samples, VK_FALSE, 0, NULL, S.ms.a2c ? VK_TRUE : VK_FALSE, VK_FALSE};
+    /* Alpha to coverage only with more than one sample. With one (all of Scarlet's), Vulkan leaves the coverage it makes to
+       the driver: the Adreno dropped pixels the Switch keeps (its single-sample coverage is dithered), so trees lost their
+       leaves and the soft edge meshes of paths and cliffs left black seams (their depth pre-pass and colour pass kept
+       different pixels). Those materials also cut out by alpha in the shader, so without it leaves keep their shapes.
+       TOTK_VK_A2C=1 keeps it on, =0 turns it off everywhere (experiments). */
+    static int a2c_mode = -1; if (a2c_mode < 0) { const char *e = getenv("TOTK_VK_A2C"); a2c_mode = e && *e ? atoi(e) != 0 : 2; }
+    int a2c = S.ms.a2c && (a2c_mode == 1 || (a2c_mode == 2 && P.samples > VK_SAMPLE_COUNT_1_BIT));
+    j->ms = (VkPipelineMultisampleStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, P.samples, VK_FALSE, 0, NULL, a2c ? VK_TRUE : VK_FALSE, VK_FALSE};
     VkStencilOpState sf = {stop((int)S.ds.fail_f), stop((int)S.ds.zpass_f), stop((int)S.ds.zfail_f), cmpop((int)S.ds.sf_f), 0xff, 0xff, 0};
     VkStencilOpState sb = {stop((int)S.ds.fail_b), stop((int)S.ds.zpass_b), stop((int)S.ds.zfail_b), cmpop((int)S.ds.sf_b), 0xff, 0xff, 0};
     j->ds = (VkPipelineDepthStencilStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, NULL, 0,
@@ -626,6 +633,15 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     VkCommandBuffer cb = CB();
     int quads; VkPrimitiveTopology topo = topo_of(dw ? dw->prim : di->prim, &quads);
     VkPipeline pipe = pso_get(pr, topo); if (!pipe) { atomic_fetch_add(&g_stat_skip_pipe, 1); return; }
+    if (rtd_armed()) {   /* the dump frame: each draw's shaders and depth / stencil / bias state */
+        const char *vk = pr->sh[0]->key, *pk = pr->sh[1] ? pr->sh[1]->key : "-";
+        VKLOG("rtdump pass %d draw: vs %.12s ps %.12s depth test %d write %d func %d, stencil test %d func %d ops %d/%d/%d ref %u masks %#x/%#x, bias %d (units %g factor %g clamp %g), cull %d, dfmt %d, "
+              "colour mask %#x blend %#x, a2c %d dither %d samples %d, alpha func %d, count %d",
+              g_rtd_pass + 1, vk + (strlen(vk) > 12 ? strlen(vk) - 12 : 0), pk + (strlen(pk) > 12 ? strlen(pk) - 12 : 0), S.ds.dt, S.ds.dw, (int)S.ds.df, S.ds.st,
+              (int)S.ds.sf_f, (int)S.ds.fail_f, (int)S.ds.zfail_f, (int)S.ds.zpass_f, (unsigned)S.st_ref[0], (unsigned)S.st_vmask[0], (unsigned)S.st_wmask[0],
+              S.poly.offset_en, S.po.units, S.po.factor, S.po.clamp, (int)S.poly.cull, (int)P.dfmt, (unsigned)S.chmask.mask, (unsigned)S.color.blend_en,
+              S.ms.a2c, S.ms.a2c_dither, (int)P.samples, (int)S.color.alpha_func, count);
+    }
     int tf = S.tf_active && pr->sh[0]->tf_n;   // Scarlet: a capture draw (plain list / point draws, as on the Mac)
     if (tf && !dw) { VKONCE("transform feedback: indexed capture draws are not implemented (skipped)"); return; }
     if (tf) { g_tfd.first = (uint32_t)dw->first; g_tfd.count = (uint32_t)dw->count; g_tfd.base_instance = (uint32_t)dw->base_instance; }
