@@ -7,9 +7,9 @@
 #   make boot      # run it from the work folder (cwd: extracted/ and rewritten/ are read relative to it)
 
 WORK ?= SCARLET_build
-# Scarlet 0100A3D008C5C000; Violet is 01008F6008C5E000 (both unverified until stage 0). GAME_VERSION is set at stage 1.
+# Scarlet 0100A3D008C5C000 (verified 2026-10-25); Violet is 01008F6008C5E000 (unverified).
 TITLE ?= 0100a3d008c5c000
-GAME_VERSION ?= 0.0.0
+GAME_VERSION ?= 4.0.0
 OUT := $(WORK)/build
 PY ?= python3
 NATIVE_OPT ?= -O2
@@ -68,15 +68,15 @@ $(OUT)/spirv-cross/spirv-cross:
 SCARLET_LOG ?= $(WORK)/logs/boot.log
 boot: runtime
 	@mkdir -p "$(dir $(SCARLET_LOG))"
-	cd "$(WORK)" && TOTK_HEADLESS=$${TOTK_HEADLESS-} ./build/scarlet-native rewritten/v120 boot 2> "$(abspath $(SCARLET_LOG))"; echo "exit $$?; log: $(SCARLET_LOG)"
+	cd "$(WORK)" && TOTK_HEADLESS=$${TOTK_HEADLESS-} ./build/scarlet-native rewritten/v400 boot 2> "$(abspath $(SCARLET_LOG))"; echo "exit $$?; log: $(SCARLET_LOG)"
 
-# The player's mods, made into checked tables: exefs patches (mods/1.2.0/<name>/exefs/*.pchtxt) -> <work>/patches,
+# The player's mods, made into checked tables: exefs patches (mods/4.0.0/<name>/exefs/*.pchtxt) -> <work>/patches,
 # RomFS mods (mods/<name>/romfs/...) -> their manifest.tsv (sizes and SHA-256 of the replacements and the originals).
 .PHONY: patches mods app
 patches:
 	"$(PY)" scripts/prepare_patches.py --work "$(WORK)"
 mods:
-	for d in mods/*/romfs; do [ -d "$$d" ] && "$(PY)" scripts/make_mod_manifest.py "$$d" --romfs "$(WORK)/extracted/v120/romfs"; done; true
+	for d in mods/*/romfs; do [ -d "$$d" ] && "$(PY)" scripts/make_mod_manifest.py "$$d" --romfs "$(WORK)/extracted/v400/romfs"; done; true
 
 # The app: a small launcher bundle (settings window with presets, then the game) that runs the game from the work
 # folder, which it names in Info.plist (ScarletWorkFolder): nothing large is copied. Its icon comes from the game's own

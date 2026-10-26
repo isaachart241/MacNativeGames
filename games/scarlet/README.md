@@ -6,55 +6,49 @@ own copies of everything (`runtime/`, `third_party/d2r`, `third_party/d2r_gfx`, 
 never affect another game. Bayonetta 3 was chosen as the base because it already runs a third-party engine: CMIF
 domains, offline network services, Wwise's AudioOut and indirect draws are all there.
 
-**Nothing runs yet.** How the work goes: [CHANGELOG.md](CHANGELOG.md).
+**Nothing runs yet.** Stage 0 is done (2026-10-25): the code extracts, rewrites and passes the structural check. How the work goes: [CHANGELOG.md](CHANGELOG.md).
 
 You must own the game: use your own dump and the `prod.keys` from your own Switch. Nothing from the game is in this
 repository; `SCARLET_build/` (the work folder) and `mods/` are ignored by git.
 
+## Inputs
+
+- Base `0100A3D008C5C000` **1.0.0**, a full game card image (XCI). Unlike Bayonetta's, the base is not sparse.
+- Update `0100A3D008C5C800` **4.0.0** (NSP): a BKTR patch over the base, with the full ExeFS.
+- `prod.keys` and firmware NCAs from your own Switch (the system fonts come from the firmware).
+
 ## What is still Bayonetta's
 
-These are placeholders until stage 1 pins Scarlet's version. Each is a compile-time or hash check, so nothing can
-silently use Bayonetta values with Scarlet data:
+- `scripts/merge_romfs.py` was written for Bayonetta's sparse base. Scarlet is a normal base plus a BKTR update, the
+  same shape as Tears of the Kingdom with an update, so stage 1 follows `build_app.py`'s merge instead.
+- `assets/expected-v4.0.0.json` doesn't exist yet; `prepare_runtime.py` and `prepare_patches.py` need it (stage 1).
+- `runtime/game_patches.c` reads Bayonetta-style patch tables (`SCARLET_PATCHES` picks them); Scarlet has none yet.
+- `scripts/make_res_patch.py` holds Bayonetta's resolution sites; it does not apply to Scarlet.
 
-- `runtime/game_version.h`: `TOTK_GAME_VERSION "0.0.0"`, `TOTK_GAME_DIR "v120"`.
-- `v120` in `Makefile`, `scripts/prepare_runtime.py`, `scripts/prepare_patches.py`, `scripts/make_res_patch.py`,
-  `scripts/make_mod_manifest.py`.
-- `assets/expected-v1.2.0.json` was removed; `prepare_runtime.py` and `prepare_patches.py` need a Scarlet
-  `assets/expected-v<version>.json` (stage 1) before they run.
-- `runtime/game_patches.c` reads Bayonetta's patch tables (`SCARLET_PATCHES` picks them); Scarlet has none yet.
-- `scripts/merge_romfs.py` was written for Bayonetta's sparse base NCA. If Scarlet's base is not sparse, the update
-  RomFS may be enough, or the script needs a non-sparse path.
+## Stage 0 (done): commands
 
-## Stage 0: the first session with the dump
+From the repository root, after `source ../env.sh`, with the files in `~/Games/Scarlet/`:
 
-From the repository root, after `source ../env.sh` (Homebrew, the Python 3.14 environment, `LLVM_BIN`):
+```sh
+cd games/scarlet
+python scripts/extract_shared_fonts.py --keys ~/Games/Scarlet/prod.keys --firmware ~/Games/Scarlet/Firmware.22.5.0 \
+  --output SCARLET_build/extracted/firmware/shared-fonts
+cd scripts
+python extract_code.py ~/Games/Scarlet/"Pokemon Scarlet v4.0.0.nsp" --keys ~/Games/Scarlet/prod.keys \
+  --output ../SCARLET_build/extracted/v400/exefs
+python survey.py ../SCARLET_build/extracted/v400/exefs --json ../SCARLET_build/survey.json
+cd ..
+for m in sdk subsdk0 main; do
+  DM_RULESET=native DM_PRIVATE_GATES=0 python third_party/d2r/patch_nso.py SCARLET_build/extracted/v400/exefs/$m SCARLET_build/rewritten/v400 $m
+  python third_party/d2r/structck.py SCARLET_build/rewritten/v400 $m SCARLET_build/extracted/v400/exefs/$m
+done
+```
 
-1. Put the dump, update and keys somewhere outside the repository, e.g. `~/Games/Scarlet/`.
-2. Extract the code from the update:
+Use the build's variables: without `DM_RULESET=native DM_PRIVATE_GATES=0` the rewrite has to be redone.
+What each step found is in [CHANGELOG.md](CHANGELOG.md).
 
-   ```sh
-   cd games/scarlet/scripts
-   python extract_code.py ~/Games/Scarlet/update.nsp --keys ~/Games/Scarlet/prod.keys --output ../SCARLET_build/extracted/exefs
-   ```
+## Stage 1: next
 
-   Add `--title 01008F6008C5E000` for Violet. If it refuses (a layout Bayonetta did not have), that is the first fix.
-3. Survey it:
-
-   ```sh
-   python survey.py ../SCARLET_build/extracted/exefs --json ../SCARLET_build/survey.json
-   ```
-
-   It lists build IDs and the SDK version, middleware markers, NVN names this tree does not implement, and services in
-   `main.npdm` the host never mentions. Copy the summary (counts and names, no game data) into CHANGELOG.md.
-4. Try the rewrite, which is generic. Expect a new site kind or two, as Bayonetta needed `site_spset`:
-
-   ```sh
-   for m in sdk subsdk0 main; do
-     DM_RULESET=native DM_PRIVATE_GATES=0 python ../third_party/d2r/patch_nso.py ../SCARLET_build/extracted/exefs/$m ../SCARLET_build/rewritten/v0 $m
-   done
-   ```
-
-   Use the build's variables: without `DM_RULESET=native DM_PRIVATE_GATES=0` the rewrite has to be redone.
-5. Look up main's build ID in community `.pchtxt` files (60 fps, resolution) for that version.
-
-Then stage 1: rename `v120` to the real version folder, write `assets/expected-v<version>.json`, and merge the RomFS.
+1. Run `equiv.py` on the three rewrites (each rewritten site against the original in an emulator), as by3 did.
+2. Merge the RomFS: base 1.0.0 + the 4.0.0 BKTR patch, following `build_app.py`'s update path; verify every IVFC block.
+3. Write `assets/expected-v4.0.0.json` pinning the ExeFS, rewrite and RomFS hashes.

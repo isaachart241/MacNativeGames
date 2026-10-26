@@ -48,19 +48,21 @@ def strings(img, pattern):
     return sorted({m.group(1).decode('latin1') for m in re.finditer(pattern, img)})
 
 
-def sdk_imports(img):
-    """nn::<library> of every undefined symbol main imports, counted."""
-    libs = Counter()
+def sdk_imports(img, replaced):
+    """{nn::<library>: [imported, replaced by the host]} over the distinct undefined nn:: symbols main imports.
+    The host answers most of the SDK by replacing functions by mangled name (runtime_override and friends); an
+    import it does not replace runs the SDK's own code, which may then reach a service over IPC."""
+    libs = {}
     try:
         entries = nsoimg.relocs(img)
     except (AssertionError, KeyError, struct.error, ValueError):
         return None   # no MOD0 / dynamic section (not a dynamic module)
-    for _, _, name, value, _ in entries:
-        m = name and value is None and re.match(r'_ZN[KV]*2nn(\d+)', name)
+    for name in {name for _, _, name, value, _ in entries if name and value is None}:
+        m = re.match(r'_ZN[KV]*2nn(\d+)', name)
         if m:
-            n = int(m.group(1)); rest = name[m.end():]
-            libs[rest[:n]] += 1
-    return libs
+            n = int(m.group(1)); lib = name[m.end():m.end() + n]
+            counts = libs.setdefault(lib, [0, 0]); counts[0] += 1; counts[1] += name in replaced
+    return dict(sorted(libs.items(), key=lambda kv: -kv[1][0]))
 
 
 def npdm_services(data):
@@ -83,10 +85,16 @@ def npdm_services(data):
 
 
 def implemented_nvn():
-    names = set()
+    """(implemented, deliberate no-ops): NVN / NVN_NOPROTO / NVN_EXTRA (nvn_impl.h) and HLE_FORCE take a name over;
+    hle_nvn.c's g_nops list answers names with an empty function."""
+    names, nops = set(), set()
     for f in (HERE / 'third_party/d2r_gfx/gfx/nvn').glob('*.[cm]'):
-        names.update(re.findall(r'\bNVN(?:_NOPROTO|_EXTRA)?\((nvn\w+)', f.read_text(errors='replace')))   # nvn_impl.h
-    return names
+        text = f.read_text(errors='replace')
+        names.update(re.findall(r'\bNVN(?:_NOPROTO|_EXTRA)?\((nvn\w+)', text))
+        names.update(re.findall(r'\bHLE_FORCE\("(nvn\w+)"', text))
+        for block in re.findall(r'\bg_nops\[\]\s*=\s*\{(.*?)\};', text, re.S):
+            nops.update(re.findall(r'"(nvn\w+)"', block))
+    return names, nops
 
 
 def host_text():
@@ -112,8 +120,9 @@ def survey(exefs):
     named = set()
     for img in images.values():
         named.update(strings(img, rb'(?<=\0)(nvn[A-Z][A-Za-z0-9]+)(?=\0)'))   # names packed one NUL apart
-    have = implemented_nvn()
-    report['nvn'] = {'named': len(named), 'implemented': sorted(named & have), 'missing': sorted(named - have)}
+    have, nops = implemented_nvn()
+    report['nvn'] = {'named': len(named), 'implemented': sorted(named & have), 'nop': sorted((named & nops) - have),
+                     'missing': sorted(named - have - nops)}
     if (exefs / 'main.npdm').is_file():
         name, program_id, services = npdm_services((exefs / 'main.npdm').read_bytes())
         text = host_text()
@@ -121,8 +130,8 @@ def survey(exefs):
             'title_name': name, 'program_id': f'{program_id:016X}',
             'list': [{'name': s, 'server': srv, 'host_mentions': f'"{s}' in text} for s, srv in services],
         }
-    libs = sdk_imports(images['main'])
-    report['sdk_imports'] = dict(libs.most_common()) if libs is not None else None
+    replaced = set(re.findall(r'"(_ZN\w+)"', host_text()))
+    report['sdk_imports'] = sdk_imports(images['main'], replaced)
     return report
 
 
@@ -134,23 +143,24 @@ def print_report(r):
     for label, mods in sorted(r['middleware'].items()) or [('none found', [])]:
         print(f"- {label}" + (f": {', '.join(mods)}" if mods else ''))
     n = r['nvn']
-    print(f"\n## NVN: {n['named']} names, {len(n['implemented'])} implemented here, {len(n['missing'])} not")
+    print(f"\n## NVN: {n['named']} names, {len(n['implemented'])} implemented here, {len(n['nop'])} deliberate no-ops, "
+          f"{len(n['missing'])} not")
     for name in n['missing']:
         print(f'- {name}')
     s = r['services']
     if s:
         missing = [e['name'] for e in s['list'] if not e['host_mentions']]
         print(f"\n## Services: {len(s['list'])} in main.npdm ({s['title_name']}, program {s['program_id']}); "
-              f"{len(missing)} never mentioned by the host")
+              f"{len(missing)} not named in runtime/ (the host may still answer them by replacing SDK functions)")
         for e in s['list']:
             print(f"- {e['name']}{' (server)' if e['server'] else ''}{'' if e['host_mentions'] else '  <- not in runtime/'}")
     else:
         print('\n## Services: no main.npdm in the folder')
-    print('\n## nn:: libraries main imports')
+    print('\n## nn:: functions main imports (distinct), and how many the host replaces by name')
     if r['sdk_imports'] is None:
         print('- (main has no dynamic section)')
-    for lib, count in (r['sdk_imports'] or {}).items():
-        print(f'- nn::{lib}: {count}')
+    for lib, (count, replaced) in (r['sdk_imports'] or {}).items():
+        print(f'- nn::{lib}: {count} imported, {replaced} replaced')
 
 
 def main():

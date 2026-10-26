@@ -2,9 +2,9 @@
 """Bind the native loader to the verified Bayonetta 3 rewrite and RomFS: generated headers stay in the work folder.
 
 Writes <work>/build/runtime_tables.h (modules, symbols, relocations, gates), romfs_config.h and
-extracted/v120/romfs/runtime-index.bin (the RomFS index the runtime reads), and shared_fonts_config.h.
+extracted/v400/romfs/runtime-index.bin (the RomFS index the runtime reads), and shared_fonts_config.h.
 Adapted from games/totk/scripts/prepare_runtime.py, prepare_romfs_backend.py and prepare_shared_fonts.py; every input
-is checked against assets/expected-v1.2.0.json first.
+is checked against assets/expected-v4.0.0.json first.
 """
 import argparse
 import hashlib
@@ -17,8 +17,8 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / 'third_party/d2r'))   # Bayonetta 3's own copy of the rewriter
 from relr import decode_relr
 
-VERSION = 'v120'
-EXPECTED = json.loads((HERE / 'assets/expected-v1.2.0.json').read_text())
+VERSION = 'v400'
+EXPECTED = json.loads((HERE / 'assets/expected-v4.0.0.json').read_text())
 
 
 def sha(path):

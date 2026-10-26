@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turn the player's 1.2.0 exefs patches (IPSwitch .pchtxt, e.g. from mods/1.2.0/<name>/exefs/) into checked patch tables.
+"""Turn the player's 4.0.0 exefs patches (IPSwitch .pchtxt, e.g. from mods/4.0.0/<name>/exefs/) into checked patch tables.
 
 Each patch must name main's build ID and touch only bytes the Apple-silicon rewrite left as they were (a rewritten word
 would be a branch into a rewrite block). Offsets are main image offsets (the files' `@flag offset_shift 0x100` is for the
@@ -17,7 +17,7 @@ HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE / 'third_party/d2r'))   # Bayonetta 3's own copy of the rewriter
 import nsoimg
 
-EXPECTED = json.loads((HERE / 'assets/expected-v1.2.0.json').read_text())
+EXPECTED = json.loads((HERE / 'assets/expected-v4.0.0.json').read_text())
 
 
 def slug(name):
@@ -28,7 +28,7 @@ def parse(path, build_id):
     text = path.read_text(errors='replace').splitlines()
     ids = [l.split('-', 1)[1].strip().upper() for l in text if l.startswith('@nsobid-')]
     if ids != [build_id]:
-        raise ValueError(f'{path}: build ID {ids} is not main 1.2.0 ({build_id})')
+        raise ValueError(f'{path}: build ID {ids} is not main 4.0.0 ({build_id})')
     patches, enabled = [], False
     for n, line in enumerate(text, 1):
         line = line.split('//', 1)[0].strip()
@@ -45,12 +45,12 @@ def parse(path, build_id):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mods', type=Path, nargs='?', default=HERE / 'mods/1.2.0', help='folder of <name>/exefs/*.pchtxt')
+    parser.add_argument('mods', type=Path, nargs='?', default=HERE / 'mods/4.0.0', help='folder of <name>/exefs/*.pchtxt')
     parser.add_argument('--work', type=Path, default=HERE / 'SCARLET_build')
     args = parser.parse_args()
     work = args.work.resolve()
-    original = nsoimg.load(work / 'extracted/v120/exefs/main')
-    rewritten = (work / 'rewritten/v120/main.patched.bin').read_bytes()
+    original = nsoimg.load(work / 'extracted/v400/exefs/main')
+    rewritten = (work / 'rewritten/v400/main.patched.bin').read_bytes()
     out = work / 'patches'; out.mkdir(exist_ok=True)
     index = []
     for f in sorted(args.mods.glob('*/exefs/*.pchtxt')):

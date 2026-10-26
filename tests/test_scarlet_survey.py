@@ -47,7 +47,8 @@ class Survey(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.exefs = Path(self.tmp.name)
         rodata = (b'\0SDK MW+Nintendo+NintendoSdk_nnSdk-99_1_0-Release\0'
-                  b'\0nvnDeviceInitialize\0nvnMadeUpEntryPoint\0AkSoundEngine::Init\0')
+                  b'\0nvnDeviceInitialize\0nvnMadeUpEntryPoint\0nvnBootstrapLoader\0nvnWindowFinalize\0'
+                  b'AkSoundEngine::Init\0')
         (self.exefs / 'main').write_bytes(nso_bytes(rodata))
         (self.exefs / 'sdk').write_bytes(nso_bytes(b'\0nothing here\0'))
         (self.exefs / 'main.npdm').write_bytes(npdm_bytes([('audren:u', False), ('zz:fake', False), ('srv:x', True)]))
@@ -61,7 +62,9 @@ class Survey(unittest.TestCase):
         self.assertEqual(r['modules']['main']['build_id'], BUILD_ID.hex().upper())
         self.assertEqual(r['modules']['main']['sdk'], ['SDK MW+Nintendo+NintendoSdk_nnSdk-99_1_0-Release'])
         self.assertEqual(r['middleware'], {'Wwise': ['main']})
-        self.assertEqual(r['nvn'], {'named': 2, 'implemented': ['nvnDeviceInitialize'], 'missing': ['nvnMadeUpEntryPoint']})
+        # nvnBootstrapLoader is taken over by HLE_FORCE, nvnWindowFinalize is in hle_nvn.c's no-op list
+        self.assertEqual(r['nvn'], {'named': 4, 'implemented': ['nvnBootstrapLoader', 'nvnDeviceInitialize'],
+                                    'nop': ['nvnWindowFinalize'], 'missing': ['nvnMadeUpEntryPoint']})
         self.assertEqual(r['services']['program_id'], '0100A3D008C5C000')
         self.assertEqual(r['services']['title_name'], 'Survey')
         self.assertEqual([(e['name'], e['server'], e['host_mentions']) for e in r['services']['list']],
