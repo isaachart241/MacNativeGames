@@ -569,3 +569,23 @@ dependencies; the device cache went from 202 variants of 172 shaders to 400 of 3
 (`TOTK_XLATE_TCP` unset), title, Continue, the house and a walk round the ground floor drew with no shader missing
 (only pipelines being built at first use: 112 draws over two frames). Not made ahead: transform feedback variants
 (their layout is known only when the game draws) and anything neither port has met yet.
+
+### 2026-10-26: Thor port: Opus through Android's own decoder
+
+Scarlet decodes its music and voices with the hardware Opus decoder (65 decoders made at start, at 8 to 48 kHz), which
+on Android was a silent stand-in waiting for libopus. Android has an Opus decoder of its own, reachable through the NDK's
+`AMediaCodec` (`c2.android.opus.decoder`, the platform's libopus in the media codec process), so
+`android/compat/opus_mediacodec.c` puts it behind the libopus calls `runtime/opus_codec.c` makes: one codec per game
+decoder, an `OpusHead` with no pre-skip so every sample comes back, each packet queued and its output waited for, reset
+by a flush. The platform decoder always outputs 48 kHz; for a lower rate every (48000 / rate)-th sample is kept, as
+libopus's own CELT decoder lowers its rate (averaging them first cost 30 dB of agreement). The final-range integrity
+check is skipped (the codec does not report it). A probe on the Thor (the platform's Opus encoder, a 440 Hz tone) decoded
+the tone at its own level through 70 decoders at once and after a flush.
+
+**Checked against libopus.** With `SCARLET_OPUS_DUMP=logs/opus.dump` the app records its first 4000 decoded packets;
+`android/tools/opus_compare.py` decodes the same packets with the Mac's libopus from each decoder's creation and through
+its resets. Title to house: 4000 packets from 47 decoders, signal-to-difference 58.6 dB overall, 55 to 61 dB on each of
+the long streams (the usual gap between two libopus builds), about 31 dB on the 4 to 6 packets that start 24 kHz streams
+(different resampling paths), the same sample count for every packet. In the game: 1.6 ms per packet on average (worst
+22 ms over 5000), the game's mix in the house at rms 0.018 instead of 0.011 without Opus, frame time p50 33.2 ms.
+Not checked: listening (the tests ran muted at night).

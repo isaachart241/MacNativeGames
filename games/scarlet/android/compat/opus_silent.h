@@ -1,7 +1,7 @@
-/* Thor port: stand-in for the libopus calls runtime/opus_codec.c makes, used while the Android build has no libopus.
-   It decodes nothing: each packet's length in samples comes from its TOC byte (RFC 6716 section 3.1: frame duration from
+/* Stand-in for the libopus calls runtime/opus_codec.c makes, for builds with -DSCARLET_OPUS_SILENT (the Android
+   build decodes with the platform's decoder instead: opus_mediacodec.c). It decodes nothing: each packet's length in samples comes from its TOC byte (RFC 6716 section 3.1: frame duration from
    the configuration, frame count from the code), and the output is silence, so the game's audio timing stays right.
-   The final-range integrity check needs a real decoder and is skipped (OPUS_SILENT in opus_codec.c). */
+   The final-range integrity check needs a real decoder and is skipped (OPUS_NO_RANGE in opus_codec.c). */
 #pragma once
 #include <stdint.h>
 #include <stdlib.h>
@@ -18,7 +18,7 @@ static inline OpusDecoder *opus_decoder_create(opus_int32 rate, int channels, in
 static inline void opus_decoder_destroy(OpusDecoder *d) { free(d); }
 static inline int opus_decoder_ctl(OpusDecoder *d, int request, ...) {
     if (request == OPUS_RESET_STATE) { d->last = d->rate / 50; return OPUS_OK; }
-    if (request == OPUS_GET_FINAL_RANGE_REQUEST) {   /* no decoder state: report 0 (not checked when OPUS_SILENT) */
+    if (request == OPUS_GET_FINAL_RANGE_REQUEST) {   /* no decoder state: report 0 (not checked: OPUS_NO_RANGE) */
         __builtin_va_list ap; __builtin_va_start(ap, request); opus_uint32 *p = __builtin_va_arg(ap, opus_uint32 *); __builtin_va_end(ap);
         if (p) *p = 0; return OPUS_OK;
     }

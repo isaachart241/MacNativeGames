@@ -45,7 +45,7 @@ else
 PIC :=
 endif
 SRC := $(wildcard runtime/*.c runtime/*.S) $(GFX_SRC) \
-  android/compat/darwin_compat.c android/compat/elf_sections.c android/compat/sha256.c
+  android/compat/darwin_compat.c android/compat/elf_sections.c android/compat/sha256.c android/compat/opus_mediacodec.c
 OBJECTS := $(patsubst %,$(OUT)/obj/%.o,$(SRC))
 HEADERS := $(wildcard runtime/*.h third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h android/compat/*.h android/compat/*/*.h)
 GEN := $(WORK)/build-android
@@ -70,11 +70,11 @@ $(OUT)/obj/%.S.o: %.S $(HEADERS) android/Makefile
 	"$(CC)" $(PIC) -Iruntime -Ithird_party/d2r_gfx/gfx/nvn -I$(GEN) -c "$<" -o "$@"
 
 $(OUT)/scarlet-native: $(OBJECTS)
-	"$(CC)" $(OBJECTS) $(GFX_LIBS) -laaudio -lm -ldl -llog -o "$@"
+	"$(CC)" $(OBJECTS) $(GFX_LIBS) -laaudio -lmediandk -lm -ldl -llog -o "$@"
 
 # The app's library: -Bsymbolic binds the runtime's own symbols inside it (the assembly reaches them PC-relative).
 $(OUT)/libscarlet.so: $(OBJECTS)
-	"$(CC)" -shared -Wl,-soname,libscarlet.so -Wl,-Bsymbolic -Wl,--no-undefined $(OBJECTS) $(GFX_LIBS) -landroid -laaudio -lm -ldl -llog -o "$@"
+	"$(CC)" -shared -Wl,-soname,libscarlet.so -Wl,-Bsymbolic -Wl,--no-undefined $(OBJECTS) $(GFX_LIBS) -landroid -laaudio -lmediandk -lm -ldl -llog -o "$@"
 
 APK_KEY ?= $(WORK)/apk-key
 apk: $(OUT)/libscarlet.so android/app/AndroidManifest.xml android/tools/build_apk.py
