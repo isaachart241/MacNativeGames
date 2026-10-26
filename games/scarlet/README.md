@@ -6,7 +6,23 @@ own copies of everything (`runtime/`, `third_party/d2r`, `third_party/d2r_gfx`, 
 never affect another game. Bayonetta 3 was chosen as the base because it already runs a third-party engine: CMIF
 domains, offline network services, Wwise's AudioOut and indirect draws are all there.
 
-**Not playable yet.** Stages 0–2 are done (2026-10-25): the game reaches `nnMain`, opens its window and starts audio; stage 3 is in progress. How the work goes: [CHANGELOG.md](CHANGELOG.md).
+**Early but playable (2026-10-26).** With GPU submission on, the game runs at about 30 fps from the title screen
+through language, look and name, the opening, and into the player's house: walking, dialogue, autosaves and loading the
+save all work, with sound. Not checked yet: anything past the house, long sessions, the app bundle. How the work goes:
+[CHANGELOG.md](CHANGELOG.md).
+
+## Playing it now
+
+After the build steps below (stages 0–2) and `make runtime shader-tools`:
+
+```sh
+games/scarlet/scripts/play.sh
+```
+
+Keyboard (a DualSense, Xbox or Switch Pro controller also works): left stick W A S D, right stick the arrow keys,
+A = J, B = K or Space, X = I, Y = U, L = Q, R = E, ZL = Option, ZR = Shift, + = Return, − = Tab or Esc,
+D-pad F T H G (left, up, right, down), stick clicks Z and C. When the game asks for text (the name), type it in the bar
+at the bottom of the window and press Return. Saves are in `SCARLET_build/user-data/save/`.
 
 You must own the game: use your own dump and the `prod.keys` from your own Switch. Nothing from the game is in this
 repository; `SCARLET_build/` (the work folder) and `mods/` are ignored by git.
