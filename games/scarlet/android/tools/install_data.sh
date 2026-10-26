@@ -25,5 +25,6 @@ adb push --sync "$WORK/rewritten/v400-android" $STAGE/rewritten/
 adb push --sync "$WORK/user-data/account.uid" "$WORK/user-data/save" $STAGE/user-data/
 adb push "$(dirname "$0")/install_data_app.sh" $STAGE/install_data_app.sh > /dev/null
 adb shell chmod -R a+rX $STAGE/extracted $STAGE/rewritten/v400-android $STAGE/user-data/account.uid $STAGE/user-data/save $STAGE/install_data_app.sh
+adb shell chmod a+rx $STAGE $STAGE/rewritten $STAGE/user-data   # the folders on the way (only these: not the shell's other files there)
 adb shell run-as $PKG sh $STAGE/install_data_app.sh $STAGE $APP $SAVE
 echo "done: start Scarlet on the Thor"
