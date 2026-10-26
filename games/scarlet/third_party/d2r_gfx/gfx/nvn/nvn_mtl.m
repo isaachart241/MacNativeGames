@@ -4645,7 +4645,7 @@ static void shmap_load(void) {
     warm_start();
 }
 
-@interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, writes_depth, lay_ok; uint8_t drv_scanned[3];   /* drv_scanned (TOTK): driver segment c0 / c2 reads found by drv_scan in the MSL but missing from the reflection json */ /* lay_ok (TOTK): vertex MSL can write the layer (1) or not (-1), 0 = not checked yet; writes_depth (TOTK): the fragment function has a [[depth(...)]] output, so its pipeline needs a depth attachment */ const char *builtin; uint64_t logged; char key[80]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
+@interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, writes_depth, lay_ok, writes_layer;   /* writes_layer (Scarlet): the MSL writes [[render_target_array_index]] itself */ uint8_t drv_scanned[3];   /* drv_scanned (TOTK): driver segment c0 / c2 reads found by drv_scan in the MSL but missing from the reflection json */ /* lay_ok (TOTK): vertex MSL can write the layer (1) or not (-1), 0 = not checked yet; writes_depth (TOTK): the fragment function has a [[depth(...)]] output, so its pipeline needs a depth attachment */ const char *builtin; uint64_t logged; char key[80]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     uint16_t texture_slots[NVN_REFL_MAXB]; uint8_t texture_count, texture_plan_ready;
     // 上次编好的参数缓冲
     // The argument buffer encoded last time
@@ -5028,7 +5028,8 @@ static NvShader *shader_load(NSString *pc, int stage) {
     o->fn = shader_fn(lib, j[@"entry"]); o->stage = stage; strlcpy(o->key, pc.UTF8String, sizeof o->key);
     NSString *full = rt ? [NSString stringWithContentsOfFile:rt_src encoding:NSUTF8StringEncoding error:nil] : nil;
     o->writes_depth = full && [full rangeOfString:@"[[depth("].location != NSNotFound;
-    if (full) { o->src_path = rt_src; drv_scan(o, full); refl_mark_stores(o, j[@"bindings"], full); }   // TOTK: scan before iOS drops the source (NPC-culling fix needs it there too); rw from the MSL's stores
+    if (full) { o->src_path = rt_src; drv_scan(o, full); refl_mark_stores(o, j[@"bindings"], full); }
+    o->writes_layer = full && [full rangeOfString:@"[[render_target_array_index]]"].location != NSNotFound;   // Scarlet: pso_desc sets the topology class   // TOTK: scan before iOS drops the source (NPC-culling fix needs it there too); rw from the MSL's stores
     /* TOTK (2026-10-17): the MSL is read again from its file when a variant needs it (sh_src), on the Mac too -- keeping
        every source cost 255 MB of strings (7,691 of them) in a long session (analysis/long18 heap). TOTK_KEEP_MSL=1 keeps
        them in memory (the Mac's behaviour before). */
@@ -5969,13 +5970,16 @@ static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered, int bo
     if (layered && !vs_layerable(vs)) MDIE("vertex shader %s cannot write the render target array index", vs->key);
     float bc[8][4]; int ba[8], bn = 0;   // TOTK: vertex-stage samplers with a border colour Metal lacks (PSO_VBORDER)
     NSString *bkey = border && sh_has_src(vs) ? border_key(vs, 0, bc, ba, &bn) : nil;
-    if (!sh_has_src(vs) || (!layered && !bkey && (!fs || !sh_has_src(fs)))) return vs->fn;
+    // Scarlet: a vertex shader that writes the layer itself also writes a point size, which Metal rejects with the triangle
+    // topology class the layer needs (pso_desc): such shaders get a variant with the point size kept as a local.
+    int nopsz = vs->writes_layer && !layered;
+    if (!sh_has_src(vs) || (!layered && !bkey && !nopsz && (!fs || !sh_has_src(fs)))) return vs->fn;
     os_unfair_lock_lock(&lk);
     NSDictionary *in = fs && sh_has_src(fs) ? msl_varyings(fs) : nil, *out = in ? msl_varyings(vs) : nil;
     NSMutableArray *miss = [NSMutableArray array];
     for (NSNumber *l in [in.allKeys sortedArrayUsingSelector:@selector(compare:)]) if (!out[l]) [miss addObject:l];
-    if (!miss.count && !layered && !bkey) { os_unfair_lock_unlock(&lk); return vs->fn; }
-    NSString *key = [NSString stringWithFormat:@"%@%@%@", layered ? @"layer;" : @"", bkey ? [NSString stringWithFormat:@"border:%@", bkey] : @"", [miss componentsJoinedByString:@","]];
+    if (!miss.count && !layered && !bkey && !nopsz) { os_unfair_lock_unlock(&lk); return vs->fn; }
+    NSString *key = [NSString stringWithFormat:@"%@%@%@%@", layered ? @"layer;" : @"", nopsz ? @"nopsz;" : @"", bkey ? [NSString stringWithFormat:@"border:%@", bkey] : @"", [miss componentsJoinedByString:@","]];
     id<MTLFunction> f = vs->vpatch[key];
     if (!f) {
         NSMutableString *add = [NSMutableString string];
@@ -5987,7 +5991,7 @@ static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered, int bo
         NSRange r = [vsrc0 rangeOfString:head];
         if (r.location == NSNotFound) MDIE("vertex shader %s: no main0_out to extend", vs->key);
         NSString *src = [vsrc0 stringByReplacingCharactersInRange:r withString:[head stringByAppendingString:add]];
-        if (layered) {
+        if (layered || nopsz) {
             NSRegularExpression *psz = [NSRegularExpression regularExpressionWithPattern:@"\\n\\s*float\\s+(\\w+)\\s*\\[\\[point_size\\]\\];" options:0 error:nil];
             NSTextCheckingResult *m = [psz firstMatchInString:src options:0 range:NSMakeRange(0, src.length)];
             if (m) {
@@ -5996,6 +6000,8 @@ static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered, int bo
                 src = [src stringByReplacingOccurrencesOfString:[@"out." stringByAppendingString:field] withString:local];
                 src = [src stringByReplacingOccurrencesOfString:@"main0_out out = {};" withString:[NSString stringWithFormat:@"main0_out out = {}; float %@ = 0.0;", local]];
             }
+        }
+        if (layered) {
             NSString *entry = @"vertex main0_out main0(";
             src = [src stringByReplacingCharactersInRange:[src rangeOfString:entry] withString:[entry stringByAppendingFormat:@"constant uint& totk_layer_in [[buffer(%d)]], ", LAY_BUF_INDEX]];
             src = [src stringByReplacingOccurrencesOfString:@"return out;" withString:@"{ out.totk_layer = totk_layer_in; return out; }"];
@@ -6201,6 +6207,9 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
     d.rasterSampleCount = k->samples ? k->samples : 1;
     d.alphaToCoverageEnabled = (k->a2c & 1) != 0;
     if (k->a2c & PSO_LAYERED) d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;   // TOTK: required with a layer output; layered passes take triangle draws only (lay_draw_ok)
+    // Scarlet: vertex shaders that write the layer themselves (gl_Layer from the vertex stage) need the topology class too;
+    // Metal refused 12 such pipelines without it. Triangles, as for TOTK's layered passes.
+    else if (vs && vs->writes_layer) d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
     for (int i = 0; i < 8; i++) {
         if (!k->cfmt[i]) continue;
         MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[i];

@@ -196,7 +196,23 @@ Seen in that run, not fatal yet:
 - A texture-to-texture copy that scales (1920x1080 to 480x270) is not implemented.
 - One draw sets different scissors per viewport; one pre-swizzled texture is not in a memory pool (CPU fallback).
 
-Next: GPU submission (`TOTK_GPU_ALLOW_SUBMIT=1`) for a first picture, then those four.
+### 2026-10-25: the first picture
+
+One 75-second run with `TOTK_GPU_ALLOW_SUBMIT=1` (GPU memory budget at its default, 3,276 MB on this 8 GB Mac):
+no crash, about 30 fps (screenshots at frames 269, 567, 1018), and the game's first-launch screen, "Which language
+will you play in?", drawn correctly at 1920x1080: the game's own title font, the highlighted entry and its cursor,
+and the Japanese, Korean and Chinese names in the system shared fonts the font fix made loadable. The game waits
+there for a button. Screenshots stay in `SCARLET_build/shots` (ignored by git: they are pictures of the game).
+
+**Layered vertex shaders (fixed).** The 12 refused pipelines: Scarlet's vertex shaders write the layer themselves
+(`gl_Layer [[render_target_array_index]]`), which needs the pipeline's input primitive topology class, and they also
+write a point size, which Metal only allows with the point class. `shader_load` now records `writes_layer` from the
+MSL (the source is not kept in memory unless `TOTK_KEEP_MSL=1`), `pso_desc` sets the triangle class for such shaders,
+and `vs_fn_for` gives them a variant with the point size kept as a local (`nopsz`), the same treatment TOTK's
+layered passes get. Checked with submission off: 0 refused pipelines.
+
+Still seen: a scaling texture-to-texture copy (1920x1080 to 480x270, not implemented), per-viewport scissors, one
+pre-swizzled texture outside a memory pool (CPU fallback).
 
 Tools for the next step: `TOTK_FS_LOG=1` (every RomFS open), `TOTK_INPUT_FILE` with `hletrace 2` (first call of each
 host function, in order), and lldb `--batch` with the inspection commands as `-k` (they run when the process stops on
