@@ -201,14 +201,17 @@ static void cam_seen(uint64_t addr, uint64_t size) {
     g_cam[g_ncam].addr = addr; g_cam[g_ncam].n = 1; memcpy(g_cam[g_ncam].m, (const void *)(uintptr_t)(addr + 0x100), 64); g_ncam++;
 }
 void bottom_map_set_player(double x, double y, double dir) __attribute__((weak));
+static void vk_map_capture(void); static double g_cam_x, g_cam_z;
 void vk_camera_frame_end(void) {   /* nvn_vk_dev.c, at each present */
+    vk_map_capture();
     int best = -1; for (int i = 0; i < g_ncam; i++) if (best < 0 || g_cam[i].n > g_cam[best].n) best = i;
     if (best >= 0 && g_cam[best].n >= 50 && bottom_map_set_player) {
         const float *m = g_cam[best].m;   /* rows: right, up, back, position */
         float fx = -m[8], fz = -m[10], h = sqrtf(fx * fx + fz * fz);
         if (h > 0.01f && isfinite(m[12]) && isfinite(m[14])) {
             fx /= h; fz /= h;
-            bottom_map_set_player(m[12] + 4 * fx, m[14] + 4 * fz, atan2f(fx, -fz));   /* map: x east, y = world z; 0 = up */
+            g_cam_x = m[12] + 4 * fx; g_cam_z = m[14] + 4 * fz;
+            bottom_map_set_player(g_cam_x, g_cam_z, atan2f(fx, -fz));   /* map: x east, y = world z; 0 = up */
             uint64_t n = mtl_present_count(); if (n % 150 == 0) VKLOG("camera: player about %.2f %.2f %.2f (camera %.2f %.2f %.2f, %d draws)", m[12] + 4 * fx, m[13], m[14] + 4 * fz, m[12], m[13], m[14], g_cam[best].n);
         }
     }
@@ -229,56 +232,117 @@ void vk_ubo_log_flush(void) {
     g_nul = 0; g_ul_at = 0;
 }
 static void pass_start(void);
-/* Texture dump (diagnostics, with the render-target dump): every texture of 256x256 or more sampled in the dump frame and
+/* Texture dump (diagnostics, with the render-target dump): every texture of 16x16 or more sampled in the dump frame and
    first drawn in the frame's last three passes (the interface) is written as <folder>/tex_<serial>_<w>x<h>_nvn<format>.png
    (level 0, layer 0; BC decoded on the CPU; formats other than
    BC1-5/7 and 8-bit RGBA / BGRA are skipped). Thor port: the game's map art for the bottom screen. A file named
    rt-dump-now in the data folder arms both for the next frame (vk_rtd_poll, at the presents). */
 static struct { uint64_t serial; int pass; } g_rtt[2048]; static int g_nrtt;
 static void rtd_tex(const vk_tex *x) {
-    if (!x || !x->img || x->decoded || x->w < 256 || x->h < 256) return;
+    if (!x || !x->img || x->decoded || x->w < 16 || x->h < 16) return;
     for (int i = 0; i < g_nrtt; i++) if (g_rtt[i].serial == x->serial) return;
     if (g_nrtt < 2048) { g_rtt[g_nrtt].serial = x->serial; g_rtt[g_nrtt++].pass = g_rtd_pass + 1; }
 }
 vk_tex *vk_tex_by_serial(uint64_t serial);
 int nvn_fmt_bpb(int format, int *bw, int *bh);
+/* A texture's level 0, layer 0 as 8-bit RGBA (BC decoded on the CPU; BC1-5/7 and 8-bit RGBA / BGRA only). Waits for the
+   GPU. NULL when the format is not handled. */
+static uint8_t *tex_read_rgba(const vk_tex *x) {
+    int bw, bh, bpb = nvn_fmt_bpb((int)x->t.d.format, &bw, &bh); uint32_t pf; int obpp;
+    int bc = nvn_bc_unpacked((uint32_t)x->t.d.format, &pf, &obpp);
+    int rgba = x->fmt == VK_FORMAT_R8G8B8A8_UNORM || x->fmt == VK_FORMAT_R8G8B8A8_SRGB, bgra = x->fmt == VK_FORMAT_B8G8R8A8_UNORM || x->fmt == VK_FORMAT_B8G8R8A8_SRGB;
+    if (!x->img || !bpb || (!bc && !rgba && !bgra) || (bc && obpp != 1 && obpp != 2 && obpp != 4)) return NULL;
+    size_t pitch = (size_t)((x->w + bw - 1) / bw) * bpb, bytes = pitch * ((x->h + bh - 1) / bh);
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
+    VmaAllocationCreateInfo bai = {0}; bai.usage = VMA_MEMORY_USAGE_AUTO; bai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VkBuffer buf; VmaAllocation bal; VmaAllocationInfo inf;
+    if (vmaCreateBuffer(V.vma, &bi, &bai, &buf, &bal, &inf) != VK_SUCCESS) return NULL;
+    VkCommandBuffer cb = vk_oneoff_begin();
+    VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {x->w, x->h, 1}};
+    vkCmdCopyImageToBuffer(cb, x->img, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &c);
+    vk_oneoff_end(cb);
+    uint8_t *px = malloc((size_t)x->w * x->h * 4), *dec = bc ? malloc((size_t)x->w * x->h * (size_t)obpp) : NULL;
+    const uint8_t *src = inf.pMappedData;
+    if (px && (!bc || (dec && !nvn_bc_decode((uint32_t)x->t.d.format, src, pitch, x->w, x->h, dec, (size_t)x->w * (size_t)obpp)))) {
+        for (size_t i = 0; i < (size_t)x->w * x->h; i++) {
+            uint8_t *o = px + 4 * i;
+            if (!bc) { const uint8_t *q = src + 4 * i; o[0] = q[bgra ? 2 : 0]; o[1] = q[1]; o[2] = q[bgra ? 0 : 2]; o[3] = q[3]; }
+            else if (obpp == 4) memcpy(o, dec + 4 * i, 4);
+            else if (obpp == 2) { o[0] = dec[2 * i]; o[1] = dec[2 * i + 1]; o[2] = 0; o[3] = 255; }
+            else { o[0] = o[1] = o[2] = dec[i]; o[3] = 255; }
+        }
+    } else { free(px); px = NULL; }
+    free(dec); vmaDestroyBuffer(V.vma, buf, bal);
+    return px;
+}
 static void rtd_tex_flush(void) {
     int last = 0; for (int k = 0; k < g_nrtt; k++) if (g_rtt[k].pass > last) last = g_rtt[k].pass;
     int dumped = 0;
     for (int k = 0; k < g_nrtt; k++) {
         if (g_rtt[k].pass < last - 2) continue;   /* only what the frame's last passes (the interface) first drew */
         vk_tex *x = vk_tex_by_serial(g_rtt[k].serial); if (!x || !x->img) continue;
-        dumped++;
-        int bw, bh, bpb = nvn_fmt_bpb((int)x->t.d.format, &bw, &bh); uint32_t pf; int obpp;
-        int bc = nvn_bc_unpacked((uint32_t)x->t.d.format, &pf, &obpp);
-        int rgba = x->fmt == VK_FORMAT_R8G8B8A8_UNORM || x->fmt == VK_FORMAT_R8G8B8A8_SRGB, bgra = x->fmt == VK_FORMAT_B8G8R8A8_UNORM || x->fmt == VK_FORMAT_B8G8R8A8_SRGB;
-        if (!bpb || (!bc && !rgba && !bgra) || (bc && obpp != 1 && obpp != 2 && obpp != 4)) { VKLOG("texture dump: %ux%u nvn %#x vk %d skipped (format)", x->w, x->h, x->t.d.format, x->fmt); continue; }
-        size_t pitch = (size_t)((x->w + bw - 1) / bw) * bpb, bytes = pitch * ((x->h + bh - 1) / bh);
-        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
-        VmaAllocationCreateInfo bai = {0}; bai.usage = VMA_MEMORY_USAGE_AUTO; bai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-        VkBuffer buf; VmaAllocation bal; VmaAllocationInfo inf;
-        if (vmaCreateBuffer(V.vma, &bi, &bai, &buf, &bal, &inf) != VK_SUCCESS) continue;
-        VkCommandBuffer cb = vk_oneoff_begin();
-        VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {x->w, x->h, 1}};
-        vkCmdCopyImageToBuffer(cb, x->img, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &c);
-        vk_oneoff_end(cb);
-        uint8_t *px = malloc((size_t)x->w * x->h * 4), *dec = bc ? malloc((size_t)x->w * x->h * (size_t)obpp) : NULL;
-        const uint8_t *src = inf.pMappedData;
-        if (px && (!bc || (dec && !nvn_bc_decode((uint32_t)x->t.d.format, src, pitch, x->w, x->h, dec, (size_t)x->w * (size_t)obpp)))) {
-            for (size_t i = 0; i < (size_t)x->w * x->h; i++) {
-                uint8_t *o = px + 4 * i;
-                if (!bc) { const uint8_t *q = src + 4 * i; o[0] = q[bgra ? 2 : 0]; o[1] = q[1]; o[2] = q[bgra ? 0 : 2]; o[3] = q[3]; }
-                else if (obpp == 4) memcpy(o, dec + 4 * i, 4);
-                else if (obpp == 2) { o[0] = dec[2 * i]; o[1] = dec[2 * i + 1]; o[2] = 0; o[3] = 255; }
-                else { o[0] = o[1] = o[2] = dec[i]; o[3] = 255; }
-            }
-            char p[1024]; snprintf(p, sizeof p, "%s/tex_%06llu_%ux%u_nvn%02x.png", g_rtd_dir, (unsigned long long)x->serial, x->w, x->h, x->t.d.format);
-            nvn_vk_write_png(p, px, x->w, x->h);
-        }
-        free(px); free(dec); vmaDestroyBuffer(V.vma, buf, bal);
+        uint8_t *px = tex_read_rgba(x);
+        if (!px) { VKLOG("texture dump: %ux%u nvn %#x vk %d skipped (format)", x->w, x->h, x->t.d.format, x->fmt); continue; }
+        char p[1024]; snprintf(p, sizeof p, "%s/tex_%06llu_%ux%u_nvn%02x.png", g_rtd_dir, (unsigned long long)x->serial, x->w, x->h, x->t.d.format);
+        nvn_vk_write_png(p, px, x->w, x->h); free(px); dumped++;
     }
     if (g_nrtt) VKLOG("texture dump: %d of %d textures (first drawn in passes %d-%d) -> %s", dumped, g_nrtt, last - 2, last, g_rtd_dir);
     g_nrtt = 0;
+}
+/* Thor port: the bottom screen's map art (runtime/bottom_android.c), taken from the game's own map screen whenever it is
+   drawn: the whole-region map (900x900, NVN format 0x44) and the screen's patterned background (800x840, 0x42) are
+   saved once to map-cache/<name>.rgba ("MAP1", width, height, then RGBA). While the zoomed-out map is shown (its quad at
+   scale 0.9), each present also notes the player marker's place on that texture (the 44x44 marker quad's translation;
+   nn::ui2d matrices, screen centred with y up) with the camera-derived position, one line in map-cache/calib.txt per
+   change: the bottom map fits its world-to-map transform to these. */
+static struct { const char *name; uint32_t w, h, fmt; int saved; uint64_t serial; } g_map_assets[] = {
+    {"overview", 900, 900, 0x44, -1, 0}, {"background", 800, 840, 0x42, -1, 0},
+};
+static float g_map_ov[6]; static int g_map_ov_seen; static float g_map_marker[2]; static int g_map_marker_seen;
+static double g_cam_x, g_cam_z;   /* the latest player position from the camera (vk_camera_frame_end) */
+static void map_asset_seen(const vk_tex *x, int st, int reg) {
+    if (!x) return;
+    for (size_t i = 0; i < sizeof g_map_assets / sizeof *g_map_assets; i++)
+        if (x->w == g_map_assets[i].w && x->h == g_map_assets[i].h && x->t.d.format == g_map_assets[i].fmt) g_map_assets[i].serial = x->serial;
+    if (st != 1 || reg != 0) return;
+    const p_bind_buf *u = &S.ubo[0][0];   /* the interface quad's matrix (floats 16-23) and rectangle (132-135) */
+    if (!u->addr || u->size < 136 * 4) return;
+    const float *f = (const float *)(uintptr_t)u->addr;
+    if (x->w == 900 && x->h == 900 && x->t.d.format == 0x44 && f[132] == 900 && f[133] == 900) { memcpy(g_map_ov, (float[]){f[16], f[19], f[21], f[23], f[134], f[135]}, sizeof g_map_ov); g_map_ov_seen = 1; }
+    if (x->w == 352 && x->h == 352 && x->t.d.format == 0x42 && f[132] == 44 && f[133] == 44) { g_map_marker[0] = f[19]; g_map_marker[1] = f[23]; g_map_marker_seen = 1; }
+}
+void bottom_map_assets_changed(void) __attribute__((weak));
+static void vk_map_capture(void) {
+    static int dir;
+    if (!dir) { dir = 1; mkdir("map-cache", 0777); }
+    for (size_t i = 0; i < sizeof g_map_assets / sizeof *g_map_assets; i++) {
+        char p[256]; snprintf(p, sizeof p, "map-cache/%s.rgba", g_map_assets[i].name);
+        if (g_map_assets[i].saved < 0) g_map_assets[i].saved = access(p, F_OK) == 0;
+        if (g_map_assets[i].saved || !g_map_assets[i].serial) continue;
+        vk_tex *x = vk_tex_by_serial(g_map_assets[i].serial); uint8_t *px = x ? tex_read_rgba(x) : NULL;
+        g_map_assets[i].serial = 0;
+        if (!px) continue;
+        FILE *f = fopen(p, "wb");
+        if (f) { uint32_t hd[3] = {0x3150414d, x->w, x->h}; fwrite(hd, 4, 3, f); fwrite(px, 4, (size_t)x->w * x->h, f); fclose(f); g_map_assets[i].saved = 1;
+                 VKLOG("map art: %s %ux%u saved to %s", g_map_assets[i].name, x->w, x->h, p); if (bottom_map_assets_changed) bottom_map_assets_changed(); }
+        free(px);
+    }
+    if (g_map_ov_seen && g_map_marker_seen && fabsf(g_map_ov[0] - 0.9f) < 1e-4f && fabsf(g_map_ov[2] - 0.9f) < 1e-4f) {
+        /* marker on the texture: quad-local = (screen - translation) / scale; texture = local - rectangle corner (y down) */
+        double u = (g_map_marker[0] - g_map_ov[1]) / g_map_ov[0] - g_map_ov[4], v = g_map_ov[5] - (g_map_marker[1] - g_map_ov[3]) / g_map_ov[2];
+        /* noted once the same place has held for 15 presents: while the map zooms, the overview is already drawn at its
+           final scale but the marker is still where the closer view had it (the screen centre) */
+        static double cu, cv, cx, cz, lu, lv, lx, lz; static int held;
+        if (fabs(u - cu) > 0.01 || fabs(v - cv) > 0.01 || fabs(g_cam_x - cx) > 0.01 || fabs(g_cam_z - cz) > 0.01) { cu = u; cv = v; cx = g_cam_x; cz = g_cam_z; held = 0; }
+        if (++held == 15 && (fabs(u - lu) > 0.01 || fabs(v - lv) > 0.01 || fabs(g_cam_x - lx) > 0.01 || fabs(g_cam_z - lz) > 0.01)) {
+            lu = u; lv = v; lx = g_cam_x; lz = g_cam_z;
+            FILE *f = fopen("map-cache/calib.txt", "a");
+            if (f) { fprintf(f, "%.3f %.3f %.3f %.3f\n", g_cam_x, g_cam_z, u, v); fclose(f); }
+            VKLOG("map calibration: player %.2f %.2f on the map at %.3f %.3f", g_cam_x, g_cam_z, u, v);
+            if (bottom_map_assets_changed) bottom_map_assets_changed();
+        }
+    }
+    g_map_ov_seen = g_map_marker_seen = 0;
 }
 void vk_rtd_poll(uint64_t present) {   /* nvn_vk_dev.c, at each present: the trigger file */
     if (present % 15) return;
@@ -288,7 +352,9 @@ void vk_rtd_poll(uint64_t present) {   /* nvn_vk_dev.c, at each present: the tri
     g_rtd_at = (long)present + 2;
     VKLOG("render-target and texture dump armed for present %ld (rt-dump-now)", g_rtd_at);
 }
+static int g_mm_active;   /* the minimap's frame was seen in the open pass (minimap_draw) */
 static void pass_end(void) {
+    g_mm_active = 0;
     if (!P.open) return;
     if (!P.begun && !P.cleared) { P.open = 0; barrier_full(CB()); return; }   // nothing drawn or cleared: no pass at all
     if (!P.begun) pass_start();
@@ -724,6 +790,7 @@ static void write_stage(wset *ws, VkDescriptorSet sets[2], vk_shader *sh, int st
                     const view_t *v = NULL; int hv = 0; vk_tex *x = tid ? vk_tex_by_id(tid, &v, &hv) : NULL;
                     if (x && x->img) iv = vk_tex_view_typed(x, v, hv, want_vt(b), 0);
                     if (rtd_armed()) rtd_tex(x);
+                    if (x && x->w >= 352) map_asset_seen(x, st, reg);
                     if (rtd_armed())
                         VKLOG("rtdump pass %d stage %d slot %d (dim %d arr %d): %s %ux%ux%u layers %u levels %u nvn %#x vk %d decoded %d", g_rtd_pass + 1, st, reg, b->dim, b->arrayed,
                               !tid ? "no texture" : !x ? "texture id not found" : !iv ? "NO VIEW (dummy)" : "ok", x ? x->w : 0, x ? x->h : 0, x ? x->d : 0, x ? x->layers : 0, x ? x->levels : 0,
@@ -790,6 +857,30 @@ static int bind_descriptors(vk_prog *pr, VkPipelineBindPoint bp) {
     return 1;
 }
 
+/* Thor port: the game's minimap moves to the bottom screen (runtime/bottom_android.c), so its draws are left out of the top
+   screen (SCARLET_MINIMAP=1, or SCARLET_BOTTOM=0, keeps it). Scarlet's minimap is drawn with nn::ui2d quads in the
+   interface pass: its map tiles and frame through a 400x400 circular mask (fragment texture slot 1, NVN format 0x49);
+   the frame (a 340x340 quad) gives the circle's centre and radius, and the rings, heading cone, follower icons and the
+   player's marker drawn after it inside that circle go too. Other screens (the map, menus, battles) draw no masked quad,
+   so nothing of theirs is touched. */
+static int g_mm_hide = -1; static float g_mm_cx, g_mm_cy, g_mm_r;
+static int minimap_draw(void) {
+    if (g_mm_hide < 0) { const char *a = getenv("SCARLET_MINIMAP"), *b = getenv("SCARLET_BOTTOM"); g_mm_hide = !(a && !strcmp(a, "1")) && !(b && !strcmp(b, "0")); }
+    if (!g_mm_hide || P.cfmt[0] != VK_FORMAT_R8G8B8A8_SRGB) return 0;
+    const p_bind_buf *u = &S.ubo[0][0];
+    if (!u->addr || u->size < 136 * 4) return 0;
+    const float *f = (const float *)(uintptr_t)u->addr;
+    int mask = 0;
+    if ((S.tex[1][1] & 0xfffff)) { const view_t *v; int hv; vk_tex *x = vk_tex_by_id((int)(S.tex[1][1] & 0xfffff), &v, &hv); mask = x && x->w == 400 && x->h == 400 && x->t.d.format == 0x49; }
+    if (mask) {
+        if (f[132] == 340 && f[133] == 340) { g_mm_cx = f[19]; g_mm_cy = f[23]; g_mm_r = 170 * fabsf(f[16]); g_mm_active = 1; }
+        return 1;
+    }
+    if (!g_mm_active) return 0;
+    float dx = f[19] - g_mm_cx, dy = f[23] - g_mm_cy;
+    return dx * dx + dy * dy <= g_mm_r * g_mm_r && fabsf(f[132]) <= 2 * g_mm_r && fabsf(f[133]) <= 2 * g_mm_r;
+}
+
 // ---------- draws ----------
 static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (S.render_disabled || !S.prog) return;
@@ -799,6 +890,8 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!pr || !pr->sh[0]) { VKONCE("draw skipped: program without a vertex shader variant"); atomic_fetch_add(&g_stat_skip_shader, 1); return; }
     if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) return;
     if (!rt_has_any() && !S.has_vp && !R.has_sc) { VKONCE("draw without render targets or viewport skipped"); return; }
+    pass_open();
+    if (minimap_draw()) return;
     pass_begin();
     if (g_pt_open >= 0) g_pt[g_pt_open].draws++;   // draw calls in the pass, recorded or not
     VkCommandBuffer cb = CB();
@@ -813,17 +906,24 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
               S.poly.offset_en, S.po.units, S.po.factor, S.po.clamp, (int)S.poly.cull, (int)P.dfmt, (unsigned)S.chmask.mask, (unsigned)S.color.blend_en,
               S.ms.a2c, S.ms.a2c_dither, (int)P.samples, (int)S.color.alpha_func, count);
         if (P.cfmt[0] == VK_FORMAT_R8G8B8A8_SRGB && P.w >= 1280) {   /* interface draws: what places each quad (bottom map calibration) */
-            for (int r = 0; r < 16; r++) {
-                const p_bind_buf *u = &S.ubo[0][r]; if (!u->addr || !u->size || u->size > 0x400) continue;
-                char b[1600]; size_t o = (size_t)snprintf(b, sizeof b, "rtdump pass %d ubo vs slot %d %#llx +%#llx:", g_rtd_pass + 1, r, (unsigned long long)u->addr, (unsigned long long)u->size);
+            for (int st = 0; st < 2; st++) for (int k = 0; pr->sh[st] && k < pr->sh[st]->nb; k++) {   /* the uniform buffers these shaders read */
+                const vk_bind *bd = &pr->sh[st]->b[k]; if (bd->kind != NVN_RB_CBUF || bd->reg >= 16) continue;
+                const p_bind_buf *u = &S.ubo[st][bd->reg]; if (!u->addr || !u->size) continue;
+                char b[4000]; size_t o = (size_t)snprintf(b, sizeof b, "rtdump pass %d ubo %s slot %d %#llx +%#llx:", g_rtd_pass + 1, st ? "fs" : "vs", bd->reg, (unsigned long long)u->addr, (unsigned long long)u->size);
                 const float *f = (const float *)(uintptr_t)u->addr;
-                for (uint64_t k = 0; k < u->size / 4 && k < 64 && o < sizeof b - 20; k++) o += (size_t)snprintf(b + o, sizeof b - o, " %g", f[k]);
+                for (uint64_t q = 0; q < u->size / 4 && q < 160 && o < sizeof b - 20; q++) o += (size_t)snprintf(b + o, sizeof b - o, " %g", f[q]);
                 VKLOG("%s", b);
             }
-            if (S.vbuf[0].address) {
-                const float *f = (const float *)(uintptr_t)(S.vbuf[0].address + (uint64_t)(dw ? dw->first : 0) * S.stream[0].stride);
-                VKLOG("rtdump pass %d vb0 stride %d: %g %g %g %g | %g %g %g %g | %g %g %g %g", g_rtd_pass + 1, (int)S.stream[0].stride,
-                      f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11]);
+            for (int i = 0; i < pr->sh[0]->nv; i++) {   /* each vertex attribute the shader reads: its first four vertices */
+                va_st a; uint32_t raw = S.attr[pr->sh[0]->v[i].loc & 15]; memcpy(&a, &raw, 4);
+                if (!S.vbuf[a.stream].address) continue;
+                uint32_t stride = S.stream[a.stream].stride; char b[600]; size_t o = (size_t)snprintf(b, sizeof b, "rtdump pass %d attr %d stream %u fmt %#x off %u stride %u:", g_rtd_pass + 1,
+                    pr->sh[0]->v[i].loc, (unsigned)a.stream, (unsigned)a.fmt, (unsigned)a.offset, stride);
+                for (int vtx = 0; vtx < 4; vtx++) {
+                    const float *f = (const float *)(uintptr_t)(S.vbuf[a.stream].address + (uint64_t)((dw ? dw->first : 0) + vtx) * stride + a.offset);
+                    o += (size_t)snprintf(b + o, sizeof b - o, " | %g %g %g %g", f[0], f[1], f[2], f[3]);
+                }
+                VKLOG("%s", b);
             }
         }
     }

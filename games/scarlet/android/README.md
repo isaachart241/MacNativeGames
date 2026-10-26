@@ -42,9 +42,13 @@ typed in a dialog with the on-screen keyboard.
 The game's rumble drives the Thor's vibration motor. It has one motor, so it gets the stronger of the game's two;
 `TOTK_RUMBLE=0` turns rumble off, and `SCARLET_RUMBLE_TEST=<1-255>` buzzes once at start to check the motor.
 
-The bottom screen shows a map while the game is in focus (drag to look around, pinch to zoom; it follows you again a
-few seconds after the last touch); leaving the game gives the screen back to whatever was there. Work in progress: the
-map is a grid for now (`runtime/bottom_android.c`). `SCARLET_BOTTOM=0` leaves the bottom screen alone.
+The bottom screen shows the game's own map while the game is in focus, north up and following you (drag to look
+around, pinch to zoom; it follows you again a few seconds after the last touch), and the minimap leaves the top screen;
+leaving the game gives the bottom screen back to whatever was there. The map's art comes from the game's map screen:
+open it once (Y) and zoom all the way out (ZL); it is kept in the data folder's `map-cache/` (a grid shows until then).
+Each time the zoomed-out map is open, your marker's place on it is noted there too, which keeps the bottom map's
+position right as you travel. `SCARLET_BOTTOM=0` leaves the bottom screen alone and keeps the minimap;
+`SCARLET_MINIMAP=1` keeps the minimap as well.
 
 ## Shaders
 

@@ -38,7 +38,7 @@ static pthread_cond_t viewCond = PTHREAD_COND_INITIALIZER;
 static ANativeWindow *win;            /* the bottom surface while shown (render thread draws into it) */
 static int winBusy, dirty = 1;        /* winBusy: the render thread is drawing into win */
 #define SNAP_S 4.0
-#define ZOOM_HOME 3.0   /* screen pixels per map unit (a metre): the bottom screen spans about 400 m */
+#define ZOOM_HOME 0.42   /* screen pixels per world unit: about half of Paldea across the screen (2.4 screen pixels a map texel) */
 static double camX, camY, zoom = ZOOM_HOME;   /* map position at the screen centre; screen pixels per map unit */
 static double playerX, playerY, playerDir;   /* map units; radians, 0 = north (up), clockwise */
 static double lastTouch = -100;       /* time of the last touch; the view follows the player SNAP_S after it */
@@ -73,7 +73,7 @@ static int bottom_motion(const AInputEvent *e) {
             double mx = ntouch == 2 ? (touch[0].x + touch[1].x) / 2 : touch[0].x, my = ntouch == 2 ? (touch[0].y + touch[1].y) / 2 : touch[0].y;
             if (ntouch == 2 && pinchDist > 20) {
                 double z = pinchZoom * hypot(touch[0].x - touch[1].x, touch[0].y - touch[1].y) / pinchDist;
-                zoom = z < 0.05 ? 0.05 : z > 20 ? 20 : z;
+                zoom = z < 0.1 ? 0.1 : z > 4 ? 4 : z;
             }
             camX = dragCamX - (mx - dragX) / zoom; camY = dragCamY - (my - dragY) / zoom;
         }
@@ -133,9 +133,43 @@ static void tri(canvas *c, const double *xs, const double *ys, uint32_t col) {  
         if (hi >= lo) fill(c, (int)lo, y, (int)hi + 1, y + 1, col);
     }
 }
-static void draw_map(canvas *c, double cx, double cy, double z, double px, double py, double pdir, const float (*t)[2], int nt) {
+/* ---------- the map art (map-cache/, saved by the Vulkan backend from the game's map screen) ---------- */
+typedef struct { uint8_t *px; int w, h; } image;
+static image overview, pattern;   /* render thread only */
+static _Atomic int assetsChanged = 1;
+void bottom_map_assets_changed(void) { assetsChanged = 1; pthread_mutex_lock(&viewLock); dirty = 1; pthread_cond_broadcast(&viewCond); pthread_mutex_unlock(&viewLock); }
+static void load_image(image *im, const char *path) {
+    FILE *f = fopen(path, "rb"); if (!f) return;
+    uint32_t hd[3];
+    if (fread(hd, 4, 3, f) == 3 && hd[0] == 0x3150414d && hd[1] && hd[2] && hd[1] <= 4096 && hd[2] <= 4096) {
+        uint8_t *px = malloc((size_t)hd[1] * hd[2] * 4);
+        if (px && fread(px, 4, (size_t)hd[1] * hd[2], f) == (size_t)hd[1] * hd[2]) { free(im->px); im->px = px; im->w = (int)hd[1]; im->h = (int)hd[2]; px = NULL; }
+        free(px);
+    }
+    fclose(f);
+}
+/* World (x, z) to the overview texture: u = u0 + x * scale, v = v0 + z * scale (north up, east right). Fitted by least squares
+   to map-cache/calib.txt, the game's own marker positions noted whenever the zoomed-out map is shown; the scale only once
+   the samples spread over 100 units. Until then, 2026-10-26's measurement at Cabo Poco: the marker at (420.33, 826.50) for
+   the player at (2323.33, -741.52), 0.1746 texels a unit (east 12 units: 2.17 texels). */
+static double mapScale = 0.1746, mapU0 = 420.33 - 2323.33 * 0.1746, mapV0 = 826.50 + 741.52 * 0.1746;
+static void load_calibration(void) {
+    FILE *f = fopen("map-cache/calib.txt", "r"); if (!f) return;
+    double x, z, u, v, sx = 0, sz = 0, su = 0, sv = 0; int n = 0;
+    static double X[4096], Z[4096], U[4096], Vv[4096];
+    while (n < 4096 && fscanf(f, "%lf %lf %lf %lf", &x, &z, &u, &v) == 4) { X[n] = x; Z[n] = z; U[n] = u; Vv[n] = v; sx += x; sz += z; su += u; sv += v; n++; }
+    fclose(f);
+    if (!n) return;
+    sx /= n; sz /= n; su /= n; sv /= n;
+    double num = 0, den = 0;
+    for (int i = 0; i < n; i++) { num += (X[i] - sx) * (U[i] - su) + (Z[i] - sz) * (Vv[i] - sv); den += (X[i] - sx) * (X[i] - sx) + (Z[i] - sz) * (Z[i] - sz); }
+    if (den > 100.0 * 100.0 && num / den > 0.05 && num / den < 1) mapScale = num / den;
+    mapU0 = su - mapScale * sx; mapV0 = sv - mapScale * sz;
+    fprintf(stderr, "[totk] bottom map: %d calibration samples, %.4f texels a unit, origin %.2f %.2f\n", n, mapScale, mapU0, mapV0);
+}
+
+static void draw_grid(canvas *c, double cx, double cy, double z) {   /* before the art has been seen once */
     fill(c, 0, 0, c->w, c->h, rgb(22, 38, 52));
-    /* Grid lines every 100 map units (every 1000 brighter), only where they are at least 12 pixels apart */
     for (int major = 0; major < 2; major++) {
         double step = major ? 1000 : 100; if (step * z < 12) continue;
         uint32_t col = major ? rgb(70, 110, 130) : rgb(40, 62, 78);
@@ -143,10 +177,54 @@ static void draw_map(canvas *c, double cx, double cy, double z, double px, doubl
         for (double gx = floor(x0 / step) * step; gx <= x0 + c->w / z; gx += step) { int sx = (int)((gx - x0) * z); fill(c, sx, 0, sx + (major ? 2 : 1), c->h, col); }
         for (double gy = floor(y0 / step) * step; gy <= y0 + c->h / z; gy += step) { int sy = (int)((gy - y0) * z); fill(c, 0, sy, c->w, sy + (major ? 2 : 1), col); }
     }
-    /* The player: an arrow pointing the way they face */
+}
+/* The map screen's look: its patterned navy background, the region map over it (bilinear, with its transparency). */
+static uint32_t *bgFrame; static int bgW, bgH;
+static void draw_art(canvas *c, double cx, double cy, double z) {
+    if (!bgFrame || bgW != c->w || bgH != c->h) {   /* the background is screen-fixed: made once */
+        free(bgFrame); bgFrame = malloc((size_t)c->w * c->h * 4); bgW = c->w; bgH = c->h;
+        for (int y = 0; y < c->h; y++) for (int x = 0; x < c->w; x++) {
+            const uint8_t *p = pattern.px ? pattern.px + 4 * ((size_t)(y % pattern.h) * pattern.w + (size_t)(x % pattern.w)) : NULL;
+            bgFrame[(size_t)y * c->w + x] = p ? rgb(p[0], p[1], p[2]) : rgb(26, 43, 74);
+        }
+    }
+    double k = mapScale / z;   /* texels a screen pixel */
+    double u0 = mapU0 + (cx - c->w / 2.0 / z) * mapScale, v0 = mapV0 + (cy - c->h / 2.0 / z) * mapScale;
+    const int W = overview.w, H = overview.h; const uint8_t *T = overview.px;
+    int64_t du = (int64_t)(k * 65536), uu0 = (int64_t)((u0 - 0.5) * 65536), vv = (int64_t)((v0 - 0.5) * 65536);
+    for (int y = 0; y < c->h; y++, vv += du) {
+        uint32_t *o = c->px + (size_t)y * c->stride; const uint32_t *b = bgFrame + (size_t)y * c->w;
+        int64_t ty = vv >> 16; uint32_t fy = (uint32_t)(vv & 0xffff) >> 8;
+        if (ty < -1 || ty >= H) { memcpy(o, b, (size_t)c->w * 4); continue; }
+        int64_t uu = uu0;
+        for (int x = 0; x < c->w; x++, uu += du) {
+            int64_t tx = uu >> 16;
+            if (tx < -1 || tx >= W) { o[x] = b[x]; continue; }
+            uint32_t fx = (uint32_t)(uu & 0xffff) >> 8, acc[4] = {0, 0, 0, 0};
+            for (int j = 0; j < 4; j++) {   /* the four texels, weights in 1/65536 */
+                int64_t sx = tx + (j & 1), sy = ty + (j >> 1);
+                uint32_t w = ((j & 1) ? fx : 256 - fx) * ((j >> 1) ? fy : 256 - fy);
+                if (sx < 0 || sy < 0 || sx >= W || sy >= H) continue;
+                const uint8_t *t = T + 4 * ((size_t)sy * W + (size_t)sx);
+                uint32_t wa = w * t[3];
+                acc[0] += t[0] * wa >> 8; acc[1] += t[1] * wa >> 8; acc[2] += t[2] * wa >> 8; acc[3] += wa >> 8;
+            }
+            uint32_t a = acc[3] >> 8;   /* coverage 0..255 */
+            if (!a) { o[x] = b[x]; continue; }
+            uint32_t bg = b[x], na = 255 - a;
+            uint32_t r = (acc[0] >> 16) + ((bg & 255) * na >> 8), g = (acc[1] >> 16) + ((bg >> 8 & 255) * na >> 8), bl = (acc[2] >> 16) + ((bg >> 16 & 255) * na >> 8);
+            o[x] = rgb((int)(r > 255 ? 255 : r), (int)(g > 255 ? 255 : g), (int)(bl > 255 ? 255 : bl));
+        }
+    }
+}
+static void draw_map(canvas *c, double cx, double cy, double z, double px, double py, double pdir, const float (*t)[2], int nt) {
+    if (overview.px) draw_art(c, cx, cy, z); else draw_grid(c, cx, cy, z);
+    /* The player, in the map screen's colours: a white disc in a dark outline with a yellow pointer the way they face */
     double sx = c->w / 2.0 + (px - cx) * z, sy = c->h / 2.0 + (py - cy) * z, s = sin(pdir), k = cos(pdir);
-    double ax[3] = {sx + 30 * s, sx - 18 * k - 16 * s, sx + 18 * k - 16 * s}, ay[3] = {sy - 30 * k, sy - 18 * s + 16 * k, sy + 18 * s + 16 * k};
-    disc(c, sx, sy, 26, rgb(255, 255, 255)); tri(c, ax, ay, rgb(230, 60, 40));
+    double ax[3] = {sx + 40 * s, sx - 16 * k + 20 * s, sx + 16 * k + 20 * s}, ay[3] = {sy - 40 * k, sy - 16 * s - 20 * k, sy + 16 * s - 20 * k};
+    disc(c, sx, sy, 24, rgb(16, 32, 40)); tri(c, ax, ay, rgb(16, 32, 40));
+    double bx[3] = {sx + 34 * s, sx - 11 * k + 19 * s, sx + 11 * k + 19 * s}, by[3] = {sy - 34 * k, sy - 11 * s - 19 * k, sy + 11 * s - 19 * k};
+    tri(c, bx, by, rgb(255, 214, 0)); disc(c, sx, sy, 19, rgb(255, 255, 255)); disc(c, sx, sy, 7, rgb(16, 32, 40));
     for (int i = 0; i < nt; i++) disc(c, t[i][0], t[i][1], 40, rgb(250, 200, 60));   /* fingers */
 }
 static void *render_thread(void *arg) {
@@ -166,6 +244,12 @@ static void *render_thread(void *arg) {
         }
         if (!ntouch && now_s() - lastTouch >= SNAP_S) {   /* glide back to the player, a fifth of the way per frame */
             camX += (playerX - camX) * 0.2; camY += (playerY - camY) * 0.2; zoom += (ZOOM_HOME - zoom) * 0.2;
+        }
+        if (assetsChanged) {   /* the backend saved new art or a calibration sample */
+            assetsChanged = 0; pthread_mutex_unlock(&viewLock);
+            load_image(&overview, "map-cache/overview.rgba"); load_image(&pattern, "map-cache/background.rgba"); load_calibration();
+            free(bgFrame); bgFrame = NULL;
+            pthread_mutex_lock(&viewLock);
         }
         double cx = camX, cy = camY, z = zoom, px = playerX, py = playerY, pd = playerDir;
         float t[2][2]; int nt = ntouch; for (int i = 0; i < nt; i++) { t[i][0] = touch[i].x; t[i][1] = touch[i].y; }

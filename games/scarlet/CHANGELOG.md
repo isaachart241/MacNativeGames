@@ -847,3 +847,38 @@ Not done: placing the player on that texture. The interface quad is a unit squar
 holds the 3D passes' stale bindings, so the overview's world transform is not read off directly yet; two spots far
 enough apart (or the minimap's tiles, whose uniform data follows the player) are the next way in. The dumped art stays
 on the Thor and in the scratch folder, not in the repository.
+
+### 2026-10-26: Thor port: the bottom map in the game's own look; the minimap off the top screen
+
+The user asked for the bottom screen to be "basically one to one with the design from the game, just fitted for the
+screen". So it now draws the game's own art, taken from the game's map screen:
+
+- **Reading the interface.** Scarlet's interface is nn::ui2d: every quad is a unit square whose vertex-stage uniform
+  buffer (slot 0, 140 floats) holds the projection (floats 0-15), the quad's matrix (16-27: scale, rotation and a
+  screen-centred translation, y up) and its rectangle (132-135: width, height, left, top). The render-target dump now
+  logs exactly the uniform buffers a draw's shaders read (from the shader's reflection) and each vertex attribute's
+  first vertices.
+- **Where the player is on the map.** Fully zoomed out, the region map is a 900x900 quad at scale 0.9 shifted (0, 10);
+  the player's marker (a 44x44 quad) sat at (-26.7, -328.85), i.e. texel (420.33, 826.50) for the player at
+  (2323.33, -741.52), and 12 units east moved it 2.17 texels: about 0.175 texels a unit, east right, north up. Zoomed
+  in, the map is a grid of 1000-unit tiles (700x700 BC7 textures) around the player, whose position the game rounds to
+  whole tile units there; the two zoom levels agree (overview texel = 12 tile units). The game rounds marker positions
+  (0.05 pixel), so a walk of 12 units gives the scale to a few percent only: the backend notes the marker's place with
+  the player's position in `map-cache/calib.txt` whenever the zoomed-out map has been steady for 15 frames (during
+  the zoom animation the marker still sits at the centre: the first try noted that), and the bottom map fits its
+  transform to those notes (the scale once they spread over 100 units).
+- **The art.** Whenever the game's map screen draws them, the backend saves the region map (900x900, BC3) and the
+  screen's patterned background (800x840) to `map-cache/*.rgba`, once. The bottom screen draws the background, the map
+  over it (bilinear, with its transparency: the sea is the background, as in the game) and the player in the map
+  screen's colours (a white disc in a dark outline with a yellow pointer), north up and following the player at about
+  half of Paldea across the screen. The art stays in the app's data folder; nothing of it is in the repository.
+- **The minimap.** In normal play the interface pass is the minimap only: 25 map tiles and a frame through a 400x400
+  circular mask, then rings, a heading cone, follower icons and the player's marker around the frame's centre
+  (780, -360). Those draws are now skipped on the top screen (masked quads, and after the frame the quads inside its
+  circle); the map screen, menus and battles draw no masked quad, so nothing of theirs is touched
+  (`SCARLET_MINIMAP=1` or `SCARLET_BOTTOM=0` keeps the minimap).
+
+Checked on the Thor: the top screen without the minimap in play, the map screen unchanged (including its hints at the
+bottom right), the bottom screen showing the region map with the player at Cabo Poco's southern tip. Not checked:
+battles and menus with the minimap rule (no masked quad there in theory). Not done: the game's markers (Pokémon Centers,
+the objective) on the bottom map, and its detailed tiles for zooming in (the region map is soft beyond about 2x).
