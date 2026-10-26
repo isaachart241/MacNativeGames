@@ -677,7 +677,23 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     uintptr_t a = lo & ~(pg - 1), b = (hi + pg - 1) & ~(pg - 1);
     pool_range_check(a, b, mem, size);
     id<MTLBuffer> buf = [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a options:MTLResourceStorageModeShared deallocator:nil];
-    if (!buf) MDIE("内存池 %p+%#llx 建零拷贝缓冲失败", mem, (unsigned long long)size);
+    if (!buf) {   /* Scarlet: seen once (a pool in pages the game had just mapped): wait for the GPU, let deferred releases go, try again;
+                     if it still fails, say what the range looks like before stopping */
+        mtl_finish(); defer_drain(); res_commit();
+        buf = [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a options:MTLResourceStorageModeShared deallocator:nil];
+        if (buf) { static int said; if (said++ < 4) MLOG("memory pool %p+%#llx: zero-copy buffer made on the second try (after GPU idle)", mem, (unsigned long long)size); }
+        else {
+            for (mach_vm_address_t at = a; at < b;) {
+                mach_vm_address_t ra = at; mach_vm_size_t rs = 0; vm_region_extended_info_data_t ri; mach_msg_type_number_t rc = VM_REGION_EXTENDED_INFO_COUNT; mach_port_t ro = MACH_PORT_NULL;
+                if (mach_vm_region(mach_task_self(), &ra, &rs, VM_REGION_EXTENDED_INFO, (vm_region_info_t)&ri, &rc, &ro) != KERN_SUCCESS) break;
+                MLOG("memory pool %p+%#llx: region %#llx+%#llx protection %d share mode %d pages resident %u", mem, (unsigned long long)size,
+                     (unsigned long long)ra, (unsigned long long)rs, ri.protection, ri.share_mode, ri.pages_resident);
+                at = ra + rs; }
+            MLOG("memory pool %p+%#llx: %d pools registered, %llu MiB, device allocated %llu MiB", mem, (unsigned long long)size, g_pools.n,
+                 (unsigned long long)(g_pool_bytes >> 20), (unsigned long long)(g_dev.currentAllocatedSize >> 20));
+            MDIE("内存池 %p+%#llx 建零拷贝缓冲失败", mem, (unsigned long long)size);
+        }
+    }
     pthread_mutex_lock(&g_mu);
     if (pidx_overlaps(&g_pools, lo, hi)) { static int said; if (said++ < 8) MLOG("memory pool %p+%#llx overlaps a registered pool (%d live)", mem, (unsigned long long)size, g_pools.n); }
     pidx_ent ent = {lo, hi, a, (__bridge void *)buf, buf.gpuAddress, mem, 0};
@@ -10844,6 +10860,109 @@ static int copy_t2t_astc(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
     defer_obj_unref(sv); defer_obj_unref(dv); defer_obj_release(pb);   // 本次提交跑完再放（视图不单独驻留，参数块撤驻留） | Release after this submit has finished running (views are not made resident separately; the parameter block is removed from residency)
     return 1;
 }
+/* Scarlet: a scaling texture-to-texture copy (the 2D engine's stretch blit: the enrollment form's photo copies a 1920x1080
+   float target to 480x270). Drawn as one triangle over the destination rectangle sampling the source rectangle, nearest
+   unless NVN_COPY_FLAGS_LINEAR_FILTER_BIT is set; same format on both sides, 2D, no mirroring (copy_t2t checks). */
+static const char k_t2t_scale_msl[] =
+"#include <metal_stdlib>\nusing namespace metal;\n"
+"struct V { float4 p [[position]]; float2 uv; };\n"
+"vertex V vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); V o; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = uv; return o; }\n"
+"fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant float4 &r [[buffer(0)]]) { return t.sample(s, r.xy + in.uv * r.zw); }\n";
+static int pf_scale_copyable(MTLPixelFormat f) {   // sampled as float and colour renderable: not depth / stencil, not integer, not compressed
+    switch (f) {
+        case MTLPixelFormatDepth16Unorm: case MTLPixelFormatDepth32Float: case MTLPixelFormatStencil8: case MTLPixelFormatDepth32Float_Stencil8:
+        case MTLPixelFormatX32_Stencil8: case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint: case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint:
+        case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint: case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint: case MTLPixelFormatRG16Uint:
+        case MTLPixelFormatRG16Sint: case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint: case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG32Uint:
+        case MTLPixelFormatRG32Sint: case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint: return 0;
+        default: return !pf_block_compressed(f);
+    }
+}
+static int copy_t2t_scaled(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsigned ss, unsigned dl, unsigned ds, const p_copy_t2t *c) {
+    static int failed; static id<MTLLibrary> lib; static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *ps; static id<MTLSamplerState> smp[2]; static id<MTL4ArgumentTable> at;
+    if (failed) return 0;
+    if (!lib) { NSError *e = nil; lib = [g_dev newLibraryWithSource:@(k_t2t_scale_msl) options:nil error:&e]; ps = [NSMutableDictionary dictionary];
+        for (int i = 0; i < 2; i++) { MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = i ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+            sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge; sd.supportArgumentBuffers = YES; smp[i] = [g_dev newSamplerStateWithDescriptor:sd]; }
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 1; ad.maxSamplerStateBindCount = 1; ad.maxBufferBindCount = 1; at = [g_dev newArgumentTableWithDescriptor:ad error:&e];
+        if (!lib || !smp[0] || !smp[1] || !at) { failed = 1; MLOG("【红】scaled texture copy: setup failed: %s", e.localizedDescription.UTF8String); return 0; } }
+    id<MTLRenderPipelineState> p = ps[@(d.pixelFormat)];
+    if (!p) { NSError *e = nil; MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = [lib newFunctionWithName:@"vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
+        pd.colorAttachments[0].pixelFormat = d.pixelFormat; p = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        if (!p) { RED_ONCE(126, "scaled texture copy: no pipeline for format %lu: %s", (unsigned long)d.pixelFormat, e.localizedDescription.UTF8String); return 0; }
+        ps[@(d.pixelFormat)] = p; }
+    id<MTLTexture> sv = [s newTextureViewWithPixelFormat:s.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(sl, 1) slices:NSMakeRange(ss, 1)];
+    id<MTLBuffer> rb = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
+    if (!sv || !rb) { RED_ONCE(127, "scaled texture copy: no source view / constant buffer"); return 0; }
+    float sw = (float)sv.width, sh = (float)sv.height, *r = rb.contents;
+    r[0] = c->sr.xoffset / sw; r[1] = c->sr.yoffset / sh; r[2] = c->sr.width / sw; r[3] = c->sr.height / sh;
+    res_add(rb);
+    rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new]; rp.colorAttachments[0].texture = d; rp.colorAttachments[0].level = dl;
+    if (d.textureType == MTLTextureType3D) rp.colorAttachments[0].depthPlane = ds; else rp.colorAttachments[0].slice = ds;
+    rp.colorAttachments[0].loadAction = MTLLoadActionLoad; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    blit_close(); rs_sync(); pt_mark(g_cb, 'R', rp); id<MTL4RenderCommandEncoder> en = [g_cb renderCommandEncoderWithDescriptor:rp]; es_reset();
+    if (!en) { defer_obj_unref(sv); defer_obj_release(rb); RED_ONCE(128, "scaled texture copy: no render encoder"); return 0; }
+    [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; [en setArgumentTable:at atStages:MTLRenderStageFragment];
+    [at setTexture:sv.gpuResourceID atIndex:0]; [at setSamplerState:smp[(c->flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) != 0].gpuResourceID atIndex:0]; [at setAddress:rb.gpuAddress atIndex:0];
+    [en setViewport:(MTLViewport){c->dr.xoffset, c->dr.yoffset, c->dr.width, c->dr.height, 0, 1}]; [en setRenderPipelineState:p]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; m4_end(en);
+    args_dirty_all(); g_pso_dirty = g_dss_dirty = 1;
+    defer_obj_unref(sv); defer_obj_release(rb);
+    static int once; if (!once++) MLOG("[copy] first scaled texture copy: %dx%d -> %dx%d, format %lu, %s", c->sr.width, c->sr.height, c->dr.width, c->dr.height, (unsigned long)d.pixelFormat, (c->flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) ? "linear" : "nearest");
+    return 1;
+}
+/* Scarlet: the same scaling copy for a depth or depth-stencil target (the 1920x1080 scene depth goes to 480x270 next to
+   the colour copy above): nearest texel, depth written by the fragment, stencil too where Metal has both planes. */
+static const char k_t2t_scale_depth_msl[] =
+"#include <metal_stdlib>\nusing namespace metal;\n"
+"struct V { float4 p [[position]]; };\n"
+"vertex V vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); V o; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
+"struct P { float4 r; float4 d; };\n"
+"static uint2 at(float4 pos, constant P &p) { return uint2(p.r.xy + floor((pos.xy - p.d.xy) * p.r.zw)); }\n"
+"struct OD { float d [[depth(any)]]; };\n"
+"fragment OD fd(V in [[stage_in]], depth2d<float> t [[texture(0)]], constant P &p [[buffer(0)]]) { OD o; o.d = t.read(at(in.p, p)); return o; }\n"
+"struct ODS { float d [[depth(any)]]; uint s [[stencil]]; };\n"
+"fragment ODS fds(V in [[stage_in]], depth2d<float> t [[texture(0)]], texture2d<uint> st [[texture(1)]], constant P &p [[buffer(0)]]) { ODS o; uint2 c = at(in.p, p); o.d = t.read(c); o.s = st.read(c).r; return o; }\n";
+static int copy_t2t_scaled_depth(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsigned ss, unsigned dl, unsigned ds, const p_copy_t2t *c) {
+    static int failed; static id<MTLLibrary> lib; static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *ps; static id<MTLDepthStencilState> dss; static id<MTL4ArgumentTable> at;
+    if (failed) return 0;
+    int stencil = d.pixelFormat == MTLPixelFormatDepth32Float_Stencil8;
+    if (d.pixelFormat != MTLPixelFormatDepth32Float && d.pixelFormat != MTLPixelFormatDepth16Unorm && !stencil) return 0;
+    if (!lib) { NSError *e = nil; lib = [g_dev newLibraryWithSource:@(k_t2t_scale_depth_msl) options:nil error:&e]; ps = [NSMutableDictionary dictionary];
+        MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new]; dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = YES;
+        MTLStencilDescriptor *sd = [MTLStencilDescriptor new]; sd.stencilCompareFunction = MTLCompareFunctionAlways; sd.depthStencilPassOperation = MTLStencilOperationReplace;
+        sd.stencilFailureOperation = sd.depthFailureOperation = MTLStencilOperationReplace; sd.readMask = sd.writeMask = 0xff; dd.frontFaceStencil = dd.backFaceStencil = sd;
+        dss = [g_dev newDepthStencilStateWithDescriptor:dd];
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 2; ad.maxBufferBindCount = 1; at = [g_dev newArgumentTableWithDescriptor:ad error:&e];
+        if (!lib || !dss || !at) { failed = 1; MLOG("【红】scaled depth copy: setup failed: %s", e.localizedDescription.UTF8String); return 0; } }
+    id<MTLRenderPipelineState> p = ps[@(d.pixelFormat)];
+    if (!p) { NSError *e = nil; MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = [lib newFunctionWithName:@"vs"];
+        pd.fragmentFunction = [lib newFunctionWithName:stencil ? @"fds" : @"fd"]; pd.depthAttachmentPixelFormat = d.pixelFormat; if (stencil) pd.stencilAttachmentPixelFormat = d.pixelFormat;
+        p = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        if (!p) { RED_ONCE(129, "scaled depth copy: no pipeline for format %lu: %s", (unsigned long)d.pixelFormat, e.localizedDescription.UTF8String); return 0; }
+        ps[@(d.pixelFormat)] = p; }
+    id<MTLTexture> sv = [s newTextureViewWithPixelFormat:s.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(sl, 1) slices:NSMakeRange(ss, 1)];
+    id<MTLTexture> stv = stencil ? [s newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8 textureType:MTLTextureType2D levels:NSMakeRange(sl, 1) slices:NSMakeRange(ss, 1)] : nil;
+    id<MTLBuffer> rb = [g_dev newBufferWithLength:32 options:MTLResourceStorageModeShared];
+    if (!sv || (stencil && !stv) || !rb) { RED_ONCE(130, "scaled depth copy: no source views / constant buffer"); return 0; }
+    float *r = rb.contents;
+    r[0] = c->sr.xoffset; r[1] = c->sr.yoffset; r[2] = (float)c->sr.width / c->dr.width; r[3] = (float)c->sr.height / c->dr.height; r[4] = c->dr.xoffset; r[5] = c->dr.yoffset; r[6] = r[7] = 0;
+    res_add(rb);
+    rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new]; rp.depthAttachment.texture = d; rp.depthAttachment.level = dl; rp.depthAttachment.slice = ds;
+    rp.depthAttachment.loadAction = MTLLoadActionLoad; rp.depthAttachment.storeAction = MTLStoreActionStore;
+    if (stencil) { rp.stencilAttachment.texture = d; rp.stencilAttachment.level = dl; rp.stencilAttachment.slice = ds; rp.stencilAttachment.loadAction = MTLLoadActionLoad; rp.stencilAttachment.storeAction = MTLStoreActionStore; }
+    blit_close(); rs_sync(); pt_mark(g_cb, 'R', rp); id<MTL4RenderCommandEncoder> en = [g_cb renderCommandEncoderWithDescriptor:rp]; es_reset();
+    if (!en) { defer_obj_unref(sv); if (stv) defer_obj_unref(stv); defer_obj_release(rb); RED_ONCE(131, "scaled depth copy: no render encoder"); return 0; }
+    [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; [en setArgumentTable:at atStages:MTLRenderStageFragment];
+    [at setTexture:sv.gpuResourceID atIndex:0]; if (stv) [at setTexture:stv.gpuResourceID atIndex:1]; [at setAddress:rb.gpuAddress atIndex:0];
+    [en setViewport:(MTLViewport){c->dr.xoffset, c->dr.yoffset, c->dr.width, c->dr.height, 0, 1}]; [en setRenderPipelineState:p]; [en setDepthStencilState:dss];
+    [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; m4_end(en);
+    args_dirty_all(); g_pso_dirty = g_dss_dirty = 1;
+    defer_obj_unref(sv); if (stv) defer_obj_unref(stv); defer_obj_release(rb);
+    static int once; if (!once++) MLOG("[copy] first scaled depth copy: %dx%d -> %dx%d, format %lu", c->sr.width, c->sr.height, c->dr.width, c->dr.height, (unsigned long)d.pixelFormat);
+    return 1;
+}
 // GPU：贴图 → 贴图（原先误列为空操作，选角页每帧 3 次）。等尺寸、不镜像、同格式 → 逐层 blit；其余语义（缩放带过滤、镜像、换格式）blit 表达不了，报红待实现
 // GPU: texture -> texture (previously mislisted as a no-op, 3 times per frame on the character select page). Same size, not mirrored, same format -> blit layer by layer; the other semantics (scaling with filtering, mirroring, format change) cannot be expressed by blit: report a failure, to be implemented
 static void copy_t2t(const p_copy_t2t *c) {
@@ -10870,6 +10989,13 @@ static void copy_t2t(const p_copy_t2t *c) {
         for (int z = 0; z < nz && ok; z++) ok = copy_t2t_astc(s, d, sl, sz0 + c->sr.zoffset + z, dl, dz0 + c->dr.zoffset + z, c->sr.xoffset, c->sr.yoffset, c->dr.xoffset, c->dr.yoffset, c->sr.width, c->sr.height);
         if (ok) return;
     }
+    if ((c->sr.width != c->dr.width || c->sr.height != c->dr.height) && nz == 1 && (c->dr.depth ? c->dr.depth : 1) == 1 && !s3 && !d3 && s.pixelFormat == d.pixelFormat
+        && !(c->flags & ~NVN_COPY_FLAGS_ENGINE_2D_BIT & ~NVN_COPY_FLAGS_LINEAR_FILTER_BIT) && c->sr.width > 0 && c->sr.height > 0 && c->dr.width > 0 && c->dr.height > 0
+        && pf_scale_copyable(d.pixelFormat) && (d.usage & MTLTextureUsageRenderTarget)
+        && copy_t2t_scaled(s, d, sl, sz0 + c->sr.zoffset, dl, dz0 + c->dr.zoffset, c)) return;   // Scarlet: scaling copy
+    if ((c->sr.width != c->dr.width || c->sr.height != c->dr.height) && nz == 1 && (c->dr.depth ? c->dr.depth : 1) == 1 && !s3 && !d3 && s.pixelFormat == d.pixelFormat
+        && !(c->flags & ~NVN_COPY_FLAGS_ENGINE_2D_BIT & ~NVN_COPY_FLAGS_LINEAR_FILTER_BIT) && c->sr.width > 0 && c->sr.height > 0 && c->dr.width > 0 && c->dr.height > 0
+        && (d.usage & MTLTextureUsageRenderTarget) && copy_t2t_scaled_depth(s, d, sl, sz0 + c->sr.zoffset, dl, dz0 + c->dr.zoffset, c)) return;   // Scarlet: scaling depth copy
     if (c->sr.width != c->dr.width || c->sr.height != c->dr.height || (c->sr.depth ? c->sr.depth : 1) != (c->dr.depth ? c->dr.depth : 1) || (c->flags & ~NVN_COPY_FLAGS_ENGINE_2D_BIT & ~NVN_COPY_FLAGS_LINEAR_FILTER_BIT)
         || s.pixelFormat != d.pixelFormat || s3 != d3) {
         RED_ONCE(33, "贴图→贴图拷贝未实现的形态：%dx%dx%d→%dx%dx%d 标志 %#x 格式 %lu→%lu 3D %d→%d", c->sr.width, c->sr.height, c->sr.depth, c->dr.width, c->dr.height, c->dr.depth,

@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 enum { STATE_STARTED = 0, STATE_STOPPED = 1, FORMAT_PCM16 = 2, DEFAULT_RATE = 48000, QUEUE_MAX = 32 };
 typedef struct { uint64_t next, sample_buffer, capacity, data_size, data_offset; } AudioOutBuffer;   /* the client's descriptor */
@@ -102,6 +103,13 @@ static void append(AudioOut *o, const IpcRequest *rq) {
     need(AudioQueueAllocateBuffer(o->aq, (UInt32)(frames * 4 ? frames * 4 : 4), &qb) == 0, "AudioOut queue buffer");
     to_stereo(ipc_guest(d.sample_buffer + d.data_offset, d.data_size), qb->mAudioData, frames, o->channels);
     qb->mAudioDataByteSize = (UInt32)(frames * 4);
+    {   /* Scarlet: the level of what is queued, every 5 s (the renderer path has its own line; this is the AudioOut one) */
+        static double sum; static uint64_t n, nonzero, t0; static int peak; const int16_t *q = qb->mAudioData;
+        for (uint64_t i = 0; i < frames * 2; i++) { int v = q[i]; sum += (double)v * v; if (v) nonzero++; if (v < 0) v = -v; if (v > peak) peak = v; }
+        n += frames * 2; uint64_t now = now_ns(); if (!t0) t0 = now;
+        if (now - t0 >= 5000000000ull) { fprintf(stderr, "[scarlet-audio] AudioOut level: rms %.4f peak %.4f over %.1f s, %llu samples, %llu nonzero\n",
+            n ? sqrt(sum / n) / 32768.0 : 0.0, peak / 32768.0, (now - t0) / 1e9, (unsigned long long)n, (unsigned long long)nonzero); sum = 0; n = nonzero = 0; peak = 0; t0 = now; }
+    }
     if (!frames) { memset(qb->mAudioData, 0, 4); qb->mAudioDataByteSize = 4; }   /* an empty buffer still has to come back */
     need(AudioQueueEnqueueBuffer(o->aq, qb, 0, NULL) == 0, "AudioOut enqueue");
 }

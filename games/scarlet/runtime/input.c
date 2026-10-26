@@ -109,12 +109,21 @@ static void bind_style_event(const uint32_t *id,void *event,int clear){
 }
 /* Scarlet: the keyboard / Pro Controller style pad is one dual unit (NpadJoyAssignmentMode_Dual = 0). */
 static int joy_assignment(const uint32_t *id){if(!id)runtime_fail("joy assignment id");input_log("joy assignment",*id);return 0;}
+/* Scarlet: controller colours (nn::hid::GetNpadControllerColor): the game asks for the left and right colours of a pad
+   when the player gets control and aborts on an error; the SDK's own code reads hid shared memory this host never maps.
+   NpadControllerColor is {main, sub} as RGBA bytes: neon blue / neon red Joy-Cons with dark buttons, or a Pro Controller. */
+static void put_color(uint8_t *out,uint32_t main_rgb,uint32_t sub_rgb){if(!out)runtime_fail("controller colour output");
+ const uint32_t c[2]={main_rgb,sub_rgb};for(int i=0;i<2;i++){out[4*i]=(uint8_t)(c[i]>>16);out[4*i+1]=(uint8_t)(c[i]>>8);out[4*i+2]=(uint8_t)c[i];out[4*i+3]=0xff;}}
+static uint32_t controller_color(uint8_t *out,const uint32_t *id){if(!id)runtime_fail("controller colour id");input_log("controller colour",*id);put_color(out,0x2d2d2d,0xe6e6e6);return 0;}
+static uint32_t controller_colors(uint8_t *left,uint8_t *right,const uint32_t *id){if(!id)runtime_fail("controller colour id");input_log("controller colours",*id);put_color(left,0x0ab9e6,0x001e1e);put_color(right,0xff3c28,0x1e1e1e);return 0;}
 /* Vibration devices and the six-axis sensor: runtime/hid_feedback.c (none unless TOTK_RUMBLE=1 / TOTK_GYRO=1). */
 void *runtime_input_override(const char *name){
  void *feedback=runtime_hid_feedback_override(name);if(feedback)return feedback;
  static const struct{const char *name;void *fn;} entries[]={
  {"_ZN2nn3hid27BindNpadStyleSetUpdateEventERKjPNS_2os15SystemEventTypeENS3_14EventClearModeE",bind_style_event},   /* Scarlet */
  {"_ZN2nn3hid20GetNpadJoyAssignmentERKj",joy_assignment},   /* Scarlet */
+ {"_ZN2nn3hid22GetNpadControllerColorEPNS0_19NpadControllerColorERKj",controller_color},   /* Scarlet */
+ {"_ZN2nn3hid22GetNpadControllerColorEPNS0_19NpadControllerColorES2_RKj",controller_colors},   /* Scarlet */
  {"_ZN2nn3hid14InitializeNpadEv",initialize},{"_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm",supported_ids},{"_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE",supported_styles},
  {"_ZN2nn3hid15GetNpadStyleSetERKj",style},{"_ZN2nn3hid13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj",full_states},
  {"_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj",disconnected_states},{"_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj",disconnected_states},

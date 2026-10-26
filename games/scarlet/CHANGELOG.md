@@ -286,3 +286,48 @@ autosave notice. The photo on the application is black (the scaled texture-to-te
 
 Audio: the AudioOut level line reads rms 0 with 0 nonzero callback frames over every 5 s window, so nothing audible
 is produced yet.
+
+### 2026-10-26: the opening plays; the player's room and the first save
+
+With the fixes below, A presses alone carry the game from "Enrollment complete!" through the whole opening: Naranja
+Academy, the classrooms and library, Director Clavell's introduction ("Director Clavell, Head of Naranja Academy"),
+the courtyard and front gate, the "Pokémon Scarlet" title over Paldea, a fly-over of Mesagoza and the lighthouse, then a
+loading screen, and gameplay: the player's room, "Now saving..." and the player at the desk with a "Get Up" prompt
+(left stick). The first save is written: `user-data/save/<id>/main`, 4.4 MB.
+
+- **Controller colours.** At about 250 s, as gameplay starts, the game aborted in the SDK (result 0x58cca). The call
+  stack named `SetControlPadRestrictionType`, but that frame was a return address at the start of the next symbol: the
+  aborting function is `nn::hid::GetNpadControllerColor(left, right, id)`, whose last instruction is the call to abort.
+  Both colour queries are now answered by the host (neon blue / neon red Joy-Cons, a dark Pro Controller), as the SDK's
+  own code reads hid shared memory this host never maps. Lesson kept: when a frame sits at +0x0 of a function, look at
+  the function before it.
+- **The first save.** Right after that the game crashed in `nn::oe::EnterExitRequestHandlingSection` (a null pointer in
+  the SDK's applet state). Scarlet brackets each save with Enter / LeaveExitRequestHandlingSection; the host has no HOME
+  menu exit request to hold back, so both are now host functions that only count the nesting depth.
+- **Scaling texture copies.** `copy_t2t` reported 1920x1080 to 480x270 copies as not implemented (one colour target,
+  RG11B10Float, and one Depth32Float_Stencil8). Both are now drawn as one triangle over the destination rectangle:
+  colour sampled nearest or linear as the copy flags say, depth (and stencil, through an X32_Stencil8 view) read texel
+  by texel and written from the fragment. Colour, non-integer and depth formats only; mirroring and format changes are
+  still reported. The black photo on the enrollment form is not fixed by this.
+- **RomFS reads.** One run stopped with "RomFS read failure": `pread` into guest memory returns EFAULT when the replay
+  write-protects the page again between `dm_guest_write_prepare` and the read (the kernel cannot take the dirty
+  tracker's fault). RomFS and save reads now prepare again and retry on EFAULT / EINTR, and report errno if they still fail.
+- **Memory pool buffers.** One run stopped because Metal refused the zero-copy buffer for a pool in pages the game had
+  just mapped. The pool path now waits for the GPU, lets deferred releases go and tries again, and logs the VM regions
+  of the range if the second try fails too.
+
+Audio: Scarlet's Wwise output goes through AudioOut (48 kHz stereo, to Core Audio), not the renderer, which only ever
+sees one update with no voices; that is why the renderer's level line read 0. AudioOut now has its own level line (and `SCARLET_AUDIO_VOICES=1` prints the renderer's voices every 5 s):
+silent for the first 10 s, then rms 0.013–0.022, peak 0.13–0.16, nearly every sample nonzero once the title music
+starts. Sound is produced; listening is still to do.
+
+Checked: 340 s with GPU submission on, A presses only, no crash; frames 1..9961 at about 30 fps.
+
+Unresolved question kept here: the vertex shaders add c0+0x640 (base vertex) to Metal's `vertex_id`, which already
+includes the base / first vertex, so a draw with a nonzero first vertex would be offset twice if Maxwell's vertex ID
+excludes it. Every draw of the 37 shaders that read c0+0x640 in two pass dumps has base 0 and first 0, so it is not
+tested either way yet.
+
+Seen, not fixed yet: the room is overexposed too; outdoor scenes in the opening are washed out (sky white, characters pale) and the sky has large
+dark / purple rectangles; some characters are drawn grey and white in some shots and fully coloured in others; the
+enrollment photo is black.

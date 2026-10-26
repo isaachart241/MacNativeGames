@@ -223,7 +223,12 @@ static unsigned read_file(uint64_t *out, uint64_t h, int64_t offset, void *buffe
     if (!(mode & OPEN_READ)) return R_OPEN_MODE;
     dm_guest_write_prepare(buffer, (size_t)size);
     uint64_t done = 0;
-    while (done < size) { ssize_t n = pread(fd, (uint8_t *)buffer + done, (size_t)(size - done), offset + (off_t)done); if (n < 0) runtime_fail("host save read failure"); if (!n) break; done += (uint64_t)n; }
+    for (int retries = 0; done < size;) {   /* EFAULT / EINTR: see runtime_romfs_read */
+        ssize_t n = pread(fd, (uint8_t *)buffer + done, (size_t)(size - done), offset + (off_t)done);
+        if (n < 0 && (errno == EFAULT || errno == EINTR) && retries++ < 64) { if (errno == EFAULT) dm_guest_write_prepare((uint8_t *)buffer + done, (size_t)(size - done)); continue; }
+        if (n < 0) runtime_fail("host save read failure");
+        if (!n) break;
+        done += (uint64_t)n; }
     *out = done; return 0;
 }
 static unsigned read_options(uint64_t *out, uint64_t h, int64_t off, void *buf, uint64_t size, const void *options) { (void)options; return read_file(out, h, off, buf, size); }

@@ -195,6 +195,22 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
         if(float_voices)memcpy(server->float_biquads,v2.biquads,sizeof v2.biquads);
     }
     for (int i = 0; i < ec; i++) r->effects[i] = effects[i];
+    /* Scarlet diagnostic SCARLET_AUDIO_VOICES=1: every 5 s, what the voices hold (in use, playing, formats, buffers queued,
+       the loudest PCM16 sample in the first playing voice's current buffer) and where they mix to. */
+    { static int on = -1; static uint64_t last; if (on < 0) on = getenv("SCARLET_AUDIO_VOICES") != NULL;
+      uint64_t now = runtime_now_ns();
+      if (on && now - last > 5000000000ull) { last = now; int used = 0, playing = 0, fmt[8] = {0}, queued = 0, first = -1, peak = 0;
+        for (int i = 0; i < r->param.voice_count; i++) { const ServerVoice *v = &r->voices[i]; if (!v->in.in_use) continue; used++;
+            if (v->in.sample_format < 8) fmt[v->in.sample_format]++;
+            for (int b = 0; b < 4; b++) queued += v->valid[b] || v->pending[b];
+            if (v->state == SV_STARTED) { playing++; if (first < 0) first = i; } }
+        if (first >= 0) { const ServerVoice *v = &r->voices[first]; const AudrenWaveBuffer *b = &v->buffers[v->index];
+            if (v->in.sample_format == FMT_PCM16 && b->address && b->size >= 2) { const int16_t *q = (const int16_t *)(uintptr_t)b->address;
+                for (uint64_t k = 0; k < b->size / 2 && k < 65536; k++) { int a = q[k] < 0 ? -q[k] : q[k]; if (a > peak) peak = a; } }
+            fprintf(stderr, "[scarlet-audio] voices: %d in use, %d playing, formats pcm16 %d adpcm %d f32 %d other %d, %d buffers queued; first playing #%d: %u Hz x%u vol %.2f mix %d splitter %u, buffer %#llx+%#llx peak %d\n",
+                used, playing, fmt[FMT_PCM16], fmt[FMT_ADPCM], fmt[FMT_PCMF32], used - fmt[FMT_PCM16] - fmt[FMT_ADPCM] - fmt[FMT_PCMF32], queued, first,
+                v->in.sample_rate, v->in.channel_count, v->in.volume, v->in.mix_id, v->in.splitter_id, (unsigned long long)b->address, (unsigned long long)b->size, peak);
+        } else fprintf(stderr, "[scarlet-audio] voices: %d in use, none playing, %d buffers queued\n", used, queued); } }
     if (getenv("TOTK_AUDIO_DUMP")) { static unsigned dumped; unsigned active = 0; for (int i=0;i<ec;i++) if (effects[i].enabled && effects[i].type) active++;
         if (active > dumped) { dumped = active; FILE *f = fopen("analysis/audio-effects.bin", "wb"); if (f) { fwrite(effects, sizeof *effects, ec, f); fclose(f); } }
     }

@@ -241,6 +241,12 @@ static void focus_mode(int mode) {if(mode<0||mode>3)runtime_fail("unknown focus 
 static int focus_state(void) {return runtime_front_focus();}
 static unsigned resume_notification,operation_notification,performance_notification;
 static void resume_enabled(unsigned value) {resume_notification=value&255;}
+/* Scarlet: the game brackets each save with Enter / LeaveExitRequestHandlingSection (an exit request from the HOME menu waits
+   until it leaves). The SDK's versions use applet state this host never creates and crash; the host has no exit request
+   to hold back, so it only counts the depth (a negative depth would be a game bug worth seeing). */
+static int exit_section_depth;
+static void enter_exit_section(void) {if(!exit_section_depth++)fprintf(stderr,"[scarlet] exit request handling section entered (a save is starting)\n");}
+static void leave_exit_section(void) {if(--exit_section_depth<0)runtime_fail("LeaveExitRequestHandlingSection without Enter");}
 static void operation_enabled(unsigned value) {operation_notification=value&255;}
 static void performance_enabled(unsigned value) {performance_notification=value&255;}
 static uint32_t performance_configuration[2];
@@ -297,6 +303,7 @@ void *runtime_override(const char *name) {
   {"_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi",performance_config},
   {"_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE",cpu_boost},{"_ZN2nn2oe16GetOperationModeEv",operation_mode},{"_ZN2nn2oe18GetPerformanceModeEv",performance_mode},
   {"_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE",focus_mode},{"_ZN2nn2oe20GetCurrentFocusStateEv",focus_state},
+  {"_ZN2nn2oe31EnterExitRequestHandlingSectionEv",enter_exit_section},{"_ZN2nn2oe31LeaveExitRequestHandlingSectionEv",leave_exit_section},   /* Scarlet */
   {"_ZN2nn2oe28SetResumeNotificationEnabledEb",resume_enabled},{"_ZN2nn2oe42SetOperationModeChangedNotificationEnabledEb",operation_enabled},{"_ZN2nn2oe44SetPerformanceModeChangedNotificationEnabledEb",performance_enabled},
   {"nndiagStartup",host_diag_init},{"_ZN2nn2oe10InitializeEv",host_oe_init},{"_ZN2nn3aoc10InitializeEv",host_aoc_init},
   {"_ZN2nn3aoc17CountAddOnContentEv",host_aoc_count},{"_ZN2nn3aoc16ListAddOnContentEPiii",host_aoc_list},

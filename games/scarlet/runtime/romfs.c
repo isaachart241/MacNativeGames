@@ -276,7 +276,12 @@ unsigned runtime_romfs_read(uint64_t *out,uint64_t h,int64_t offset,void *buffer
  dm_guest_write_prepare(buffer,(size_t)n);
  uint64_t t0=profile?runtime_now_ns():0;
  if(fd==image_fd&&image_map){memcpy(buffer,image_map+base+(uint64_t)offset,(size_t)n);done=n;}
- else while(done<n){size_t chunk=(size_t)(n-done);if(chunk>8<<20)chunk=8<<20;ssize_t r=src_pread(fd,(uint8_t *)buffer+done,chunk,(off_t)(base+(uint64_t)offset+done));if(r<=0)runtime_fail("RomFS read failure");done+=(uint64_t)r;}
+ /* Scarlet: the kernel's write into guest memory cannot take the dirty tracker's fault: a page the replay protects again
+    between dm_guest_write_prepare and pread fails the read with EFAULT. Prepared again and retried (EINTR likewise). */
+ else for(int retries=0;done<n;){size_t chunk=(size_t)(n-done);if(chunk>8<<20)chunk=8<<20;ssize_t r=src_pread(fd,(uint8_t *)buffer+done,chunk,(off_t)(base+(uint64_t)offset+done));
+  if(r<0&&(errno==EFAULT||errno==EINTR)&&retries++<64){if(errno==EFAULT)dm_guest_write_prepare((uint8_t *)buffer+done,chunk);continue;}
+  if(r<=0){fprintf(stderr,"[totk] RomFS read: %zd at %#llx+%#zx, errno %d (%s)\n",r,(unsigned long long)(base+(uint64_t)offset+done),chunk,r<0?errno:0,r<0?strerror(errno):"end of file");runtime_fail("RomFS read failure");}
+  done+=(uint64_t)r;}
  if(profile){uint64_t now=runtime_now_ns();atomic_fetch_add(&read_calls,1);atomic_fetch_add(&read_bytes,done);atomic_fetch_add(&read_ns,now-t0);atomic_fetch_add(&read_prepare_ns,t0-prep_start);
   uint64_t last=atomic_load(&read_report_ns);
   if(now-last>1000000000ULL&&atomic_compare_exchange_strong(&read_report_ns,&last,now))
