@@ -13,6 +13,10 @@ typedef struct {
 // bit 4 (TOTK) the vertex function emulates a sampler border colour Metal lacks (vs_fn_for, border_key).
 #define PSO_LAYERED 2u
 #define PSO_VBORDER 16u
+// bit 5 (Scarlet) transform feedback capture: the vertex function also writes the captured varyings (vs_fn_tf); bit 6 the
+// capture draw rasterizes nothing (rasterizer discard): no fragment function, rasterization disabled.
+#define PSO_TF 32u
+#define PSO_TFNR 64u
 
 typedef struct {
     uint8_t kind, fbmask;

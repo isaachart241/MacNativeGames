@@ -271,21 +271,6 @@ NVN_EXTRA(nvnTextureBuilderGetViewOffset, ptrdiff_t, const NVNtextureBuilder *b,
 }
 NVN_EXTRA(nvnProgramGetSubtileSize, void, const NVNprogram *p) { (void)p; die("nvnProgramGetSubtileSize: signature not identified"); }
 
-// ---------- Transform feedback (Scarlet): NOT EMULATED YET. Metal has no stream-out; these record nothing, so the captured
-// buffers keep whatever they held (zero for fresh memory) and a draw that consumes them (DrawTransformFeedback) is dropped.
-// Draws made while capture is on replay normally (games set rasterizer discard for them). Reported once each. ----------
-static void tf_unemulated(const char *what) { static int seen[8]; static const char *names[8]; int i = 0;
-    for (; i < 8 && names[i] && names[i] != what; i++) {}
-    if (i < 8 && !names[i]) names[i] = what;
-    if (i < 8 && !seen[i]++) LOG("[nvn] transform feedback is not emulated: %s recorded as nothing (captured data stays empty)", what); }
-NVN(nvnCommandBufferBindTransformFeedbackBuffer, void, NVNcommandBuffer *c, int i, NVNbufferAddress a, size_t n) { (void)c; (void)i; (void)a; (void)n; tf_unemulated("BindTransformFeedbackBuffer"); }
-NVN(nvnCommandBufferBindTransformFeedbackBuffers, void, NVNcommandBuffer *c, int first, int n, const NVNbufferRange *r) { (void)c; (void)first; (void)n; (void)r; tf_unemulated("BindTransformFeedbackBuffers"); }
-NVN(nvnCommandBufferBeginTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { (void)c; (void)a; tf_unemulated("BeginTransformFeedback"); }
-NVN(nvnCommandBufferEndTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { (void)c; (void)a; tf_unemulated("EndTransformFeedback"); }
-NVN(nvnCommandBufferPauseTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { (void)c; (void)a; tf_unemulated("PauseTransformFeedback"); }
-NVN(nvnCommandBufferResumeTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { (void)c; (void)a; tf_unemulated("ResumeTransformFeedback"); }
-NVN(nvnCommandBufferDrawTransformFeedback, void, NVNcommandBuffer *c, NVNdrawPrimitive p, NVNbufferAddress a) { (void)c; (void)p; (void)a; tf_unemulated("DrawTransformFeedback (draw dropped)"); }
-
 // ---------- ZCull (Tegra depth-cull cache): no Metal equivalent; zero storage is needed and save/restore have nothing to move ----------
 NVN(nvnTextureBuilderGetZCullStorageSize, size_t, const NVNtextureBuilder *b) { (void)b; return 0; }
 NVN(nvnTextureGetZCullStorageSize, size_t, const NVNtexture *t) { (void)t; return 0; }

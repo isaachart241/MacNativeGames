@@ -1757,6 +1757,25 @@ NVN(nvnCommandBufferSetRenderEnableConditional, void, NVNcommandBuffer *c, NVNco
 }
 // Rasterizer discard runs vertex work without rasterising; with no transform feedback that is the same as not drawing.
 NVN(nvnCommandBufferSetRasterizerDiscard, void, NVNcommandBuffer *c, uint32_t e) { REC(c, OP_RASTER_DISCARD, p_flag)->value = B(e) != 0; }
+// Scarlet: transform feedback, recorded for the replay (nvn_mtl.m tf_*), which captures the program's layout
+// (control section, tf_layout) from draws made while capture is on. DrawTransformFeedback is not supported yet.
+NVN(nvnCommandBufferBindTransformFeedbackBuffer, void, NVNcommandBuffer *c, int i, NVNbufferAddress a, size_t n) {
+    if (i < 0 || i > 3) die("transform feedback buffer %d", i);
+    p_tf_bind *b = REC(c, OP_TF_BIND, p_tf_bind); b->first = i; b->n = 1; b->addr[0] = a; b->size[0] = n;
+}
+NVN(nvnCommandBufferBindTransformFeedbackBuffers, void, NVNcommandBuffer *c, int first, int n, const NVNbufferRange *r) {
+    if (first < 0 || n < 0 || first + n > 4 || (n && !r)) die("transform feedback buffers %d+%d", first, n);
+    p_tf_bind *b = REC(c, OP_TF_BIND, p_tf_bind); b->first = first; b->n = n;
+    for (int k = 0; k < n; k++) { b->addr[k] = r[k].address; b->size[k] = r[k].size; }
+}
+static void tf_state(NVNcommandBuffer *c, int mode, NVNbufferAddress a) { p_tf_state *s = REC(c, OP_TF_STATE, p_tf_state); s->mode = mode; s->control = a; }
+NVN(nvnCommandBufferBeginTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { tf_state(c, 1, a); }
+NVN(nvnCommandBufferEndTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { tf_state(c, 2, a); }
+NVN(nvnCommandBufferPauseTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { tf_state(c, 3, a); }
+NVN(nvnCommandBufferResumeTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { tf_state(c, 4, a); }
+NVN(nvnCommandBufferDrawTransformFeedback, void, NVNcommandBuffer *c, NVNdrawPrimitive p, NVNbufferAddress a) {
+    (void)c; (void)p; (void)a; static int once; if (!once++) LOG("【红】[nvn] DrawTransformFeedback is not supported yet: draw dropped");
+}
 /* TOTK diagnostic: TOTK_BINDPROG_LOG=<frame_lo>-<frame_hi> prints every BindProgram of those frames with the program object, its
    vertex-stage shader data address and the guest call chain (module+offset), so a program choice can be traced to game code. */
 static uint64_t g_frame;

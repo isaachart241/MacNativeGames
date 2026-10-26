@@ -12,7 +12,7 @@ result. Game data, keys and saves are never committed.
 | 1 | Code and data out of the dump; code rewritten for Apple silicon | done 2026-10-25 |
 | 2 | The runtime fork boots to `nnMain` | done 2026-10-25 |
 | 3 | Every unknown service / NVN call answered until the first `nvnQueuePresentTexture` | done 2026-10-25 (submission off) |
-| 4 | Picture, audio, input, saves; frame-rate patches | |
+| 4 | Picture, audio, input, saves; frame-rate patches | in progress: picture and input to the first save |
 | 5 | Performance, shaders, packaging as an app | |
 
 ## Log
@@ -245,3 +245,44 @@ the crash).
 lldb helpers used here (kept outside the repository, easy to rewrite): a script that stops in the loader's
 `relocate`, reads main's base from `modules[0].base`, and then sets breakpoints or watchpoints at main offsets. The
 base changes every run because the loader maps main with mmap.
+
+### 2026-10-25: transform feedback, the colour LUT, enrollment complete
+
+**Transform feedback (emulated).** Four vertex shaders capture varyings (points, 3 buffers, rasterizer discard). NVN
+has no API for the layout; it is in the GLSLC control section of each vertex program: buffer count at +0x6ec, and per
+buffer b a varying code at +0xdc + 0x80·b (0x20 + N is `locnN`), its component count at +0x4dc + 0x80·b, the stride
+(u16) at +0x6dc + 2·b and an enable byte at +0x6e8 + b. Read for all four shaders; `tf_layout` rejects anything else.
+Bind / Begin / End / Pause / Resume now record `OP_TF_BIND` / `OP_TF_STATE`, and a capture draw (non-indexed point,
+line or triangle list) uses a vertex function variant (`vs_fn_tf`) that writes each captured varying to
+`buffer + slot * stride` before returning, slot = (vertex - first) + (instance - base instance) * count, with offsets
+advancing per draw as the hardware's do. With rasterizer discard the variant returns void and the pipeline has no
+fragment function, as Metal requires. A vertex-to-vertex/fragment barrier follows each capture draw.
+`DrawTransformFeedback` is still dropped (reported once); not seen called yet.
+
+**The colour grading LUT.** The tone-map pass samples a 32x32x32 3D texture that one draw fills: one triangle,
+32 instances, the vertex shader writing layer = instance + 1 (the tone-map shader samples one slice up to match).
+Opened as a plain pass, Metal ignored the layer and every instance landed on slice 0. `lay_self` now opens a layered
+pass over every layer of the targets when the draw's vertex shader writes the layer itself (no depth, no pending
+clear), and a draw like that inside a plain pass reopens it. Note for reading pass dumps: the `d` line printed 1 as
+the instance count of every non-indexed draw; it prints the real count now.
+
+**My regression, found the long way.** Adding the capture variant in `pso_desc` put the line that sets
+`d.fragmentFunction` at the end of a comment, so from then on every pipeline had no fragment function. Every screen
+came out magenta, which is the swapchain memory's initial content showing through. It looked like a missing pass
+after the name prompt (the screenshots before that were not retaken), so the search went through the LUT above
+(a real bug) before `DM_NVN_HILITE` showed that a draw with a replaced fragment function did land. Fixed by putting
+the assignment back on its own line. Lesson kept: retake an early screenshot after any change to `pso_desc`.
+
+Also fixed on the way:
+- The warm-up thread built a cached transform feedback pipeline from a shader loaded without its control section and
+  aborted; capture keys are skipped there and built on first use.
+- `pool_range_check` refused a 16 KiB memory pool whose two host pages were each write-protected by a different
+  neighbouring pool's dirty tracking (pools are 8 KiB aligned, host pages 16 KiB). Every page is now checked on its own.
+
+Checked, GPU submission on, 60 s, no crash, about 30 fps: language, look, the name prompt (software keyboard,
+`kbtype Thor`), then **"Are you ready to start the game with these settings?"** with the 3D character model, the
+Naranja Academy enrollment application with language and name filled in, and **"Enrollment complete!"** with the
+autosave notice. The photo on the application is black (the scaled texture-to-texture copy is the first suspect).
+
+Audio: the AudioOut level line reads rms 0 with 0 nonzero callback frames over every 5 s window, so nothing audible
+is produced yet.

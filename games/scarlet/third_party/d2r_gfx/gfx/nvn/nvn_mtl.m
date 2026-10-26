@@ -639,7 +639,11 @@ static void pool_range_check(uintptr_t a, uintptr_t b, const void *mem, uint64_t
             /* TOTK: pages our own dirty tracker write-protected (CPU-visible pool memory that is really read-write) are fine: they are
                mapped and resident, only the CPU page tables carry the temporary read-only bit. Anything else stays refused. */
             uintptr_t lo = ra < a ? a : (uintptr_t)ra, hi = ra + rs > b ? b : (uintptr_t)(ra + rs);
-            if ((ri.protection & VM_PROT_READ) && hi > lo && nvn_dirty_tracked((const void *)lo, hi - lo)) {
+            /* Scarlet: pools are 8 KiB aligned and host pages 16 KiB, so a small pool can sit on pages that two neighbouring pools
+               track (half a page each): every page must be tracked by some range, not the whole span by one. */
+            int tracked = (ri.protection & VM_PROT_READ) && hi > lo;
+            for (uintptr_t p = lo, pg = (uintptr_t)getpagesize(); tracked && p < hi; p = (p & ~(pg - 1)) + pg) tracked = nvn_dirty_tracked((const void *)p, MIN(hi, (p & ~(pg - 1)) + pg) - p);
+            if (tracked) {
                 static int said; if (said++ < 4) MLOG("memory pool %p+%#llx: pages at %#llx+%#llx are write-protected by the dirty tracker; accepted for the zero-copy GPU buffer", mem, (unsigned long long)size, (unsigned long long)lo, (unsigned long long)(hi - lo));
             } else
             MDIE("memory pool %p+%#llx: pages at %#llx+%#llx have protection %d, refused for a zero-copy GPU buffer", mem, (unsigned long long)size,
@@ -1245,6 +1249,8 @@ static inline void enc_r_address(id<MTL4RenderCommandEncoder> e, unsigned stage,
 }
 static inline void enc_r_vbuf(id<MTL4RenderCommandEncoder> e, NSUInteger i, uint64_t gpu) { enc_r_address(e, 0, i, gpu); }
 static inline void enc_r_args(id<MTL4RenderCommandEncoder> e, MTLRenderStages s, uint64_t gpu, NSUInteger i) { enc_r_address(e, s == MTLRenderStageVertex ? 0 : 1, i, gpu); }
+// Scarlet: an intra-pass barrier, in order with the draws whether they go through the render stream or not.
+static inline void enc_r_barrier(id<MTL4RenderCommandEncoder> e, MTLStages after, MTLStages before, MTL4VisibilityOptions vis) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_BARRIER,.u={after,before,vis}},1); else [e barrierAfterEncoderStages:after beforeEncoderStages:before visibilityOptions:vis]; }
 static inline void enc_r_draw(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_DRAW,.u={p,v,n}},1); else [e drawPrimitives:p vertexStart:v vertexCount:n]; }
 static inline void enc_r_draw_instanced(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n, NSUInteger i, NSUInteger b) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INSTANCED,.u={p,v,n,i,b}},1); else [e drawPrimitives:p vertexStart:v vertexCount:n instanceCount:i baseInstance:b]; }
 static inline void enc_r_draw_indexed(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger n, MTLIndexType t, uint64_t gpu, NSUInteger len, NSUInteger i, NSInteger bv, NSUInteger bi) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INDEXED,.u={p,n,t,gpu,len,i,(uint64_t)bv,bi}},1); else [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:gpu indexBufferLength:len instanceCount:i baseVertex:bv baseInstance:bi]; }
@@ -3669,7 +3675,7 @@ static id<MTL4RenderCommandEncoder> g_enc;
 static int rp_active(void) { return g_enc != nil; }
 // 当前渲染通道的目标信息：rp_begin 时由附件定一次，通道内各绘制共用（管线键、深度模板、视口 / 剪裁都只依赖它）
 // Target info of the current render pass: determined once from the attachments at rp_begin and shared by all draws in the pass (pipeline key, depth-stencil, viewport / scissor all depend only on it)
-static struct { uint32_t cfmt[8], dfmt, sfmt, samples; int hd, hs; NSUInteger tw, th; uint64_t serial, reg_gen, ser_gen, range_dirty; int range_external, range_depth_nonro; __unsafe_unretained id<MTLTexture> range_color, range_depth; int layered, mfx, noatt; } g_pass;
+static struct { uint32_t cfmt[8], dfmt, sfmt, samples; int hd, hs; NSUInteger tw, th; uint64_t serial, reg_gen, ser_gen, range_dirty; int range_external, range_depth_nonro; __unsafe_unretained id<MTLTexture> range_color, range_depth; int layered, mfx, noatt, self_layers; } g_pass;
 /* TOTK_MFX=interp (totk_mfx.m): the canvas is the float target the game composes the frame in and then copies to the
    presented texture (docked: 1920x1080, the 1600x900 scene upscaled into it; handheld: 1280x720, the scene drawn in it).
    Before the first UI draw into it (a TOTK UI vertex shader) the pass is ended and the canvas copied: that is the scene.
@@ -4036,11 +4042,14 @@ static uint64_t g_rt_merge_n;   // 累计续用次数 | Cumulative continuation 
    stored unchanged. Clears (g_rt_merged), sampled attachments, other targets and draws that cannot route their layer end the
    pass as before. TOTK_LAYER_MERGE=0 turns it off; it is also off with the experimental DM_NVN_TBDR rewrites. */
 #define LAY_BUF_INDEX 14        // vertex buffer slot of the layer constant (translated vertex functions use buffer 0, vertex attributes 16-30)
+#define TF_BUF_INDEX 13         // Scarlet: vertex buffer slot of the transform feedback capture block (tf_info, vs_fn_tf)
+static int g_tf_draw;           // Scarlet: the draw being encoded captures its varyings (draw_inner sets it; pso_get adds PSO_TF)
 #define LAY_MAX 256             // layers per layered pass
 #define LAY_MAX_EXTENT 256      // largest level merged (bounds the load / store of layers that stay untouched)
 static struct { int active, refuse, base, count, cur; uint64_t passes, merges, refused; } g_lay;   // refuse: open the next pass plain
 static int g_lay_probe_neg;     // probe-gpu-layer-merge negative controls: 1 every draw writes layer 0 of its pass, 2 no SetRenderTargets is merged
 static int lay_decide(int clear_only, int *first);
+static int lay_self(int clear_only, int *first);
 static int g_defer_replaying;
 static void fz_end(void);   // 可读 tile 通道合并的收尾（定义在 draw 之前） | Wrap-up of the readable-tile pass merge (defined before draw)
 static void defer_fallback(void);
@@ -4376,6 +4385,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     if (!R.has_rt) { RED_ONCE(3, "绘制前没有设置渲染目标"); g_rpb_why = 1; return nil; }
     int lay_first = 0, lay_n = lay_decide(clear_only, &lay_first);   // TOTK: layered pass over lay_n layers from lay_first (see g_lay)
     if (!lay_n && !clear_only && g_cg_force_layers) { lay_n = g_cg_force_layers; lay_first = 0; }   // TOTK: the merged cube-face-set pass (nvn_cube_group.h): six temps, one layer per member
+    int self_first = 0, self_n = lay_n ? 0 : lay_self(clear_only, &self_first);   // Scarlet: the draw's vertex shader picks the layer itself (lay_self)
     // 附件范围候选的版本在捕获任何附件之前取；建立途中有变化则不续用。
     // The version of the attachment-range candidate is taken before capturing any attachment; if it changes during setup, there is no continuation.
     uint64_t reg0 = 0, ser0 = 0, dirty0 = 0;
@@ -4483,7 +4493,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
             R.rt.color[i] ? R.rt.color[i]->d.format : 0, R.rt.color[i] ? R.rt.color[i]->d.width : 0, R.rt.color[i] ? R.rt.color[i]->d.height : 0, R.rt.has_cview[i], R.rt.color[i] && tex_mtl(R.rt.color[i]) ? 1 : 0);
         return nil;
     }
-    if (lay_n) pd.renderTargetArrayLength = (NSUInteger)lay_n;
+    if (lay_n || self_n) pd.renderTargetArrayLength = (NSUInteger)(lay_n ? lay_n : self_n);
     for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i] && zskip_zero_clear(i)) {
         g_zskip_cand_ok[i] = 1; g_zskip_cand[i] = (zskip_zero){R.rt.color[i]->serial, (uint16_t)(R.rt.has_cview[i] && R.rt.cview[i].set_levels ? R.rt.cview[i].base_level : 0), (uint16_t)(R.rt.has_cview[i] && R.rt.cview[i].set_layers ? R.rt.cview[i].min_layer : 0)};
     }
@@ -4493,7 +4503,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     for (int i = 0; i < R.rt.n; i++) {
         MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[i];
         if (!c.texture) continue;
-        uint64_t b = att_bytes(c.texture, c.level) * (uint64_t)(lay_n ? lay_n : 1); natt++; g_bw_store += b; if (c.loadAction == MTLLoadActionLoad) { g_bw_load += b; nload++; }
+        uint64_t b = att_bytes(c.texture, c.level) * (uint64_t)(lay_n ? lay_n : self_n ? self_n : 1); natt++; g_bw_store += b; if (c.loadAction == MTLLoadActionLoad) { g_bw_load += b; nload++; }
         if (R.rt.has_cview[i] && R.rt.cview[i].set_format) PD("V %llu c%d 视图格式 %#x（基贴图 NVN 格式 %#x）", g_stat_pass + 1, i, R.rt.cview[i].format, R.rt.color[i]->d.format);
         PD("P %llu c%d ser=%llu fmt=%lu %lux%lu ms%lu lv%lu sl%lu %s clear=%g,%g,%g,%g mem=%p", g_stat_pass + 1, i, R.rt.color[i]->serial, (unsigned long)c.texture.pixelFormat,
            (unsigned long)c.texture.width, (unsigned long)c.texture.height, (unsigned long)c.texture.sampleCount, (unsigned long)c.level, (unsigned long)c.slice,
@@ -4536,7 +4546,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
         g_pass.dfmt = g_pass.hd ? (uint32_t)dt.pixelFormat : 0; g_pass.sfmt = stt ? (uint32_t)stt.pixelFormat : 0;
         if (dt || stt) g_pass.samples = (uint32_t)(dt ? dt : stt).sampleCount;
         pass_dims(pd, (NSUInteger)R.rt.n, &g_pass.tw, &g_pass.th);
-        g_pass.layered = lay_n != 0; g_pass.noatt = noatt;
+        g_pass.layered = lay_n != 0; g_pass.noatt = noatt; g_pass.self_layers = self_n;
         if (rt_range_on()) { g_pass.reg_gen = reg0; g_pass.ser_gen = ser0; }
         if (rt_range_on()) { g_pass.range_dirty=dirty0; g_pass.range_color=pd.colorAttachments[0].texture; g_pass.range_depth=pd.depthAttachment.texture; }
         g_enc_pso = nil; g_enc_dss = nil;
@@ -4559,6 +4569,8 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     if (lay_n) { g_lay.active = 1; g_lay.base = g_lay.cur = lay_first; g_lay.count = lay_n; if (g_cg_force_layers) g_lay.cur = g_cg_cur;
         if (!g_lay.passes++) MLOG("[totk] layered pass: first one covers layers %d-%d of a %lux%lu level", lay_first, lay_first + lay_n - 1, (unsigned long)g_pass.tw, (unsigned long)g_pass.th);
         PD("L %llu 分层通道 层 %d-%d", g_stat_pass, lay_first, lay_first + lay_n - 1); }
+    if (self_n) { static int once; if (!once++) MLOG("[layer] first pass whose vertex shader picks the layer: %d layers from %d of a %lux%lu level", self_n, self_first, (unsigned long)g_pass.tw, (unsigned long)g_pass.th);
+        PD("L %llu 着色器自选层的分层通道 %d 层（起 %d）", g_stat_pass, self_n, self_first); }
     if (enc_label_on()) { id<MTLTexture> lt = pd.colorAttachments[0].texture ?: pd.depthAttachment.texture ?: pd.stencilAttachment.texture; g_el_w = (int)lt.width; g_el_h = (int)lt.height; g_el_draws = 0; g_el_key[0] = 0; }
     return g_enc;
 }
@@ -4645,7 +4657,7 @@ static void shmap_load(void) {
     warm_start();
 }
 
-@interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, writes_depth, lay_ok, writes_layer;   /* writes_layer (Scarlet): the MSL writes [[render_target_array_index]] itself */ uint8_t drv_scanned[3];   /* drv_scanned (TOTK): driver segment c0 / c2 reads found by drv_scan in the MSL but missing from the reflection json */ /* lay_ok (TOTK): vertex MSL can write the layer (1) or not (-1), 0 = not checked yet; writes_depth (TOTK): the fragment function has a [[depth(...)]] output, so its pipeline needs a depth attachment */ const char *builtin; uint64_t logged; char key[80]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
+@interface NvShader : NSObject { @public id<MTLFunction> fn; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, writes_depth, lay_ok, writes_layer; uint8_t tf_n, tf_parsed, tf_slot[4], tf_ncomp[4]; uint16_t tf_stride[4];   /* tf_* (Scarlet): transform feedback layout from the control section (tf_layout); tf_n 0 none, 0xff not understood */   /* writes_layer (Scarlet): the MSL writes [[render_target_array_index]] itself */ uint8_t drv_scanned[3];   /* drv_scanned (TOTK): driver segment c0 / c2 reads found by drv_scan in the MSL but missing from the reflection json */ /* lay_ok (TOTK): vertex MSL can write the layer (1) or not (-1), 0 = not checked yet; writes_depth (TOTK): the fragment function has a [[depth(...)]] output, so its pipeline needs a depth attachment */ const char *builtin; uint64_t logged; char key[80]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     uint16_t texture_slots[NVN_REFL_MAXB]; uint8_t texture_count, texture_plan_ready;
     // 上次编好的参数缓冲
     // The argument buffer encoded last time
@@ -4995,6 +5007,25 @@ static id<MTLFunction> shader_fn(id<MTLLibrary> lib, NSString *name) {
     if (!s) MLOG("【红】shader function %s declares function constants and could not be specialized: %s", name.UTF8String, e.localizedDescription.UTF8String);
     return s;
 }
+/* Scarlet: a vertex program's transform feedback layout, read from its GLSLC control section. Decoded from the three
+   capturing vertex shaders seen (2026-10-25), each writing three vec4 varyings: +0x6ec buffer count; per buffer b,
+   +0xdc + 0x80b the captured varying (0x20 + N = user(locnN)), +0x4dc + 0x80b the component count from x, +0x6dc + 2b the
+   stride in bytes, +0x6e8 + b enabled. Anything outside that pattern is marked not understood (0xff) and its capture draws
+   are skipped with a message rather than guessed. */
+static void tf_layout(NvShader *sh, const uint8_t *c) {
+    if (sh->tf_parsed) return; sh->tf_parsed = 1; sh->tf_n = 0;
+    unsigned n = c[0x6ec]; if (!n) return;
+    int ok = n <= 4;
+    for (unsigned b = 0; ok && b < n; b++) {
+        unsigned code = c[0xdc + 0x80 * b], comps = c[0x4dc + 0x80 * b]; uint16_t stride; memcpy(&stride, c + 0x6dc + 2 * b, 2);
+        ok = code >= 0x20 && code < 0x40 && comps >= 1 && comps <= 4 && stride >= 4 * comps && !(stride & 3) && c[0x6e8 + b] == 1;
+        for (unsigned k = 0; ok && k < 0x80; k++) if (k != 0x0c && c[0xd0 + 0x80 * b + k] && 0xd0 + 0x80 * b + k < 0x4d0) ok = 0;   // only the one byte per record
+        if (ok) { sh->tf_slot[b] = (uint8_t)(code - 0x20); sh->tf_ncomp[b] = (uint8_t)comps; sh->tf_stride[b] = stride; }
+    }
+    sh->tf_n = ok ? (uint8_t)n : 0xff;
+    MLOG("[tf] vertex shader %s: transform feedback layout %s (%u buffers%s)", sh->key, ok ? "understood" : "NOT understood", n,
+         ok ? [[NSString stringWithFormat:@": %@", ^{ NSMutableString *s = [NSMutableString string]; for (unsigned b = 0; b < n; b++) [s appendFormat:@"%s locn%u x%u stride %u", b ? "," : "", sh->tf_slot[b], sh->tf_ncomp[b], sh->tf_stride[b]]; return s; }()] UTF8String] : "");
+}
 static NvShader *shader_load(NSString *pc, int stage) {
     NSError *e = nil;
     // TOTK: runtime translations are MSL source compiled here (macOS allows runtime compilation); the OS caches compiled code.
@@ -5133,6 +5164,7 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
         NvShader *sh=shader_get([variant stringByAppendingString:@"_b"],st);
         if(!sh)MDIE("TOTK shader translation/reflection unavailable for %s",variant.UTF8String);
         o->sh[st]=sh; o->ctl[st]=control; o->code[st]=(const uint8_t *)(uintptr_t)p->sd[i].data; o->key[st]=@(key);
+        if (st == 0) tf_layout(sh, control);   // Scarlet: transform feedback layout
         o->sig[st]=stage_sig(st); o->alt[st]=[NSMutableDictionary dictionaryWithObject:sh forKey:@(o->sig[st])];
     }
     if (p->serial) serial_put(p->serial, o);
@@ -5593,7 +5625,7 @@ static struct {
     p_bind_buf ubo[6][16], ssbo[6][16];
     uint64_t tex[6][128], samp[6][128], img[6][32];
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
-    p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp; int depth_clamp; int render_disabled; int raster_discard;
+    p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp; int depth_clamp; int render_disabled; int raster_discard; uint64_t tf_addr[4], tf_size[4], tf_off[4]; int tf_active;   /* Scarlet: transform feedback buffers, bytes captured into each, capture on (OP_TF_*) */
     float blend_color[4]; int64_t copy_stride;
 } S;
 // No render target set: no colour target and no depth / stencil (a pass of rasterization only, see rp_begin_ex)
@@ -6018,6 +6050,61 @@ static id<MTLFunction> vs_fn_for(NvShader *vs, NvShader *fs, int layered, int bo
     os_unfair_lock_unlock(&lk);
     return f;
 }
+/* Scarlet: transform feedback capture variant of a vertex function. Besides its normal outputs it writes, before every
+   return, the captured components of each buffer's varying to tf_info.b[b] + slot * stride / 4, slot = (vertex - first) +
+   (instance - base instance) * count: the order a plain list or point draw emits vertices in (draw_inner only sends those).
+   The block is at buffer TF_BUF_INDEX (tf_info_gpu): four device pointers, four strides, first, count, base instance. */
+static id<MTLFunction> vs_fn_tf(NvShader *vs, int noraster) {   // noraster: returns void (Metal requires it without rasterization)
+    static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
+    if (!vs->tf_n || vs->tf_n == 0xff) MDIE("vertex shader %s: transform feedback variant without an understood layout", vs->key);
+    os_unfair_lock_lock(&lk);
+    NSString *vkey = noraster ? @"tfnr" : @"tf";
+    id<MTLFunction> f = vs->vpatch[vkey];
+    if (!f) {
+        NSString *src = sh_src(vs);
+        NSRegularExpression *field = [NSRegularExpression regularExpressionWithPattern:@"\\n\\s*(\\w+)\\s+(\\w+)\\s*\\[\\[user\\(locn(\\d+)\\)\\]\\];" options:0 error:nil];
+        NSMutableDictionary<NSNumber *, NSArray<NSString *> *> *locn = [NSMutableDictionary dictionary];
+        for (NSTextCheckingResult *m in [field matchesInString:src options:0 range:NSMakeRange(0, src.length)])
+            locn[@([[src substringWithRange:[m rangeAtIndex:3]] intValue])] = @[[src substringWithRange:[m rangeAtIndex:1]], [src substringWithRange:[m rangeAtIndex:2]]];
+        NSString *entry = @"vertex main0_out main0(";
+        NSRange er = [src rangeOfString:entry];
+        if (er.location == NSNotFound) MDIE("vertex shader %s: no main0 entry for the transform feedback variant", vs->key);
+        NSRange close = [src rangeOfString:@")" options:0 range:NSMakeRange(er.location, src.length - er.location)];
+        NSString *params = [src substringWithRange:NSMakeRange(NSMaxRange(er), close.location - NSMaxRange(er))];
+        NSString *(^builtin)(NSString *) = ^NSString *(NSString *attr) {   // name of an existing [[vertex_id]] / [[instance_id]] parameter, or nil
+            NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:[NSString stringWithFormat:@"(\\w+)\\s*\\[\\[%@\\]\\]", attr] options:0 error:nil];
+            NSTextCheckingResult *m = [re firstMatchInString:params options:0 range:NSMakeRange(0, params.length)];
+            return m ? [params substringWithRange:[m rangeAtIndex:1]] : nil; };
+        NSString *vid = builtin(@"vertex_id"), *iid = builtin(@"instance_id");
+        NSMutableString *add = [NSMutableString stringWithFormat:@"constant totk_tf_info& totk_tf [[buffer(%d)]], ", TF_BUF_INDEX];
+        if (!vid) { vid = @"totk_tf_vid"; [add appendString:@"uint totk_tf_vid [[vertex_id]], "]; }
+        if (!iid) { iid = @"totk_tf_iid"; [add appendString:@"uint totk_tf_iid [[instance_id]], "]; }
+        NSMutableString *write = [NSMutableString stringWithFormat:@"{ uint totk_slot = (%@ - totk_tf.first) + (%@ - totk_tf.base_instance) * totk_tf.count;", vid, iid];
+        for (unsigned b = 0; b < vs->tf_n; b++) {
+            NSArray<NSString *> *fv = locn[@(vs->tf_slot[b])];
+            if (!fv) MDIE("vertex shader %s: transform feedback buffer %u captures locn%u, which it does not write", vs->key, b, vs->tf_slot[b]);
+            int integer = [fv[0] hasPrefix:@"int"] || [fv[0] hasPrefix:@"uint"];
+            [write appendFormat:@" { device float *p = totk_tf.b[%u] + totk_slot * (totk_tf.stride[%u] / 4u);", b, b];
+            for (unsigned c = 0; c < vs->tf_ncomp[b]; c++)
+                [write appendFormat:integer ? @" p[%u] = as_type<float>(out.%@.%c);" : @" p[%u] = out.%@.%c;", c, fv[1], "xyzw"[c]];
+            [write appendString:@" }"];
+        }
+        [write appendString:noraster ? @" return; }" : @" return out; }"];
+        NSString *patched = [src stringByReplacingCharactersInRange:er withString:[(noraster ? @"vertex void main0(" : entry) stringByAppendingString:add]];
+        patched = [patched stringByReplacingOccurrencesOfString:@"return out;" withString:write];
+        NSRange sr = [patched rangeOfString:@"struct main0_out"];
+        if (sr.location == NSNotFound) MDIE("vertex shader %s: no main0_out for the transform feedback variant", vs->key);
+        patched = [patched stringByReplacingCharactersInRange:NSMakeRange(sr.location, 0) withString:@"struct totk_tf_info { device float *b[4]; uint stride[4]; uint first, count, base_instance, pad; };\n\n"];
+        NSError *e = nil; id<MTLLibrary> lib = totk_msl_library(patched, &e);
+        f = shader_fn(lib, vs->fn.name);
+        if (!f) MDIE("vertex shader %s (transform feedback variant): %s", vs->key, e.localizedDescription.UTF8String);
+        if (!vs->vpatch) vs->vpatch = [NSMutableDictionary dictionary];
+        vs->vpatch[vkey] = f;
+        MLOG("[tf] vertex shader %s: transform feedback variant built (%u buffers%s)", vs->key, vs->tf_n, noraster ? ", no rasterization" : "");
+    }
+    os_unfair_lock_unlock(&lk);
+    return f;
+}
 // MSL of a depth-exporting fragment function with the depth output kept as a local (see fs_fn_without_depth).
 static NSString *fs_src_without_depth(NvShader *fs) {
     NSRegularExpression *decl = [NSRegularExpression regularExpressionWithPattern:@"float\\s+(\\w+)\\s*\\[\\[depth\\([^)]*\\)\\]\\]\\s*;" options:0 error:nil];
@@ -6169,7 +6256,9 @@ static void nan_trace_bind(id<MTL4RenderCommandEncoder> en) {
 }
 static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> fsfn, int merged) {
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-    d.vertexFunction = vs_fn_for(vs, fs, (k->a2c & PSO_LAYERED) != 0, (k->a2c & PSO_VBORDER) != 0); d.fragmentFunction = fsfn ? fsfn : fs ? (k->dfmt ? fs->fn : fs_fn_without_depth(fs)) : nil;
+    d.vertexFunction = vs_fn_for(vs, fs, (k->a2c & PSO_LAYERED) != 0, (k->a2c & PSO_VBORDER) != 0);
+    if (k->a2c & PSO_TF) d.vertexFunction = vs_fn_tf(vs, (k->a2c & PSO_TFNR) != 0);   // Scarlet: transform feedback capture variant
+    d.fragmentFunction = fsfn ? fsfn : fs ? (k->dfmt ? fs->fn : fs_fn_without_depth(fs)) : nil;
     if (!fsfn && nan_trace_match(fs) && !fs->writes_depth) d.fragmentFunction = nan_trace_fn(fs);   // diagnostic TOTK_NAN_TRACE
     // 诊断 DM_NVN_HILITE=片元着色器键,…：这些绘制改用纯色片元（第 1–6 个键依次 品红 / 绿 / 青 / 黄 / 蓝 / 白），看几何落在哪里
     // Diagnostic DM_NVN_HILITE=fragment shader key,...: these draws use a solid-color fragment instead (keys 1–6 in order magenta / green / cyan / yellow / blue / white), to see where the geometry lands
@@ -6210,6 +6299,7 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
     // Scarlet: vertex shaders that write the layer themselves (gl_Layer from the vertex stage) need the topology class too;
     // Metal refused 12 such pipelines without it. Triangles, as for TOTK's layered passes.
     else if (vs && vs->writes_layer) d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+    if (k->a2c & PSO_TFNR) { d.fragmentFunction = nil; d.rasterizationEnabled = NO; }   // Scarlet: capture with rasterizer discard
     for (int i = 0; i < 8; i++) {
         if (!k->cfmt[i]) continue;
         MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[i];
@@ -6333,6 +6423,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (!vs) { RED_ONCE(13, "程序没有顶点着色器（或未映射）"); return nil; }
     pso_key k; pso_key_fill(&k, vs, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, g_pso_lmap != NULL);
     if (g_pass.layered) k.a2c |= PSO_LAYERED;   // TOTK: layered pass (see g_lay)
+    if (g_tf_draw) k.a2c |= PSO_TF | (S.raster_discard ? PSO_TFNR : 0);   // Scarlet: transform feedback capture (draw_inner)
     if (g_mfx.role) k.a2c |= (uint32_t)g_mfx.role << 2;   // TOTK_MFX: scene / UI copy variant (see pso_desc)
     if (g_pso_lmap) { memcpy(k.lmap, g_pso_lmap, 8); k.fsfn = (__bridge void *)g_pso_fsfn; }
     __unsafe_unretained id<MTLFunction> bfn = !g_pso_lmap && !g_mfx.role ? fs_fn_border(fs, k.dfmt == 0) : nil;   // TOTK: sampler border colour emulation
@@ -6575,6 +6666,8 @@ static void warm_worker(NSArray<NSString *> *paths, NSArray<NSString *> *files,
                         warm_enqueue(item);
                     } else if ([c[0] isEqualToString:@"R"] && c.count >= 2) {
                         pso_skey sk; if (pso_skey_parse(c[1].UTF8String, &sk)) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
+                        // Scarlet: a capture variant needs the layout from the control section, which a shader loaded here lacks; built on first use
+                        if (sk.k.a2c & PSO_TF) { warm_task_done(&done,total,shader_total,pipeline_total,dict); continue; }
                         NSString *vkey = warm_key(sk.vs, sizeof sk.vs), *fkey = warm_key(sk.fs, sizeof sk.fs);
                         NvShader *vs = vkey.length ? warm_shader(dict, vkey, sk.vs_stage) : nil;
                         NvShader *fs = fkey.length ? warm_shader(dict, fkey, sk.fs_stage) : nil;
@@ -7539,6 +7632,32 @@ static int lay_decide(int clear_only, int *first) {
     int hi = lay_scan(g_exec_cur + h.size, &R.rt, *first, (int)layers);
     return hi > *first ? hi - *first + 1 : 0;
 }
+/* Scarlet: a draw whose vertex shader writes the layer itself (the colour grading LUT: one triangle, 32 instances, layer =
+   instance + 1 into a 32-deep 3D texture; the tone-map pass samples it one slice up) needs a layered pass over every layer
+   of its targets, else Metal ignores the layer and every instance lands on the first one. No depth, no pending clear. */
+static int lay_self(int clear_only, int *first) {
+    if (clear_only || !g_exec_cur || R.rt.depth || R.rt.n < 1) return 0;
+    op_hdr h; memcpy(&h, g_exec_cur, sizeof h);
+    if (h.op != OP_DRAW && h.op != OP_DRAW_IDX) return 0;
+    NvProg *pr = S.prog ? prog_get(S.prog) : nil;
+    if (!pr || !pr->sh[0] || !pr->sh[0]->writes_layer) return 0;
+    int n = 0;
+    for (int i = 0; i < R.rt.n && i < 8; i++) {
+        if (!R.rt.color[i]) continue;
+        id<MTLTexture> t = tex_mtl(R.rt.color[i]);
+        if (R.clear_c[i] || !t || t.sampleCount != 1) return 0;
+        const view_t *v = R.rt.has_cview[i] ? &R.rt.cview[i] : NULL;
+        NSUInteger lv = v && v->set_levels ? v->base_level : 0;
+        int f = v && v->set_layers ? v->min_layer : 0;
+        int all = t.textureType == MTLTextureType3D ? (int)mip_extent(t.depth, lv) : t.textureType == MTLTextureType2DArray ? (int)t.arrayLength :
+                  t.textureType == MTLTextureTypeCube ? 6 : 0;
+        int m = v && v->set_layers && v->nlayers ? MIN((int)v->nlayers, all - f) : all - f;
+        if (m < 2 || (n && m != n)) return 0;
+        if (!n) *first = f;
+        n = m;
+    }
+    return n;
+}
 // SetRenderTargets in a layered pass: another layer of its range continues the pass (g_rt_merged: a clear or a draw that
 // samples the attachment ends it, as for a same-target continuation).
 static int lay_continue(const p_set_rt *r) {
@@ -7683,6 +7802,14 @@ static int state_op(uint32_t op, const void *a) {
         case OP_RENDER_ENABLE: S.render_disabled = !((const p_flag *)a)->value; break;
         case OP_RENDER_COND: S.render_disabled = !cond_eval(a, (const uint8_t *)a - 8); PD("E cond addr=%#llx mode=%d -> %s", (unsigned long long)((const p_render_cond *)a)->addr, ((const p_render_cond *)a)->mode, S.render_disabled ? "disabled" : "enabled"); break;
         case OP_RASTER_DISCARD: S.raster_discard = ((const p_flag *)a)->value; break;
+        case OP_TF_BIND: { const p_tf_bind *tb = (const p_tf_bind *)a;   // Scarlet: transform feedback buffers (offsets restart at 0)
+            for (int k = 0; k < tb->n; k++) { int i = tb->first + k; S.tf_addr[i] = tb->addr[k]; S.tf_size[i] = tb->size[k]; S.tf_off[i] = 0; }
+            break; }
+        case OP_TF_STATE: { const p_tf_state *ts = (const p_tf_state *)a;   // 1 begin (from offset 0), 2 end, 3 pause, 4 resume (keeps the offsets)
+            if (ts->mode == 1) { S.tf_active = 1; memset(S.tf_off, 0, sizeof S.tf_off); }
+            else if (ts->mode == 2 || ts->mode == 3) S.tf_active = 0;
+            else if (ts->mode == 4) S.tf_active = 1;
+            break; }
         default: return 0;
     }
     return 1;
@@ -9820,11 +9947,43 @@ static int mfxup_draw(NvProg *pr) {
     return 0;
 }
 #include "nvn_cube_group.h"
+/* Scarlet: the transform feedback capture block of a plain draw (vs_fn_tf reads it at TF_BUF_INDEX): the GPU address of
+   each buffer at its current offset, the strides, first vertex, vertex count and base instance; then the offsets advance by
+   what the draw writes. 0 when a buffer is unbound, too small or outside the memory pools (the draw is skipped). */
+static int tf_bind(id<MTL4RenderCommandEncoder> en, const p_draw *dw, NvShader *vs) {
+    struct { uint64_t b[4]; uint32_t stride[4]; uint32_t first, count, base_instance, pad; } info; memset(&info, 0, sizeof info);
+    uint32_t inst = dw->instances > 1 ? (uint32_t)dw->instances : 1, n = (uint32_t)dw->count * inst;
+    for (unsigned b = 0; b < vs->tf_n; b++) {
+        uint64_t need = (uint64_t)n * vs->tf_stride[b]; void *mb; uint64_t mo, gpu;
+        if (!S.tf_addr[b] || S.tf_off[b] + need > S.tf_size[b]) {
+            RED_ONCE(122, "transform feedback buffer %u: %llu + %llu bytes past its %llu (or unbound): capture draw skipped", b,
+                     (unsigned long long)S.tf_off[b], (unsigned long long)need, (unsigned long long)S.tf_size[b]); return 0; }
+        if (!mtl_gpu_addr(S.tf_addr[b] + S.tf_off[b], need ? need : 4, &mb, &mo, &gpu)) { RED_ONCE(123, "transform feedback buffer %u outside every memory pool: capture draw skipped", b); return 0; }
+        info.b[b] = gpu; info.stride[b] = vs->tf_stride[b];
+    }
+    info.first = (uint32_t)dw->first; info.count = (uint32_t)dw->count; info.base_instance = (uint32_t)dw->base_instance;
+    id<MTLBuffer> buf; size_t off = arena_alloc(sizeof info, &buf); memcpy((uint8_t *)buf.contents + off, &info, sizeof info);
+    enc_r_vbuf(en, TF_BUF_INDEX, g_cur_arena->gpu + off);
+    for (unsigned b = 0; b < vs->tf_n; b++) S.tf_off[b] += (uint64_t)n * vs->tf_stride[b];
+    static int once; if (!once++) MLOG("[tf] first capture draw: %u vertices into %u buffers (vertex shader %s)", n, vs->tf_n, vs->key);
+    return 1;
+}
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
     g_draw_params[0] = di ? di->base_vertex : dw ? dw->first : 0;   // Scarlet: driver segment c0 + 0x640 (driver_bank_fill)
     g_draw_params[1] = di ? di->base_instance : dw ? dw->base_instance : 0; g_draw_params[2] = 0;
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
+    /* Scarlet: transform feedback capture (vs_fn_tf, tf_bind): capture on, the vertex shader's layout understood, and a plain
+       point / line / triangle list (their vertex order is the capture order). Other capture draws are skipped and reported. */
+    int tfd = 0;
+    if (S.tf_active && !S.render_disabled && pr && !pr->missing) {
+        __unsafe_unretained NvShader *tv = pr->sh[0]; int prim = dw ? dw->prim : di ? di->prim : -1;
+        if (!tv || !tv->tf_n || tv->tf_n == 0xff) { RED_ONCE(124, "transform feedback is on but vertex shader %s has no understood capture layout: draw skipped", tv ? tv->key : "-"); g_draw_skip[4]++; return; }
+        if (di || (g_ind_gpu && g_ind_cur == dw) || !(prim == 0 || prim == 1 || prim == 4)) {
+            RED_ONCE(125, "transform feedback with %s draw (primitive %d): not emulated, draw skipped", di ? "an indexed" : "an indirect or strip / quad", prim); g_draw_skip[4]++; return; }
+        tfd = 1;
+    }
+    g_tf_draw = tfd;
     if (pr && pr->missing) { g_draw_skip[15]++; return; }   // TOTK (iOS): a stage is not translated yet
     if (g_nupd) upd_guard_draw(pr, di);   // TOTK: before any encoder or texture preparation of this draw
     { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { g_draw_skip[15]++; return; } if (fit) g_pso_dirty = 1; }
@@ -9832,16 +9991,16 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     geometry_dump(pr, dw, di);
     if (di && di->itype == 0 && di->count && pend_hits(di->ibuf, (uint64_t)di->count)) widen_indices_gpu(di);
     /* Merge/skip checks can resolve sampling views too; prepare before any of those checks. */
-    if (!S.render_disabled && !S.raster_discard) { prepare_draw_textures(pr); if (mfxup_draw(pr)) return; }   // docked: MetalFX wrote the canvas instead of this draw
+    if (!S.render_disabled && (!S.raster_discard || tfd)) { prepare_draw_textures(pr); if (!tfd && mfxup_draw(pr)) return; }   // docked: MetalFX wrote the canvas instead of this draw
     if (g_ruler_truth == 0) {   // 尺子负对照（DM_NVN_RULER_NEG=<片元键>）：被测模式下丢掉该着色器的绘制，尺子必须报不等价 | Ruler negative control (DM_NVN_RULER_NEG=<fragment key>): in the mode under test drop this shader's draws, and the ruler must report non-equivalence
         static const char *neg; static int ng = -1; if (ng < 0) { neg = getenv("DM_NVN_RULER_NEG"); ng = neg && *neg; }
         if (ng && pr) for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (sh && sh->stage == 1 && !strncmp(sh->key, neg, strlen(neg))) { static int once; if (!once++) MLOG("DM_NVN_RULER_NEG：被测模式丢弃着色器 %s 的绘制", sh->key); return; } }
     }
-    if (zskip_can_draw(pr)) {   // 零源跳过：输出恒为 0、写 0 盖 0，这次绘制不改变任何结果（见 zskip_can_draw） | Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
+    if (!tfd && zskip_can_draw(pr)) {   // 零源跳过：输出恒为 0、写 0 盖 0，这次绘制不改变任何结果（见 zskip_can_draw） | Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
         g_zskip_count++; { static int once; if (!once++) MLOG("零源跳过：首例 通道 %llu", g_stat_pass + 1); }
         PD("N %llu 零源跳过", g_stat_pass + 1); g_draw_skip[1]++; return; }
     if (!g_defer_replaying) {
-        if (g_defer.active && g_defer.in_p && !g_defer.at_q) { if (defer_take(dw, di)) { g_draw_skip[2]++; return; } }
+        if (!tfd && g_defer.active && g_defer.in_p && !g_defer.at_q) { if (defer_take(dw, di)) { g_draw_skip[2]++; return; } }
     }
     /* Diagnostic: sample the HDR texture immediately before tone mapping.
        The same allocation is reused by FXAA later, so reading it at present
@@ -9950,7 +10109,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
                  t ? t->t.d.width : 0, t ? t->t.d.height : 0, t ? t->t.d.format : 0, t ? t->t.d.target : 0, t ? t->t.has_layout : 0, t ? (void *)t->t.mem : NULL, t ? (unsigned long long)t->t.serial : 0ull); } } }
     if (S.color.logic_op != NVN_LOGIC_OP_COPY || (S.color.alpha_func && S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS))
         RED_ONCE(70, "TOTK: logic op %u / alpha test %u not implemented on Metal (drawn without it)", S.color.logic_op, S.color.alpha_func);
-    if (S.render_disabled || S.raster_discard) { g_draw_skip[S.render_disabled ? 3 : 4]++; return; }   // TOTK: SetRenderEnable(false) / SetRasterizerDiscard(true)
+    if (S.render_disabled || (S.raster_discard && !tfd)) { g_draw_skip[S.render_disabled ? 3 : 4]++; return; }   // TOTK: SetRenderEnable(false) / SetRasterizerDiscard(true)
     if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) { g_draw_skip[5]++; return; }
     if (exp_skip_fs(pr)) return;   // TOTK_EXP_SKIP_FS (measurement only)
     // 续用的通道可能是少挂深度 / 模板开的（开法 2 / 3 / 4）：这次绘制要的平面没挂，就在它之前切开（重开时按新前瞻挂）
@@ -9993,6 +10152,8 @@ frz_plain:;
     if (!g_enc) { g_fd_dw = dw; g_fd_di = di; }
     if (g_enc && g_lay.active && !lay_draw_ok(pr, dw, di)) {   // TOTK: this draw cannot write its layer: end the layered pass, draw in a plain one
         PD("L %llu 分层通道内的绘制不能写层号，在此切开", g_stat_pass); rp_end(); g_lay.refuse = 1; g_lay.refused++; }
+    if (g_enc && !g_lay.active && !g_pass.self_layers && pr && pr->sh[0] && pr->sh[0]->writes_layer) {   // Scarlet: reopen as a layered pass (lay_self)
+        int f; if (lay_self(0, &f)) { PD("L %llu 绘制自选层，重开分层通道", g_stat_pass); rp_end(); } }
     if (!g_mfx.scene_done && g_mfx.canvas && R.rt.n > 0 && R.rt.color[0] && R.rt.color[0]->serial == g_mfx.canvas && pr && pr->sh[0] && MFX_UI_DRAW(pr) && mfx_enabled())
         mfx_snapshot_scene();   // TOTK_MFX: first UI draw into the canvas: copy the finished scene first
     if (!g_uw_ui && uw_on_canvas() && pr && pr->sh[0] && mfx_ui_vs(pr->sh[0]->key)) g_uw_ui = 1;   // key 4: the UI begins
@@ -10018,6 +10179,7 @@ frz_plain:;
     // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
     static id<MTLRenderPipelineState> cur_ps; static NvProg *cur_pr; static uint64_t cur_ps_pass;
     if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }   // 可读 tile 合并：按物理 → 逻辑映射与特化取管线 | Readable tile merge: fetch the pipeline by the physical -> logical mapping and the specialization
+    static int cur_tf; if (cur_tf != tfd) { cur_tf = tfd; g_pso_dirty = 1; }   // Scarlet: capture and plain draws use different pipelines
     if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || (pr->sh[1] && pr->sh[1]->border_seen) || (pr->sh[0] && pr->sh[0]->border_seen)) { cur_ps = pso_get(pr, nil); cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps; }
     if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // 下一次绘制重新按自身情况取 | The next draw fetches again according to its own situation
     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
@@ -10143,7 +10305,8 @@ frz_plain:;
       enc_r_clip(en, S.depth_clamp && !noclamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip); }   // TOTK: SetDepthClamp
     enc_r_blend_color(en, S.blend_color[0], S.blend_color[1], S.blend_color[2], S.blend_color[3]);
     bind_vertex_streams((id<MTL4RenderCommandEncoder>)en,pr->sh[0]);
-    if (g_lay.active) enc_r_vbuf(en, LAY_BUF_INDEX, lay_gpu(g_lay_probe_neg == 1 ? 0 : g_lay.cur - g_lay.base));   // TOTK: this draw's layer within the layered pass
+    if (g_lay.active) enc_r_vbuf(en, LAY_BUF_INDEX, lay_gpu(g_lay_probe_neg == 1 ? 0 : g_lay.cur - g_lay.base));
+    if (tfd && !tf_bind(en, dw, pr->sh[0])) { g_draw_skip[4]++; return; }   // Scarlet: capture block and offsets   // TOTK: this draw's layer within the layered pass
     if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
     if (pr->sh[1]) encode_args(en, pr->sh[1], 1, 0);
     // 参数绑定在登记表锁内捕获实际资源；资格判断到绑定期间有版本变化，则在任何GPU draw前切开重试。
@@ -10190,8 +10353,8 @@ frz_plain:;
     if (anom_on() && g_anom_rec) anom_note(pr, dw, di);   // TOTK_ANOMALY
     if (passdump()) {   // 通道首次绘制的特征（判读入是否可省：全屏、无混合、写满通道、不依赖深度）；DM_NVN_PASSDUMP_ALL 时每次绘制都记 | Characteristics of a render pass's first draw (to judge whether the load can be omitted: full screen, no blending, writes all channels, does not depend on depth); with DM_NVN_PASSDUMP_ALL every draw is recorded
         static uint64_t last_pass = ~0ull; static int all = -1; if (all < 0) all = getenv("DM_NVN_PASSDUMP_ALL") != NULL || getenv("TOTK_INPUT_FILE") != NULL;
-        if (all) PD("d %llu bv=%d bi=%d first=%d vs=%s fs=%s vc=%d inst=%d blend=%#x b0=%#llx dt=%d dw=%d df=%d cull=%d st=%d sf=%d,%d sop=%d,%d,%d/%d,%d,%d smask=%#x,%#x/%#x,%#x sref=%#x,%#x ib=%#llx it=%d cmask=%#x front=%d dr=%g,%g clamp=%d", g_stat_pass, di ? di->base_vertex : 0, di ? di->base_instance : 0, dw ? dw->first : 0, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-",
-                    dw ? dw->count : di->count, dw ? 1 : di->instances, S.color.blend_en, (unsigned long long)*(uint64_t *)&S.blend[0], (int)S.ds.dt, (int)S.ds.dw, (int)S.ds.df, (int)S.poly.cull,
+        if (all) PD("d %llu bv=%d bi=%d first=%d vs=%s fs=%s vc=%d inst=%d blend=%#x b0=%#llx dt=%d dw=%d df=%d cull=%d st=%d sf=%d,%d sop=%d,%d,%d/%d,%d,%d smask=%#x,%#x/%#x,%#x sref=%#x,%#x ib=%#llx it=%d cmask=%#x front=%d dr=%g,%g clamp=%d", g_stat_pass, di ? di->base_vertex : 0, di ? di->base_instance : dw ? dw->base_instance : 0, dw ? dw->first : 0, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-",
+                    dw ? dw->count : di->count, dw ? dw->instances : di->instances, S.color.blend_en, (unsigned long long)*(uint64_t *)&S.blend[0], (int)S.ds.dt, (int)S.ds.dw, (int)S.ds.df, (int)S.poly.cull,
                     (int)S.ds.st, (int)S.ds.sf_f, (int)S.ds.sf_b, (int)S.ds.fail_f, (int)S.ds.zfail_f, (int)S.ds.zpass_f,
                     (int)S.ds.fail_b, (int)S.ds.zfail_b, (int)S.ds.zpass_b, S.st_vmask[0], S.st_vmask[1], S.st_wmask[0], S.st_wmask[1], S.st_ref[0], S.st_ref[1],
                     di ? (unsigned long long)di->ibuf : 0ull, di ? di->itype : 0, S.chmask.mask, (int)S.poly.front, S.dr[0], S.dr[1], (int)S.depth_clamp);
@@ -10218,7 +10381,7 @@ frz_plain:;
         if (last_pass != g_stat_pass) {
             last_pass = g_stat_pass;
             PD("D %llu prim=%d vc=%d inst=%d blend=%#x wm=%#x dt=%d dw=%d df=%d st=%d sc=%lu,%lu,%lu,%lu tgt=%lux%lu vp=%.0f,%.0f,%.0f,%.0f", g_stat_pass, prim,
-               dw ? dw->count : di->count, dw ? 1 : di->instances, S.color.blend_en, S.chmask.mask, (int)S.ds.dt, (int)S.ds.dw, (int)S.ds.df, (int)S.ds.st,
+               dw ? dw->count : di->count, dw ? dw->instances : di->instances, S.color.blend_en, S.chmask.mask, (int)S.ds.dt, (int)S.ds.dw, (int)S.ds.df, (int)S.ds.st,
                (unsigned long)sc.x, (unsigned long)sc.y, (unsigned long)sc.width, (unsigned long)sc.height, (unsigned long)tw, (unsigned long)th,
                S.has_vp ? S.vp[0][0] : 0, S.has_vp ? S.vp[0][1] : 0, S.has_vp ? S.vp[0][2] : (float)tw, S.has_vp ? S.vp[0][3] : (float)th);
         }
@@ -10242,6 +10405,7 @@ frz_plain:;
         if (g_ind_gpu && g_ind_cur == dw) enc_r_draw_indirect(en, mp, g_ind_gpu);   // BY3: arguments resolved on the GPU timeline (ind_resolve)
         else if (dw->count && (dw->instances > 1 || dw->base_instance)) enc_r_draw_instanced(en, mp, dw->first, dw->count, dw->instances, dw->base_instance);
         else if (dw->count && dw->instances >= 0) enc_r_draw(en, mp, dw->first, dw->count);
+        if (tfd) enc_r_barrier((id<MTL4RenderCommandEncoder>)en, MTLStageVertex, MTLStageVertex | MTLStageFragment, MTL4VisibilityOptionDevice);   // Scarlet: captured data visible to later draws
     } else {
         if (prim == 7) { RED_ONCE(20, "带索引的四边形未实现"); return; }
         void *mb; uint64_t mo;
@@ -11094,6 +11258,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_SCISSOR: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
             case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL:
             case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_BLEND_COLOR: case OP_COPY_STRIDE: case OP_DEPTH_CLAMP: case OP_RENDER_ENABLE: case OP_RASTER_DISCARD: case OP_RENDER_COND:
+            case OP_TF_BIND: case OP_TF_STATE:   // Scarlet: transform feedback state
                 state_op(h.op, a); break;
             case OP_COPY_B2T: copy_b2t(a); break;
             case OP_COPY_T2B: copy_t2b(a); break;

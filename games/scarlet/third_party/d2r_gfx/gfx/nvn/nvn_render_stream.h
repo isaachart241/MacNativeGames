@@ -27,6 +27,7 @@ enum {
     RS_INDEXED_INDIRECT,   /* BY3: u[0] = primitive, u[1] = index type, u[2] = index buffer, u[3] = its length, u[4] = GPU address of MTLDrawIndexedPrimitivesIndirectArguments */
     RS_BEGIN,  /* u[0] = retained MTL4RenderPassDescriptor, u[1] = vertex table, u[2] = fragment table, u[3] = command buffer, u[4] = barrier at start, u[5] = visibility options */
     RS_END,     /* end the encoder (barrier at end if u[0], visibility options u[1]) */
+    RS_BARRIER, /* Scarlet: intra-pass barrier, u[0] after stages, u[1] before stages, u[2] visibility options */
 };
 enum { RS_SPIN_NS = 200000 };   /* B waits (wfe) this long on an empty queue before sleeping on the semaphore. During a replay A never pauses
                                    for that long, so B sleeps in the frame gap and wakes (~30 us) at the next submission. The waits are wfe / sev,
@@ -97,6 +98,7 @@ static void rs_apply(id<MTL4RenderCommandEncoder> *enc, id<MTL4ArgumentTable> *v
         case RS_INDIRECT: [e drawPrimitives:(MTLPrimitiveType)u[0] indirectBuffer:u[1]]; break;
         case RS_INDEXED_INDIRECT: [e drawIndexedPrimitives:(MTLPrimitiveType)u[0] indexType:(MTLIndexType)u[1] indexBuffer:u[2] indexBufferLength:(NSUInteger)u[3] indirectBuffer:u[4]]; break;
         case RS_INDEXED: [e drawIndexedPrimitives:(MTLPrimitiveType)u[0] indexCount:(NSUInteger)u[1] indexType:(MTLIndexType)u[2] indexBuffer:u[3] indexBufferLength:(NSUInteger)u[4] instanceCount:(NSUInteger)u[5] baseVertex:(NSInteger)u[6] baseInstance:(NSUInteger)u[7]]; break;
+        case RS_BARRIER: [e barrierAfterEncoderStages:(MTLStages)u[0] beforeEncoderStages:(MTLStages)u[1] visibilityOptions:(MTL4VisibilityOptions)u[2]]; break;
         case RS_STORE:
             if (u[0] == 1) [e setDepthStoreAction:(MTLStoreAction)u[1]];
             else if (u[0] == 2) [e setStencilStoreAction:(MTLStoreAction)u[1]];
