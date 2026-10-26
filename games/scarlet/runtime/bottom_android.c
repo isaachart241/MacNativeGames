@@ -362,30 +362,48 @@ static void draw_map(canvas *c, double cx, double cy, double z, double px, doubl
 }
 /* The interface's layout on this screen. The game spreads it over a 16:9 TV picture, its boxes in the corners with the
    layer's navy between them; fitted to this screen's width as it is, its text came out at 0.65 of its size. So the empty
-   bands are taken out: columns and rows that hold nothing that stands out from the navy (text, borders, panels; not the
-   faint dark backdrop of battle messages) shrink to a gap of UI_GAP (UI_EDGE at the edges), the boxes keep their places
-   relative to each other, and the result is scaled to fill the width, up to UI_MAXS of the game's size and leaving the
-   map at least STRIP_MIN rows. Screens that are all interface (the X menu's screens, the map screen, the title) have no
-   empty bands and fill the width as before. Recomputed for each new frame, into uiOut (the screen's width x uiOutH). */
-#define UI_GAP 40
-#define UI_EDGE 16
+   bands are squeezed: columns and rows that hold nothing that stands out from the navy (text, borders, panels; not the
+   faint dark backdrop of battle messages) count as UI_GAP long (UI_EDGE at the edges), and the boxes are scaled up until
+   that fills the screen's width or height (at most UI_MAXS of the game's size). The screen's remaining space goes back to
+   the empty bands, each a share by its length in the game's picture, so the interface covers the whole screen with its
+   boxes where the game has them (battle commands and dialogue at the bottom, the opponent at the top). Screens that are
+   all interface (the X menu's screens, the map screen, the title) have no empty bands: they fill the width, the map
+   below. Recomputed for each new frame, into uiOut (the whole screen), with an alpha: the navy is see-through, so the
+   interface lies over the map (ui_over). */
+#define UI_GAP 24
+#define UI_EDGE 8
+#define UI_STICKY 1.5   /* seconds a band stays reserved after its last content: the layout holds while menus come and go */
 #define UI_WIDEN 8
 #define UI_MAXS 1.5
-#define STRIP_MIN 300
 static uint32_t *uiOut; static int uiOutW, uiOutH;
-static int ui_runs(const uint8_t *has, int n, int *map) {
+typedef struct { int a, n, content; } ui_run;
+static int ui_runs(const uint8_t *has, int n, ui_run *r) {   /* runs of content (widened by UI_WIDEN) and of empty */
     static uint8_t d[UI_MAXW]; int m = 0;
     for (int i = 0; i < n; i++) { d[i] = 0; for (int k = i - UI_WIDEN; k <= i + UI_WIDEN; k++) if (k >= 0 && k < n && has[k]) { d[i] = 1; break; } }
-    for (int i = 0; i < n;) {
-        int j = i; while (j < n && d[j] == d[i]) j++;
-        if (d[i]) for (int k = i; k < j; k++) map[m++] = k;
-        else { int keep = i == 0 || j == n ? UI_EDGE : UI_GAP; if (keep > j - i) keep = j - i; for (int k = 0; k < keep; k++) map[m++] = i + (j - i - keep) / 2 + k; }
-        i = j;
-    }
+    for (int i = 0; i < n;) { int j = i; while (j < n && d[j] == d[i]) j++; r[m].a = i; r[m].n = j - i; r[m].content = d[i]; m++; i = j; }
     return m;
 }
+static double ui_keep(const ui_run *r, int i, int nr) { int k = i == 0 || i == nr - 1 ? UI_EDGE : UI_GAP; return r[i].content ? r[i].n : k < r[i].n ? k : r[i].n; }
+static double ui_len(const ui_run *r, int nr) { double t = 0; for (int i = 0; i < nr; i++) t += ui_keep(r, i, nr); return t; }
+/* One axis: for each of the screen's out pixels the source pixels s0, s1 and the weight of s1 (of 256); s0 -1: nothing */
+static void ui_axis(const ui_run *r, int nr, double s, int out, int lim, int *s0, int *s1, int *wt) {
+    double spare = 0, extra = out - ui_len(r, nr) * s; if (extra < 0) extra = 0;
+    for (int i = 0; i < nr; i++) if (!r[i].content) spare += r[i].n - ui_keep(r, i, nr);
+    double pos = 0; int d = 0;
+    for (int i = 0; i < nr && d < out; i++) {
+        double len = ui_keep(r, i, nr) * s + (!r[i].content && spare > 0 ? extra * (r[i].n - ui_keep(r, i, nr)) / spare : 0), end = pos + len;
+        for (; d < out && d + 0.5 < end; d++) {
+            if (!r[i].content) { s0[d] = s1[d] = r[i].a + r[i].n / 2; wt[d] = 0; continue; }
+            double f = r[i].a + (d + 0.5 - pos) / s - 0.5; if (f < 0) f = 0; int k = (int)f; if (k > lim - 1) k = lim - 1;
+            s0[d] = k; s1[d] = k + 1 < lim ? k + 1 : k; wt[d] = (int)((f - k) * 256);
+        }
+        pos = end;
+    }
+    for (; d < out; d++) s0[d] = s1[d] = -1, wt[d] = 0;
+}
 static void ui_layout(const uint8_t *px, int w, int h, int cw, int ch) {
-    static uint8_t colHas[UI_MAXW], rowHas[UI_MAXH]; static int mx[UI_MAXW], my[UI_MAXH];
+    static uint8_t colHas[UI_MAXW], rowHas[UI_MAXH]; static ui_run rx[UI_MAXW], ry[UI_MAXH];
+    static double colSeen[UI_MAXW], rowSeen[UI_MAXH]; double now = now_s();
     memset(colHas, 0, sizeof colHas); memset(rowHas, 0, sizeof rowHas);
     const int br = 30, bg = 43, bb = 72;   /* the layer's navy as it arrives (the backend clears to it) */
     long n = 0, nbg = 0;
@@ -393,32 +411,52 @@ static void ui_layout(const uint8_t *px, int w, int h, int cw, int ch) {
         const uint8_t *p = px + 4 * ((size_t)y * w + x); int d = abs(p[0] - br) + abs(p[1] - bg) + abs(p[2] - bb);
         n++; if (d <= 12) nbg++; if (d > 90) colHas[x] = rowHas[y] = 1;
     }
-    int lw, lh;
-    if (nbg * 10 < n * 3) { for (int i = 0; i < w; i++) mx[i] = i; for (int i = 0; i < h; i++) my[i] = i; lw = w; lh = h; }   /* all interface */
-    else { lw = ui_runs(colHas, w, mx); lh = ui_runs(rowHas, h, my); }
-    if (lw < 1 || lh < 1) { uiOutH = 0; return; }
-    double s = (double)cw / lw; if (s > (double)(ch - STRIP_MIN) / lh) s = (double)(ch - STRIP_MIN) / lh; if (s > UI_MAXS) s = UI_MAXS;
-    int ow = (int)(lw * s), oh = (int)(lh * s), ox = (cw - ow) / 2; if (ow > cw) ow = cw; if (oh > ch) oh = ch;
-    if (!uiOut || uiOutW != cw) { free(uiOut); uiOut = malloc((size_t)cw * ch * 4); uiOutW = cw; }
+    for (int x = 0; x < w; x++) { if (colHas[x]) colSeen[x] = now; else colHas[x] = colSeen[x] > 0 && now - colSeen[x] < UI_STICKY; }
+    for (int y = 0; y < h; y++) { if (rowHas[y]) rowSeen[y] = now; else rowHas[y] = rowSeen[y] > 0 && now - rowSeen[y] < UI_STICKY; }
+    int nx, ny;
+    if (nbg * 10 < n * 3) { rx[0] = (ui_run){0, w, 1}; ry[0] = (ui_run){0, h, 1}; nx = ny = 1; }   /* all interface */
+    else { nx = ui_runs(colHas, w, rx); ny = ui_runs(rowHas, h, ry); }
+    double lw = ui_len(rx, nx), lh = ui_len(ry, ny);
+    if (lw < 1 || lh < 1 || cw > 4096 || ch > 4096) { uiOutH = 0; return; }
+    double s = cw / lw; if (s > ch / lh) s = ch / lh; if (s > UI_MAXS) s = UI_MAXS;
+    if (!uiOut || uiOutW != cw || uiOutH != ch) { free(uiOut); uiOut = malloc((size_t)cw * ch * 4); uiOutW = cw; }
     if (!uiOut) { uiOutH = 0; return; }
-    uint32_t navy = rgb(br, bg, bb);
-    static int sx0[4096], sx1[4096], wx[4096];
-    for (int x = 0; x < ow && x < 4096; x++) {   /* each column's two source columns and the weight of the second (of 256) */
-        double f = (x + 0.5) / s - 0.5; if (f < 0) f = 0; int k = (int)f; if (k > lw - 1) k = lw - 1;
-        sx0[x] = mx[k]; sx1[x] = mx[k + 1 < lw ? k + 1 : k]; wx[x] = (int)((f - k) * 256);
-    }
-    for (int y = 0; y < oh; y++) {
+    static int sx0[4096], sx1[4096], wx[4096], sy0[4096], sy1[4096], wy[4096];
+    ui_axis(rx, nx, s, cw, w, sx0, sx1, wx); ui_axis(ry, ny, s, ch, h, sy0, sy1, wy);
+    for (int y = 0; y < ch; y++) {
         uint32_t *o = uiOut + (size_t)y * cw;
-        for (int x = 0; x < cw; x++) o[x] = navy;
-        double f = (y + 0.5) / s - 0.5; if (f < 0) f = 0; int k = (int)f; if (k > lh - 1) k = lh - 1;
-        const uint8_t *r0 = px + 4 * (size_t)my[k] * w, *r1 = px + 4 * (size_t)my[k + 1 < lh ? k + 1 : k] * w; int wy = (int)((f - k) * 256);
-        for (int x = 0; x < ow && x < 4096; x++) {
+        if (sy0[y] < 0) { memset(o, 0, (size_t)cw * 4); continue; }
+        const uint8_t *r0 = px + 4 * (size_t)sy0[y] * w, *r1 = px + 4 * (size_t)sy1[y] * w; int v1 = wy[y];
+        for (int x = 0; x < cw; x++) {
+            if (sx0[x] < 0) { o[x] = 0; continue; }
             const uint8_t *a = r0 + 4 * sx0[x], *b = r0 + 4 * sx1[x], *c = r1 + 4 * sx0[x], *d = r1 + 4 * sx1[x]; int u = wx[x], v[3];
-            for (int i = 0; i < 3; i++) { int t = (a[i] * (256 - u) + b[i] * u) >> 8, bt = (c[i] * (256 - u) + d[i] * u) >> 8; v[i] = (t * (256 - wy) + bt * wy) >> 8; }
-            o[ox + x] = rgb(v[0], v[1], v[2]);
+            for (int i = 0; i < 3; i++) { int t = (a[i] * (256 - u) + b[i] * u) >> 8, bt = (c[i] * (256 - u) + d[i] * u) >> 8; v[i] = (t * (256 - v1) + bt * v1) >> 8; }
+            /* how much it stands out from the navy: none is see-through, 56 or more (sum of the three) is solid */
+            int dn = abs(v[0] - br) + abs(v[1] - bg) + abs(v[2] - bb), al = dn <= 8 ? 0 : dn >= 56 ? 255 : (dn - 8) * 255 / 48;
+            o[x] = al ? (uint32_t)al << 24 | (uint32_t)v[2] << 16 | (uint32_t)v[1] << 8 | (uint32_t)v[0] : 0;
         }
     }
-    uiOutH = oh;
+    uiOutH = ch;
+}
+/* The interface over the map. Where it is partly see-through it was blended with the navy, so the navy's share is swapped
+   for the map's: out = ui + (1 - alpha) (map - navy), with no navy fringes. The map is dimmed to UI_DIM (of 256) while
+   the interface is up, so that what is drawn straight on the navy (battle messages' names, hints) stays readable. */
+#define UI_DIM 190
+static void ui_over(canvas *c, int rows) {
+    const int nv[3] = {30, 43, 72};
+    for (int y = 0; y < rows; y++) {
+        uint32_t *o = c->px + (size_t)y * c->stride; const uint32_t *u = uiOut + (size_t)y * uiOutW;
+        for (int x = 0; x < c->w; x++) {
+            uint32_t p = u[x], m = o[x]; int al = (int)(p >> 24), v[3];
+            if (al == 255) { o[x] = p; continue; }
+            for (int i = 0; i < 3; i++) {
+                int mp = (int)(m >> 8 * i & 255) * UI_DIM >> 8;
+                v[i] = al ? (int)(p >> 8 * i & 255) + (255 - al) * (mp - nv[i]) / 255 : mp;
+                if (v[i] < 0) v[i] = 0; if (v[i] > 255) v[i] = 255;
+            }
+            o[x] = rgb(v[0], v[1], v[2]);
+        }
+    }
 }
 static void *render_thread(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "bottom");
@@ -462,11 +500,9 @@ static void *render_thread(void *arg) {
             canvas c = {b.bits, b.width, b.height, b.stride};
             double t0 = now_s();
             if (ui && (fresh || uiOutW != c.w)) ui_layout(upx, uw, uh, c.w, c.h);
-            if (ui && uiOutH > 0) {   /* the interface at the top, the map below it */
-                int rows = uiOutH < c.h ? uiOutH : c.h;
-                for (int y = 0; y < rows; y++) memcpy(c.px + (size_t)y * c.stride, uiOut + (size_t)y * uiOutW, (size_t)c.w * 4);
-                canvas strip = {c.px + (size_t)rows * c.stride, c.w, c.h - rows, c.stride};
-                if (strip.h > 0) draw_map(&strip, cx, cy, z, px, py, pd, t, 0);
+            if (ui && uiOutH > 0) {   /* the map exactly as without the interface (it stays put as menus come and go), the interface over it */
+                draw_map(&c, cx, cy, z, px, py, pd, t, nt);
+                ui_over(&c, uiOutH < c.h ? uiOutH : c.h);
             } else
             draw_map(&c, cx, cy, z, px, py, pd, t, nt);
             ANativeWindow_unlockAndPost(w);

@@ -1016,3 +1016,25 @@ and navy between them: text at 0.65 of its size, most of the area empty.
 
 Not checked: how the layout looks on screens not seen yet (shops, Pokémon Centers, the Pokédex, later battles); the
 layout changes at once when the interface changes shape (no animation).
+
+### 2026-10-26: Thor port: the interface over the map, over the whole bottom screen
+
+The user: "can you make it more seamless? like, let it be an overlay on top of the map with a transparent background",
+then while it was being tried: "dont have the map move when there are things popping up", "the menu items should take
+up that whole bottom screen", and "things still move around a bit weirdly, and some of the menus could be a bit bigger".
+
+- **Overlay** (`ui_over`). The map is drawn on the whole screen, exactly as without the interface (it no longer moves
+  when menus open or close), and dimmed to 190/256 while the interface is up; the interface goes over it with the
+  layer's navy see-through. Its alpha is how far a pixel stands out from the navy (8 or less: none, 56 or more: solid);
+  where it is partly see-through it was blended with the navy, so the navy's share is swapped for the map's (no navy
+  fringes).
+- **The whole screen.** Empty bands still count as a 24-pixel gap (8 at the edges) when the scale is chosen, then the
+  screen's remaining space is shared back among them by their length in the game's picture: the boxes sit where the
+  game puts them (opponent at the top, commands and dialogue at the bottom), over the whole screen.
+- **Steadier.** A band stays reserved for 1.5 s after it last held anything, so the layout holds while battle menus and
+  messages take turns instead of changing with each frame.
+
+Checked on the Thor on the test copy of the save (the user's save put back afterwards, byte for byte): the map fixed
+under the interface; the battle's dialogue and messages at the bottom, large; the command and move menus at the corners
+the game gives them, the opponent at the top. Not checked: the X menu and the map screen with this version. Seen: a
+message right after the battle's wide menus keeps their layout for up to 1.5 s, so it shows smaller than on its own.
