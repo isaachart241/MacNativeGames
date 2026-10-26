@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
 #ifdef _WIN32
 #include <direct.h>
 #include <windows.h>
@@ -119,6 +120,7 @@ static void rtd_capture(VkCommandBuffer cb) {
     barrier_full(cb);
 }
 int nvn_vk_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) __attribute__((weak));
+static void rtd_tex_flush(void);
 void vk_rt_dump_flush(void) {   /* nvn_vk_dev.c, at the present after the dumped frame */
     if (!g_nrtd || !nvn_vk_write_png) return;
     mtl_finish();
@@ -145,7 +147,8 @@ void vk_rt_dump_flush(void) {   /* nvn_vk_dev.c, at the present after the dumped
         vmaDestroyImage(V.vma, d->img, d->al);
     }
     VKLOG("render-target dump: %d attachments of %d passes -> %s", g_nrtd, g_rtd_pass, g_rtd_dir);
-    g_nrtd = 0; g_rtd_at = 0;
+    rtd_tex_flush();
+    g_nrtd = 0; g_rtd_at = 0; g_rtd_pass = 0;
 }
 /* Pass timing (diagnostics): TOTK_VK_PASS_TIMES=<present number> writes GPU timestamps around every render pass and
    dispatch of that frame and, at the present after it, logs one line each (kind, size, attachments, draws, GPU ms). */
@@ -206,6 +209,7 @@ void vk_camera_frame_end(void) {   /* nvn_vk_dev.c, at each present */
         if (h > 0.01f && isfinite(m[12]) && isfinite(m[14])) {
             fx /= h; fz /= h;
             bottom_map_set_player(m[12] + 4 * fx, m[14] + 4 * fz, atan2f(fx, -fz));   /* map: x east, y = world z; 0 = up */
+            uint64_t n = mtl_present_count(); if (n % 150 == 0) VKLOG("camera: player about %.2f %.2f %.2f (camera %.2f %.2f %.2f, %d draws)", m[12] + 4 * fx, m[13], m[14] + 4 * fz, m[12], m[13], m[14], g_cam[best].n);
         }
     }
     g_ncam = 0;
@@ -225,6 +229,65 @@ void vk_ubo_log_flush(void) {
     g_nul = 0; g_ul_at = 0;
 }
 static void pass_start(void);
+/* Texture dump (diagnostics, with the render-target dump): every texture of 256x256 or more sampled in the dump frame and
+   first drawn in the frame's last three passes (the interface) is written as <folder>/tex_<serial>_<w>x<h>_nvn<format>.png
+   (level 0, layer 0; BC decoded on the CPU; formats other than
+   BC1-5/7 and 8-bit RGBA / BGRA are skipped). Thor port: the game's map art for the bottom screen. A file named
+   rt-dump-now in the data folder arms both for the next frame (vk_rtd_poll, at the presents). */
+static struct { uint64_t serial; int pass; } g_rtt[2048]; static int g_nrtt;
+static void rtd_tex(const vk_tex *x) {
+    if (!x || !x->img || x->decoded || x->w < 256 || x->h < 256) return;
+    for (int i = 0; i < g_nrtt; i++) if (g_rtt[i].serial == x->serial) return;
+    if (g_nrtt < 2048) { g_rtt[g_nrtt].serial = x->serial; g_rtt[g_nrtt++].pass = g_rtd_pass + 1; }
+}
+vk_tex *vk_tex_by_serial(uint64_t serial);
+int nvn_fmt_bpb(int format, int *bw, int *bh);
+static void rtd_tex_flush(void) {
+    int last = 0; for (int k = 0; k < g_nrtt; k++) if (g_rtt[k].pass > last) last = g_rtt[k].pass;
+    int dumped = 0;
+    for (int k = 0; k < g_nrtt; k++) {
+        if (g_rtt[k].pass < last - 2) continue;   /* only what the frame's last passes (the interface) first drew */
+        vk_tex *x = vk_tex_by_serial(g_rtt[k].serial); if (!x || !x->img) continue;
+        dumped++;
+        int bw, bh, bpb = nvn_fmt_bpb((int)x->t.d.format, &bw, &bh); uint32_t pf; int obpp;
+        int bc = nvn_bc_unpacked((uint32_t)x->t.d.format, &pf, &obpp);
+        int rgba = x->fmt == VK_FORMAT_R8G8B8A8_UNORM || x->fmt == VK_FORMAT_R8G8B8A8_SRGB, bgra = x->fmt == VK_FORMAT_B8G8R8A8_UNORM || x->fmt == VK_FORMAT_B8G8R8A8_SRGB;
+        if (!bpb || (!bc && !rgba && !bgra) || (bc && obpp != 1 && obpp != 2 && obpp != 4)) { VKLOG("texture dump: %ux%u nvn %#x vk %d skipped (format)", x->w, x->h, x->t.d.format, x->fmt); continue; }
+        size_t pitch = (size_t)((x->w + bw - 1) / bw) * bpb, bytes = pitch * ((x->h + bh - 1) / bh);
+        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
+        VmaAllocationCreateInfo bai = {0}; bai.usage = VMA_MEMORY_USAGE_AUTO; bai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VkBuffer buf; VmaAllocation bal; VmaAllocationInfo inf;
+        if (vmaCreateBuffer(V.vma, &bi, &bai, &buf, &bal, &inf) != VK_SUCCESS) continue;
+        VkCommandBuffer cb = vk_oneoff_begin();
+        VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {x->w, x->h, 1}};
+        vkCmdCopyImageToBuffer(cb, x->img, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &c);
+        vk_oneoff_end(cb);
+        uint8_t *px = malloc((size_t)x->w * x->h * 4), *dec = bc ? malloc((size_t)x->w * x->h * (size_t)obpp) : NULL;
+        const uint8_t *src = inf.pMappedData;
+        if (px && (!bc || (dec && !nvn_bc_decode((uint32_t)x->t.d.format, src, pitch, x->w, x->h, dec, (size_t)x->w * (size_t)obpp)))) {
+            for (size_t i = 0; i < (size_t)x->w * x->h; i++) {
+                uint8_t *o = px + 4 * i;
+                if (!bc) { const uint8_t *q = src + 4 * i; o[0] = q[bgra ? 2 : 0]; o[1] = q[1]; o[2] = q[bgra ? 0 : 2]; o[3] = q[3]; }
+                else if (obpp == 4) memcpy(o, dec + 4 * i, 4);
+                else if (obpp == 2) { o[0] = dec[2 * i]; o[1] = dec[2 * i + 1]; o[2] = 0; o[3] = 255; }
+                else { o[0] = o[1] = o[2] = dec[i]; o[3] = 255; }
+            }
+            char p[1024]; snprintf(p, sizeof p, "%s/tex_%06llu_%ux%u_nvn%02x.png", g_rtd_dir, (unsigned long long)x->serial, x->w, x->h, x->t.d.format);
+            nvn_vk_write_png(p, px, x->w, x->h);
+        }
+        free(px); free(dec); vmaDestroyBuffer(V.vma, buf, bal);
+    }
+    if (g_nrtt) VKLOG("texture dump: %d of %d textures (first drawn in passes %d-%d) -> %s", dumped, g_nrtt, last - 2, last, g_rtd_dir);
+    g_nrtt = 0;
+}
+void vk_rtd_poll(uint64_t present) {   /* nvn_vk_dev.c, at each present: the trigger file */
+    if (present % 15) return;
+    if (access("rt-dump-now", F_OK)) return;
+    unlink("rt-dump-now");
+    rtd_armed();   /* reads TOTK_VK_DUMP_RT once (and the folder) */
+    g_rtd_at = (long)present + 2;
+    VKLOG("render-target and texture dump armed for present %ld (rt-dump-now)", g_rtd_at);
+}
 static void pass_end(void) {
     if (!P.open) return;
     if (!P.begun && !P.cleared) { P.open = 0; barrier_full(CB()); return; }   // nothing drawn or cleared: no pass at all
@@ -660,6 +723,7 @@ static void write_stage(wset *ws, VkDescriptorSet sets[2], vk_shader *sh, int st
                     int tid = reg < 128 ? (int)(S.tex[st][reg] & 0xfffff) : 0;
                     const view_t *v = NULL; int hv = 0; vk_tex *x = tid ? vk_tex_by_id(tid, &v, &hv) : NULL;
                     if (x && x->img) iv = vk_tex_view_typed(x, v, hv, want_vt(b), 0);
+                    if (rtd_armed()) rtd_tex(x);
                     if (rtd_armed())
                         VKLOG("rtdump pass %d stage %d slot %d (dim %d arr %d): %s %ux%ux%u layers %u levels %u nvn %#x vk %d decoded %d", g_rtd_pass + 1, st, reg, b->dim, b->arrayed,
                               !tid ? "no texture" : !x ? "texture id not found" : !iv ? "NO VIEW (dummy)" : "ok", x ? x->w : 0, x ? x->h : 0, x ? x->d : 0, x ? x->layers : 0, x ? x->levels : 0,
@@ -748,6 +812,20 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
               (int)S.ds.sf_f, (int)S.ds.fail_f, (int)S.ds.zfail_f, (int)S.ds.zpass_f, (unsigned)S.st_ref[0], (unsigned)S.st_vmask[0], (unsigned)S.st_wmask[0],
               S.poly.offset_en, S.po.units, S.po.factor, S.po.clamp, (int)S.poly.cull, (int)P.dfmt, (unsigned)S.chmask.mask, (unsigned)S.color.blend_en,
               S.ms.a2c, S.ms.a2c_dither, (int)P.samples, (int)S.color.alpha_func, count);
+        if (P.cfmt[0] == VK_FORMAT_R8G8B8A8_SRGB && P.w >= 1280) {   /* interface draws: what places each quad (bottom map calibration) */
+            for (int r = 0; r < 16; r++) {
+                const p_bind_buf *u = &S.ubo[0][r]; if (!u->addr || !u->size || u->size > 0x400) continue;
+                char b[1600]; size_t o = (size_t)snprintf(b, sizeof b, "rtdump pass %d ubo vs slot %d %#llx +%#llx:", g_rtd_pass + 1, r, (unsigned long long)u->addr, (unsigned long long)u->size);
+                const float *f = (const float *)(uintptr_t)u->addr;
+                for (uint64_t k = 0; k < u->size / 4 && k < 64 && o < sizeof b - 20; k++) o += (size_t)snprintf(b + o, sizeof b - o, " %g", f[k]);
+                VKLOG("%s", b);
+            }
+            if (S.vbuf[0].address) {
+                const float *f = (const float *)(uintptr_t)(S.vbuf[0].address + (uint64_t)(dw ? dw->first : 0) * S.stream[0].stride);
+                VKLOG("rtdump pass %d vb0 stride %d: %g %g %g %g | %g %g %g %g | %g %g %g %g", g_rtd_pass + 1, (int)S.stream[0].stride,
+                      f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11]);
+            }
+        }
     }
     int tf = S.tf_active && pr->sh[0]->tf_n;   // Scarlet: a capture draw (plain list / point draws, as on the Mac)
     if (tf && !dw) { VKONCE("transform feedback: indexed capture draws are not implemented (skipped)"); return; }

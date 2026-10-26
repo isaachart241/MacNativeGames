@@ -831,3 +831,19 @@ map (`bottom_map_set_player`); the frame's buffer with the most draws is taken, 
 their own. The map's units are metres (3 pixels each by default, about 400 m across the screen); it redraws at most 20
 times a second unless a finger is down. Checked on the Thor: the arrow turns with the camera and the grid scrolls as
 the player walks. Not done: the map's picture (the game's map art) and its markers, and the minimap on the top screen.
+
+### 2026-10-26: Thor port: the game's map art found (bottom map, next step)
+
+The region map's art: Y opens the game's map (the user's hint; minus does not), ZL zooms out, and fully zoomed out the
+whole of Paldea is one 900x900 texture (NVN format 0x44, BC3) drawn in the interface pass, with the landmarks painted
+in; the map screen's background is an 800x840 texture of its own. Found with a texture dump added to the render-target
+dump: every texture of 256x256 or more first drawn in the dump frame's last three passes (the interface) is written as
+`tex_<serial>_<w>x<h>_nvn<format>.png` (BC decoded on the CPU); a file named `rt-dump-now` in the data folder arms the
+dump for the next frame, so a screen reached by hand can be dumped without restarting. In the dump frame, interface
+draws also log their vertex-stage uniform buffers and first vertices, and the camera-derived player position is logged
+every 150 presents.
+
+Not done: placing the player on that texture. The interface quad is a unit square placed by uniform data that also
+holds the 3D passes' stale bindings, so the overview's world transform is not read off directly yet; two spots far
+enough apart (or the minimap's tiles, whose uniform data follows the player) are the next way in. The dumped art stays
+on the Thor and in the scratch folder, not in the repository.

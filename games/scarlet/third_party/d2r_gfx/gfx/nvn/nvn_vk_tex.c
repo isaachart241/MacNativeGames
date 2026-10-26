@@ -404,6 +404,9 @@ VkBufferView vk_tex_bview(vk_tex *x) {
     return x->bview;
 }
 
+vk_tex *vk_tex_by_serial(uint64_t serial) {   /* diagnostics (the texture dump): NULL once released */
+    pthread_mutex_lock(&g_tmu); vk_tex *x = tab_get(serial); pthread_mutex_unlock(&g_tmu); return x;
+}
 static void tex_destroy(void *arg) {
     vk_tex *x = arg;
     for (vk_view *w = x->views; w;) { vk_view *n = w->next; vkDestroyImageView(V.dev, w->v, NULL); free(w); w = n; }

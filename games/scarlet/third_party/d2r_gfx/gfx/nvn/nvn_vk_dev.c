@@ -675,7 +675,7 @@ static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
         }
         if (ticket % 60 == 0) { last_s = s; last_p = p; }
     }
-    { void vk_camera_frame_end(void); vk_camera_frame_end(); }
+    { void vk_camera_frame_end(void); vk_camera_frame_end(); void vk_rtd_poll(uint64_t); vk_rtd_poll(ticket); }
     if (ticket == 1 || ticket % 600 == 0) VKLOG("present %llu: draws %llu passes %llu dispatches %llu", (unsigned long long)ticket, (unsigned long long)atomic_load(&g_stat_draws),
                                              (unsigned long long)atomic_load(&g_stat_passes), (unsigned long long)atomic_load(&g_stat_dispatches));
     if (!V.ok || !V.surface_fn) return ticket;
