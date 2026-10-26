@@ -42,13 +42,15 @@ typed in a dialog with the on-screen keyboard.
 The game's rumble drives the Thor's vibration motor. It has one motor, so it gets the stronger of the game's two;
 `TOTK_RUMBLE=0` turns rumble off, and `SCARLET_RUMBLE_TEST=<1-255>` buzzes once at start to check the motor.
 
-The bottom screen shows the game's own map while the game is in focus, north up and following you (drag to look
+The bottom screen is the game's second screen while it is in focus: its menus, battle commands, dialogue and map
+screen are drawn there (the top screen shows the game without them; screens that are all interface, such as the
+title, show on both), with a strip of your map below them. Otherwise it shows the game's own map, north up and following you (drag to look
 around, pinch to zoom; it follows you again a few seconds after the last touch), and the minimap leaves the top screen;
 leaving the game gives the bottom screen back to whatever was there. The map is the game's own art, gathered as you
 play from the minimap (hidden from the top screen but still drawn by the game), and kept in the data folder's
 `map-cache/`: places appear once you have been near them. There is no need to open the game's map screen; when you
 do (Y), its place names, the objective and the whole-Paldea view (zoomed out) are added too. `SCARLET_BOTTOM=0` leaves the bottom screen alone and keeps the minimap;
-`SCARLET_MINIMAP=1` keeps the minimap as well.
+`SCARLET_MINIMAP=1` keeps the minimap as well, `SCARLET_BOTTOM_UI=0` keeps the interface on the top screen.
 
 ## Shaders
 

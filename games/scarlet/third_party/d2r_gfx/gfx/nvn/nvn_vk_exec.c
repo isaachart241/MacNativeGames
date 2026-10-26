@@ -51,7 +51,7 @@ static struct { p_set_rt rt; int has_rt; p_scissor sc; int has_sc; } R;
 /* The render pass: open = its attachments are chosen; begun = vkCmdBeginRendering was recorded (Thor port: the begin waits
    for the first draw, so clears of whole attachments before it become load operations; see pass_open). */
 static struct {
-    int open, begun, cleared; uint32_t w, h, layers, ncolor; VkFormat cfmt[8], dfmt, sfmt; VkSampleCountFlagBits samples;
+    int open, begun, cleared, ui; uint32_t w, h, layers, ncolor; VkFormat cfmt[8], dfmt, sfmt; VkSampleCountFlagBits samples;   /* ui: drawn into the interface layer */
     VkImageView cview[8], dview; vk_tex *ctex[8], *dtex;
     VkRenderingAttachmentInfo ca[8], da, sa;
 } P;
@@ -632,6 +632,123 @@ static void pass_start(void) {
     atomic_fetch_add(&g_stat_passes, 1);
 }
 static void pass_begin(void) { pass_open(); pass_start(); }
+
+/* Thor port: the game's interface on the bottom screen (runtime/bottom_android.c; SCARLET_BOTTOM=0 or SCARLET_BOTTOM_UI=0:
+   as before). Every interface quad (nn::ui2d) is drawn with its 1920x1080 projection at the start of its vertex uniform
+   buffer; drawn into a 1920x1080 frame, its pass is turned to the interface layer instead, an image of the frame's size
+   that starts each frame as the map screen's navy. The frame keeps the scene: the top screen shows the game without its
+   interface (the minimap is left out already). At the present, the layer is scaled to the bottom screen's width and
+   copied out (vk_ui_record), and handed to the bottom screen once its fence has passed (vk_ui_poll). */
+static struct { VkImage img; VmaAllocation al; VkImageView view; VkFormat fmt; } g_uil;
+static int g_ui_split = -1, g_ui_cleared, g_ui_draws, g_scene_draws, g_ui_full;   /* this frame's draws to the layer and to the frame */
+static int ui_split_on(void) {
+    if (g_ui_split < 0) { const char *a = getenv("SCARLET_BOTTOM"), *b = getenv("SCARLET_BOTTOM_UI"); g_ui_split = !(a && !strcmp(a, "0")) && !(b && !strcmp(b, "0")); }
+    return g_ui_split;
+}
+static int ui2d_draw(void) {   /* the quads (projection 1/960, 1/540) and the text (its own 128-byte buffer, y flipped) */
+    if (P.w != 1920 || P.h != 1080 || P.ncolor != 1 || P.da.imageView || P.sa.imageView) return 0;
+    const p_bind_buf *u = &S.ubo[0][0];
+    if (!u->addr || u->size < 0x40) return 0;
+    const float *f = (const float *)(uintptr_t)u->addr;
+    return fabsf(f[0] - 1.0f / 960) < 1e-6f && fabsf(fabsf(f[5]) - 1.0f / 540) < 1e-6f;
+}
+static int uil_ensure(VkFormat fmt) {   /* outside a render pass */
+    if (g_uil.img && g_uil.fmt == fmt) return 1;
+    if (g_uil.img) return 0;   /* one format a session (the game's interface target) */
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, fmt, {1920, 1080, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    VmaAllocationCreateInfo ai = {0}; ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    if (vmaCreateImage(V.vma, &ci, &ai, &g_uil.img, &g_uil.al, NULL) != VK_SUCCESS) { g_uil.img = VK_NULL_HANDLE; return 0; }
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, g_uil.img, VK_IMAGE_VIEW_TYPE_2D, fmt, {0, 0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VKCHECK(vkCreateImageView(V.dev, &vi, NULL, &g_uil.view));
+    VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, 0, g_uil.img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 0, NULL, 0, NULL, 1, &b};
+    vkCmdPipelineBarrier2(CB(), &di);
+    g_uil.fmt = fmt;
+    VKLOG("interface layer: 1920x1080 format %d (the game's interface goes to the bottom screen)", (int)fmt);
+    return 1;
+}
+/* At the present: the layer scaled to the bottom screen's width (the height in proportion) into a small image, copied to
+   the present slot's buffer (vk_ui_record); handed over when that slot's fence has passed (vk_ui_poll, at the next
+   presents: about a frame later). Frames without interface draws hand nothing: the bottom screen shows the map then. */
+int bottom_ui_width(void) __attribute__((weak));
+void bottom_ui_frame(const uint8_t *rgba, int w, int h) __attribute__((weak));
+static struct { VkImage img; VmaAllocation al; uint32_t w, h; } g_uis;
+static struct { VkBuffer buf; VmaAllocation al; void *map; uint64_t seq; int pending; } g_uib[8];
+void vk_ui_poll(const VkFence *fences) {
+    int best = -1;
+    for (int s = 0; s < 8; s++) if (g_uib[s].pending && vkGetFenceStatus(V.dev, fences[s]) == VK_SUCCESS) {
+        g_uib[s].pending = 0; if (best < 0 || g_uib[s].seq > g_uib[best].seq) best = s; }
+    if (best >= 0 && bottom_ui_frame) bottom_ui_frame(g_uib[best].map, (int)g_uis.w, (int)g_uis.h);
+}
+/* Returns the layer when the frame drew next to nothing but interface (the title, loading screens): the top screen
+   shows it too then, instead of an empty frame. */
+VkImage vk_ui_record(VkCommandBuffer cb, uint32_t slot) {
+    static uint64_t seq; int had = g_ui_draws, scene = g_scene_draws, full = g_ui_full; g_ui_draws = g_scene_draws = g_ui_full = 0; g_ui_cleared = 0;
+    if (!had || !g_uil.img || !bottom_ui_frame) return VK_NULL_HANDLE;
+    VkImage mirror = scene < 10 || full ? g_uil.img : VK_NULL_HANDLE;
+    uint32_t w = bottom_ui_width ? (uint32_t)bottom_ui_width() : 1240; if (w < 64 || w > 1920) w = 1240;
+    uint32_t h = (w * 1080 + 960) / 1920;
+    if (!g_uis.img || g_uis.w != w) {
+        if (g_uis.img) { vkQueueWaitIdle(V.q); vmaDestroyImage(V.vma, g_uis.img, g_uis.al); for (int i = 0; i < 8; i++) if (g_uib[i].buf) vmaDestroyBuffer(V.vma, g_uib[i].buf, g_uib[i].al); memset(g_uib, 0, sizeof g_uib); }
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, g_uil.fmt, {w, h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+        VmaAllocationCreateInfo ai = {0}; ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+        if (vmaCreateImage(V.vma, &ci, &ai, &g_uis.img, &g_uis.al, NULL) != VK_SUCCESS) { g_uis.img = VK_NULL_HANDLE; return mirror; }
+        g_uis.w = w; g_uis.h = h;
+        for (int i = 0; i < 8; i++) {
+            VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, (VkDeviceSize)w * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
+            VmaAllocationCreateInfo bai = {0}; bai.usage = VMA_MEMORY_USAGE_AUTO; bai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            VmaAllocationInfo inf; VKCHECK(vmaCreateBuffer(V.vma, &bi, &bai, &g_uib[i].buf, &g_uib[i].al, &inf)); g_uib[i].map = inf.pMappedData;
+        }
+        VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, 0, g_uis.img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 0, NULL, 0, NULL, 1, &b};
+        vkCmdPipelineBarrier2(cb, &di);
+    }
+    VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+                           VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT};
+    VkDependencyInfo d = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 1, &mb};
+    vkCmdPipelineBarrier2(cb, &d);
+    VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {1920, 1080, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
+    vkCmdBlitImage(cb, g_uil.img, VK_IMAGE_LAYOUT_GENERAL, g_uis.img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT; mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier2(cb, &d);
+    VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+    vkCmdCopyImageToBuffer(cb, g_uis.img, VK_IMAGE_LAYOUT_GENERAL, g_uib[slot % 8].buf, 1, &c);
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT; mb.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    vkCmdPipelineBarrier2(cb, &d);
+    g_uib[slot % 8].pending = 1; g_uib[slot % 8].seq = ++seq;
+    return mirror;
+}
+static void pass_end(void);
+/* Before a draw: an interface quad's pass goes to the layer; anything else's back to the frame. */
+static void ui_route(void) {
+    if (!ui_split_on()) return;
+    int ui = ui2d_draw() || P.ui;   /* the rest of an interface pass follows it */
+    /* A whole-screen interface quad: with a picture (the title's backdrop, a menu's own background) the screen is all
+       interface, so the top shows it too (g_ui_full); with a tiny texture it is a dimmer or a fade over the world, which
+       stays on the top screen. */
+    const p_bind_buf *u = &S.ubo[0][0];
+    if (ui && u->addr && u->size >= 136 * 4) {
+        const float *f = (const float *)(uintptr_t)u->addr;
+        if (f[132] >= 1920 && f[133] >= 1080 && fabsf(f[16]) > 0.99f && fabsf(f[21]) > 0.99f) {
+            const view_t *v; int hv; vk_tex *x = (S.tex[1][0] & 0xfffff) ? vk_tex_by_id((int)(S.tex[1][0] & 0xfffff), &v, &hv) : NULL;
+            if (x && x->w >= 256 && x->h >= 256) g_ui_full = 1; else ui = 0;
+        }
+    }
+    if (ui && !P.ui) {
+        if (P.begun || P.cleared) { pass_end(); pass_open(); }   /* the frame's own clear or draws first */
+        if (P.begun || !uil_ensure(P.cfmt[0])) return;
+        P.ca[0].imageView = g_uil.view; P.cview[0] = g_uil.view; P.ctex[0] = NULL;
+        if (!g_ui_cleared) {   /* the layer's first pass in the frame: the map screen's navy (linear values of the sRGB 26, 43, 74) */
+            P.ca[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; P.ca[0].clearValue = (VkClearValue){{{0.0103f, 0.0242f, 0.0685f, 1}}}; P.cleared = 1; g_ui_cleared = 1;
+        } else P.ca[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        P.ui = 1;
+    } else if (!ui && P.ui) { pass_end(); pass_open(); }
+    if (P.ui) g_ui_draws++; else g_scene_draws++;
+}
 /* A clear of the whole render area before the pass has begun: the attachment's load operation (its clear value as the
    clear command would have written it). Returns 0 when the clear has to be recorded as a command. */
 static int pass_clear_whole(VkRect2D r, VkRenderingAttachmentInfo *a, VkClearValue v) {
@@ -1087,6 +1204,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!rt_has_any() && !S.has_vp && !R.has_sc) { VKONCE("draw without render targets or viewport skipped"); return; }
     pass_open();
     if (minimap_draw()) return;
+    ui_route();
     pass_begin();
     if (g_pt_open >= 0) g_pt[g_pt_open].draws++;   // draw calls in the pass, recorded or not
     VkCommandBuffer cb = CB();
@@ -1226,6 +1344,7 @@ static VkRect2D clear_rect(void) {
     return r;
 }
 static void clear_color(const p_clear_color *c) {
+    if (P.open && P.ui) pass_end();   /* clears are the frame's, not the interface layer's */
     if (S.render_disabled || c->index < 0 || c->index >= 8 || !R.has_rt || c->index >= R.rt.n || !R.rt.color[c->index]) return;
     if (!(c->mask & 0xf)) return;
     if ((c->mask & 0xf) != 0xf) VKONCE("colour clear with a partial channel mask clears all channels");
@@ -1242,6 +1361,7 @@ static void clear_color(const p_clear_color *c) {
     vkCmdClearAttachments(CB(), 1, &a, 1, &cr);
 }
 static void clear_ds(const p_clear_ds *c) {
+    if (P.open && P.ui) pass_end();
     if (S.render_disabled || !R.has_rt || !R.rt.depth) return;
     pass_open();
     VkImageAspectFlags asp = 0;

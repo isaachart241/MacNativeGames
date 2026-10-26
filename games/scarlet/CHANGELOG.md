@@ -934,3 +934,31 @@ Checked on the Thor: with `map-cache/` emptied and the map screen never opened, 
 map Cabo Poco's tiles around the player (21 tiles noted, drawings 13 ms). The earlier map-screen captures (names,
 objective, region map) were merged back into the app's cache. Not checked: minimap icons (none appeared in reach on
 these walks: the objective is just beyond it), the walked scale.
+
+### 2026-10-26: Thor port: the game's interface on the bottom screen
+
+The user: "the bottom screen should have more features than just the map. the majority of the menus should really go
+down there". Their choices: the X menu and its screens, battle commands and HP, dialogue and the map screen all go down;
+the top shows the game without them; the space below a menu (fitted to the screen's width, a 16:9 menu fills about
+two thirds of it) shows the map.
+
+- **Telling interface from scene.** Every interface quad (nn::ui2d) has its 1920x1080 projection at the start of its
+  vertex uniform buffer (1/960, 1/540); the text has its own 128-byte buffer with the same projection, y flipped. The
+  first such draw in a pass on a 1920x1080 target turns the pass to the **interface layer**, an image of the frame's
+  size that starts each frame as the map screen's navy (a clear still pending for the frame is recorded on the frame
+  first); the rest of that pass follows; a clear or a scene draw goes back to the frame. The frame keeps the scene, so
+  the top screen shows the game without its interface.
+- **Two kinds of whole-screen quads.** With a picture (the title's backdrop) the screen is all interface: the present
+  shows the layer on the top screen too (also when a frame drew fewer than 10 scene draws). With a tiny texture it is a
+  dimmer or a fade over the world (the map screen's, 16x16): it stays in the frame, so the top screen dims or fades.
+- **To the bottom screen.** At the present, in the present's own command buffer, the layer is blitted to the bottom
+  screen's width (1240x698) and copied to that present slot's buffer; at the next presents, a slot whose fence has
+  passed is handed to the bottom screen (no waiting; about a frame late). The bottom screen draws it at the top with the
+  map below, 0.2 s after the last frame the whole screen is the map again, and it redraws as frames arrive while the
+  interface is up. `SCARLET_BOTTOM_UI=0` keeps the interface on the top screen.
+
+Checked on the Thor: the X menu (panels, icons and text) on the bottom with the map below and the world alone on top;
+the map screen on the bottom with the dimmed world on top; the title on both screens; the loading screen's spinner on
+the bottom (black on top, as the game draws it); normal play unchanged (the clean world on top, the map below). Not
+checked: dialogue and battles (not reachable at this point of the user's save without advancing the story); the
+first version left the menu's text on top (the text's own uniform buffer).

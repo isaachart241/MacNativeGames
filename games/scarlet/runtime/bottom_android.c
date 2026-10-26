@@ -42,8 +42,23 @@ static int winBusy, dirty = 1;        /* winBusy: the render thread is drawing i
 static double camX, camY, zoom = ZOOM_HOME;   /* map position at the screen centre; screen pixels per map unit */
 static double playerX, playerY, playerDir;   /* map units; radians, 0 = north (up), clockwise */
 static double lastTouch = -100;       /* time of the last touch; the view follows the player SNAP_S after it */
+static int uiShown;                   /* the last drawing showed the game's interface */
 static struct { int id; float x, y; } touch[2]; static int ntouch;
 static double pinchDist, pinchZoom, dragX, dragY, dragCamX, dragCamY;
+
+/* The game's interface (menus, battles, dialogue, its map screen), drawn by the Vulkan backend into a layer of its own
+   instead of the top screen's frame and handed over scaled to this screen's width, about once a frame while it has any
+   (bottom_ui_frame). It goes at the top of the screen with the map in the strip below; 0.2 s without a frame and the
+   whole screen is the map again. */
+static uint8_t *uiPx; static int uiW, uiH; static double uiTime = -100; static int winW = 1240;
+int bottom_ui_width(void) { return winW; }
+void bottom_ui_frame(const uint8_t *rgba, int w, int h) {
+    pthread_mutex_lock(&viewLock);
+    if (w != uiW || h != uiH) { free(uiPx); uiPx = malloc((size_t)w * h * 4); uiW = w; uiH = h; }
+    if (uiPx) { memcpy(uiPx, rgba, (size_t)w * h * 4); uiTime = now_s(); dirty = 1; pthread_cond_broadcast(&viewCond); }
+    pthread_mutex_unlock(&viewLock);
+}
+#define UI_HOLD 0.2
 
 void bottom_map_set_player(double x, double y, double dir) {   /* a new drawing only for half a pixel or a degree */
     pthread_mutex_lock(&viewLock);
@@ -340,7 +355,13 @@ static void *render_thread(void *arg) {
             double idle = now_s() - lastTouch;
             int following = !ntouch && idle >= SNAP_S;
             int off = following && (fabs(camX - playerX) > 0.5 / zoom || fabs(camY - playerY) > 0.5 / zoom || fabs(zoom - ZOOM_HOME) > 0.002);
+            int uiNow = now_s() - uiTime < UI_HOLD;
             if (win && (dirty || off)) break;
+            if (win && (uiNow || (uiShown && !uiNow))) {   /* the interface may stop: look again shortly */
+                if (uiShown && !uiNow) break;
+                struct timespec t; clock_gettime(CLOCK_REALTIME, &t); t.tv_nsec += 100000000; if (t.tv_nsec >= 1000000000) { t.tv_nsec -= 1000000000; t.tv_sec++; }
+                pthread_cond_timedwait(&viewCond, &viewLock, &t); continue;
+            }
             if (win && !ntouch && idle < SNAP_S) {   /* wake when the snap-back is due */
                 struct timespec t; clock_gettime(CLOCK_REALTIME, &t); double w = SNAP_S - idle + 0.01;
                 t.tv_sec += (time_t)w; t.tv_nsec += (long)((w - floor(w)) * 1e9); if (t.tv_nsec >= 1000000000) { t.tv_nsec -= 1000000000; t.tv_sec++; }
@@ -359,18 +380,28 @@ static void *render_thread(void *arg) {
         double cx = camX, cy = camY, z = zoom, px = playerX, py = playerY, pd = playerDir;
         float t[2][2]; int nt = ntouch; for (int i = 0; i < nt; i++) { t[i][0] = touch[i].x; t[i][1] = touch[i].y; }
         ANativeWindow *w = win; winBusy = 1; dirty = 0;
+        int ui = now_s() - uiTime < UI_HOLD && uiPx; uiShown = ui;
         pthread_mutex_unlock(&viewLock);
         ANativeWindow_Buffer b;
         if (ANativeWindow_lock(w, &b, NULL) == 0) {
             canvas c = {b.bits, b.width, b.height, b.stride};
             double t0 = now_s();
+            winW = b.width;
+            if (ui) {   /* the interface at the top, the map below it */
+                pthread_mutex_lock(&viewLock);
+                int rows = uiH < c.h ? uiH : c.h, cols = uiW < c.w ? uiW : c.w;
+                for (int y = 0; y < rows; y++) memcpy(c.px + (size_t)y * c.stride, uiPx + (size_t)y * uiW * 4, (size_t)cols * 4);
+                pthread_mutex_unlock(&viewLock);
+                canvas strip = {c.px + (size_t)rows * c.stride, c.w, c.h - rows, c.stride};
+                if (strip.h > 0) draw_map(&strip, cx, cy, z, px, py, pd, t, 0);
+            } else
             draw_map(&c, cx, cy, z, px, py, pd, t, nt);
             ANativeWindow_unlockAndPost(w);
             static double sum; static int n; sum += now_s() - t0;
             if (++n == 200) { fprintf(stderr, "[totk] bottom map: %.1f ms a drawing (last 200)\n", sum / n * 1000); sum = 0; n = 0; }
         }
         pthread_mutex_lock(&viewLock); winBusy = 0; pthread_cond_broadcast(&viewCond); pthread_mutex_unlock(&viewLock);
-        usleep(nt ? 16000 : 100000);   /* ~60 drawings a second under a finger, 10 when only following the player */
+        usleep(nt || ui ? 16000 : 100000);   /* ~60 drawings a second under a finger or with the interface, 10 when only following */
     }
     return NULL;
 }

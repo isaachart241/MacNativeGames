@@ -695,6 +695,7 @@ static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
         VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, VK_FENCE_CREATE_SIGNALED_BIT};
         for (int i = 0; i < 8; i++) VKCHECK(vkCreateFence(V.dev, &fci, NULL, &pfence[i]));
     }
+    { void vk_ui_poll(const VkFence *); vk_ui_poll(pfence); }   /* the interface layer's copies that are done: to the bottom screen */
     uint32_t fi = V.s_frame++ % 8, idx = 0;
     vkWaitForFences(V.dev, 1, &pfence[fi], VK_TRUE, UINT64_MAX);
     VkResult r = vkAcquireNextImageKHR(V.dev, V.swap, 1000000000ull, V.s_acq[fi], VK_NULL_HANDLE, &idx);
@@ -704,9 +705,10 @@ static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
     VkCommandBuffer cb = pcb[fi]; int swap_reset = 0;
     VKCHECK(vkResetCommandBuffer(cb, 0));
     { VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; VKCHECK(vkBeginCommandBuffer(cb, &bi)); }
+    VkImage srcimg; { VkImage vk_ui_record(VkCommandBuffer, uint32_t); VkImage m = vk_ui_record(cb, fi); srcimg = m ? m : x->img; }
     VkImageMemoryBarrier2 b[2] = {
         {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, 0, 0, x->img, {x->aspect, 0, 1, 0, 1}},
+         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, 0, 0, srcimg, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
         {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_BLIT_BIT, 0, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
          VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, 0, V.simg[idx], {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}}};
     VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 0, NULL, 0, NULL, 2, b};
@@ -720,7 +722,8 @@ static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
     VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT};
     VkDependencyInfo d2 = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 1, &mb};
     vkCmdPipelineBarrier2(cb, &d2);
-    vkCmdBlitImage(cb, x->img, VK_IMAGE_LAYOUT_GENERAL, V.simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+    if (srcimg != x->img) { bl.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; bl.srcOffsets[0] = (VkOffset3D){0, 0, 0}; bl.srcOffsets[1] = (VkOffset3D){1920, 1080, 1}; }   /* the interface layer */
+    vkCmdBlitImage(cb, srcimg, VK_IMAGE_LAYOUT_GENERAL, V.simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
     if (overlay_vk_draw) {   /* the in-game menu / FPS counter (runtime/overlay), drawn last; the image is TRANSFER_DST again after it */
         overlay_vk_frame of = {V.inst, V.phys, V.dev, V.q, &V.qmu, V.qfam, V.nsimg, idx, cb, V.simg[idx], (uint32_t)V.sfmt, V.sext.width, V.sext.height, g_swap_gen};
         if (overlay_vk_draw(&of) & 2) swap_reset = 1;
