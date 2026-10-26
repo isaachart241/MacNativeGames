@@ -107,6 +107,10 @@ void *runtime_front_override(const char *name) {
     return NULL;
 }
 
+/* Vulkan (android/Makefile GFX=vk): no window yet, so the backend renders offscreen (screenshots: TOTK_VK_SHOT=<dir>). */
+const char *const *front_vk_instance_extensions(uint32_t *count) { if (count) *count = 0; return NULL; }
+uint64_t front_vk_surface(void *vk_instance) { (void)vk_instance; return 0; }
+
 /* Probes that drive the Metal path (gpu_path_probe.m, vpool_probe.m): not available without a GPU backend. */
 void runtime_gpu_path_probe(const char *which) { fprintf(stderr, "[totk] GPU path probe %s: needs the Metal backend\n", which ? which : ""); exit(2); }
 void runtime_vpool_probe(void) { fprintf(stderr, "[totk] vpool probe: needs the Metal backend\n"); exit(2); }

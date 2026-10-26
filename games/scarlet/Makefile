@@ -14,7 +14,7 @@ OUT := $(WORK)/build
 PY ?= python3
 NATIVE_OPT ?= -O2
 
-GFX_SRC := $(filter-out third_party/d2r_gfx/gfx/nvn/nvn_null.c,$(wildcard third_party/d2r_gfx/gfx/nvn/*.c third_party/d2r_gfx/gfx/nvn/*.m third_party/d2r_gfx/gfx/nvn/*.S third_party/d2r_gfx/gfx/tex/*.c third_party/d2r_gfx/gfx/tex/*.m))   # nvn_null.c: the Android build's backend (android/Makefile)
+GFX_SRC := $(filter-out third_party/d2r_gfx/gfx/nvn/nvn_null.c third_party/d2r_gfx/gfx/nvn/nvn_vk%.c third_party/d2r_gfx/gfx/tex/nvn_fmt_vk.c third_party/d2r_gfx/gfx/tex/nvn_astc_dec.c,$(wildcard third_party/d2r_gfx/gfx/nvn/*.c third_party/d2r_gfx/gfx/nvn/*.m third_party/d2r_gfx/gfx/nvn/*.S third_party/d2r_gfx/gfx/tex/*.c third_party/d2r_gfx/gfx/tex/*.m))   # nvn_null.c, nvn_vk*.c: the Android build's backends (android/Makefile)
 GFX_OBJECTS := $(patsubst %,$(OUT)/obj/%.o,$(GFX_SRC))
 GFX_HEADERS := $(wildcard third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h)
 GFX_FLAGS := -std=gnu11 -Wno-error -Wno-unused-function -Wno-unused-parameter -fobjc-arc -Ithird_party/d2r_gfx/gfx/nvn/include

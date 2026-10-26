@@ -16,15 +16,28 @@ DEVICE_DIR ?= /data/local/tmp/scarlet
 NATIVE_OPT ?= -O2
 
 # Everything the Mac build compiles except the Objective-C (Metal, AppKit, GameController) and the Metal-only pieces;
-# frontend.m / gamepad*.m are replaced by their _android.c counterparts and nvn_mtl.m by nvn_null.c.
-SRC := $(wildcard runtime/*.c runtime/*.S) \
-  $(wildcard third_party/d2r_gfx/gfx/nvn/*.c third_party/d2r_gfx/gfx/nvn/*.S third_party/d2r_gfx/gfx/tex/*.c) \
+# frontend.m / gamepad*.m are replaced by their _android.c counterparts and nvn_mtl.m by a backend chosen with GFX:
+#   GFX=null (default): nvn_null.c, nothing drawn (stage T1)
+#   GFX=vk: the Vulkan backend nvn_vk*.c (stage T2, from the TotK tree), over android/compat/vk (volk / VMA stand-ins)
+GFX ?= null
+VK_SRC := $(wildcard third_party/d2r_gfx/gfx/nvn/nvn_vk*.c) third_party/d2r_gfx/gfx/tex/nvn_fmt_vk.c third_party/d2r_gfx/gfx/tex/nvn_astc_dec.c
+ALL_GFX := $(wildcard third_party/d2r_gfx/gfx/nvn/*.c third_party/d2r_gfx/gfx/nvn/*.S third_party/d2r_gfx/gfx/tex/*.c)
+ifeq ($(GFX),vk)
+GFX_SRC := $(filter-out third_party/d2r_gfx/gfx/nvn/nvn_null.c,$(ALL_GFX)) android/compat/vk/vk_shims.c
+GFX_LIBS := -lvulkan
+OUT := $(WORK)/build-android-vk
+else
+GFX_SRC := $(filter-out $(VK_SRC),$(ALL_GFX))
+GFX_LIBS :=
+endif
+SRC := $(wildcard runtime/*.c runtime/*.S) $(GFX_SRC) \
   android/compat/darwin_compat.c android/compat/elf_sections.c android/compat/sha256.c
 OBJECTS := $(patsubst %,$(OUT)/obj/%.o,$(SRC))
 HEADERS := $(wildcard runtime/*.h third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h android/compat/*.h android/compat/*/*.h)
-GENERATED := $(OUT)/runtime_tables.h $(OUT)/romfs_config.h $(OUT)/shared_fonts_config.h
+GEN := $(WORK)/build-android
+GENERATED := $(GEN)/runtime_tables.h $(GEN)/romfs_config.h $(GEN)/shared_fonts_config.h
 CFLAGS := -std=gnu11 $(NATIVE_OPT) -g -Wall -Wextra -Wno-unused-function -Wno-unused-parameter -Wno-sign-compare \
-  -include android/compat/android_prelude.h -Iandroid/compat -I$(OUT) -Iruntime \
+  -include android/compat/android_prelude.h -Iandroid/compat -Iandroid/compat/vk -I$(GEN) -Iruntime \
   -Ithird_party/d2r_gfx/gfx/nvn/include -Ithird_party/d2r_gfx/gfx/nvn -Ithird_party/d2r_gfx/gfx/tex -Ithird_party/d2r_gfx/third_party
 
 .PHONY: all push boot clean
@@ -40,10 +53,10 @@ $(OUT)/obj/%.c.o: %.c $(HEADERS) $(GENERATED) android/Makefile
 # Assembly: the same include paths, without the C prelude
 $(OUT)/obj/%.S.o: %.S $(HEADERS) android/Makefile
 	@mkdir -p "$(dir $@)"
-	"$(CC)" -Iruntime -Ithird_party/d2r_gfx/gfx/nvn -I$(OUT) -c "$<" -o "$@"
+	"$(CC)" -Iruntime -Ithird_party/d2r_gfx/gfx/nvn -I$(GEN) -c "$<" -o "$@"
 
 $(OUT)/scarlet-native: $(OBJECTS)
-	"$(CC)" $(OBJECTS) -lm -ldl -llog -o "$@"
+	"$(CC)" $(OBJECTS) $(GFX_LIBS) -lm -ldl -llog -o "$@"
 
 push: $(OUT)/scarlet-native
 	"$(ADB)" shell mkdir -p $(DEVICE_DIR)/logs

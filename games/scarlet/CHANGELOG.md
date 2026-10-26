@@ -432,3 +432,37 @@ Mac, the regression run (two A presses, screenshot at 60 s, GPU on) reaches the 
 Not checked: anything visible on the Thor (no graphics backend yet), the new-game path with an empty save on the Thor
 (it sat idle after the first A on the title before this fix; not retried), sound (no AAudio output, Opus silent until
 libopus is built for Android), controllers.
+
+### 2026-10-26: Thor port, T2: the first pictures through Vulkan
+
+**The backend.** The TotK tree's Vulkan NVN backend (`nvn_vk*.c`, written for Windows behind the same `mtl_*` seam and
+never run with a game) is now in Scarlet's tree, built by `make -f android/Makefile GFX=vk` (the default stays the null
+backend). Its two external libraries are replaced by local stand-ins in `android/compat/vk`: `volk.h` (Android's
+libvulkan exports every core function up to 1.3; the two extension functions it calls are loaded by hand) and
+`vk_mem_alloc.h` / `vk_shims.c` (the part of VulkanMemoryAllocator it uses, over one dedicated `vkAllocateMemory` per
+resource). The Android front end reports no window, so it renders offscreen; `TOTK_VK_SHOT=<dir>` writes every n-th
+present as a PNG, and `TOTK_VK_DUMP_RT=<present>,<dir>` every render target of one frame. On the Thor: Adreno 740,
+BC and ASTC sampled natively, no FP64, no host-memory import, so pools are mirrored with dirty uploads.
+
+**Shaders.** The backend asks a `totk_xlate --service --target spirv` for each variant it lacks. Scarlet's translator has
+no SPIR-V target, and no .NET is installed to build the TotK tree's newer one, but its MSL chain produces the same
+SPIR-V first (the same translation job) with everything in descriptor set 0. `android/tools/shader_bridge.py` runs it on
+the Mac, moves a pixel shader's resources to set 1 (the shared support buffer stays set 0 binding 0) and writes the
+SPIR-V chain's reflection from the SPIR-V itself (a Python port of `SpirvReflect.cs` and `HandleSpirv`). The device
+reaches it through `adb reverse` (`TOTK_XLATE_TCP=<port>`, a TCP client added to `nvn_vk_rt.c`): the request carries
+the guest code inline, the reply carries the `.spv` and `.json`, and the variants land in `user-data/shader-cache-vk`
+on the device. 146 variants translated in the first sessions, none failed.
+
+**First pictures.** The title screen renders exactly (offscreen, 1920x1080). After Continue the house rendered with its
+geometry, textures and layout right but every surface covered in fine stripes along its own texture direction. The
+render-target dump of one frame located it: the G-buffer (pass 8) is clean, the stripes start in the full-screen
+lighting pass (pass 16), whose shader reads slot 28 and takes bit 6 of the value's raw bits as a material flag. That
+slot is a stencil view (`set_stencil`, which Scarlet's NVN layer has and the TotK backend did not know), so the backend
+bound the depth plane, and bit 6 of a depth float is noise that follows the depth gradient. Views with `set_stencil`
+now select the stencil aspect; on the Adreno a float sampler returns the stencil bits the shader expects, and the house
+renders like the Mac's, sunlight on the stairs included.
+
+Not done: the player character (only its shadow is drawn; it is skinned through transform feedback, `OP_TF_*`, which the
+backend does not implement yet), a window (needs the APK stage's surface), storage buffers whose 16-byte-aligned start is
+not 64-byte aligned (the Adreno's minimum; the MSL-chain shaders assume 16, so those bindings read 0..48 bytes early;
+none in the lighting pass), `TOTK_VK_NO_BC=1` (crashes in the driver), performance (not measured).
