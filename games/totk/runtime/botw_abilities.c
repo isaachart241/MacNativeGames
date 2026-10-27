@@ -112,6 +112,8 @@ static int ray_cast(const float from[3], const float to[3], uint32_t layers, flo
     return 1;
 }
 
+static void fx(uintptr_t actor, const char *effect, const char *sound);   /* the abilities' look and sound, below */
+
 /* Ascend (A2). Ready when a ray from his head finds a ceiling within g_reach and, within g_thick above it, a top with
    room to stand (12 and 64 m; TOTK_ASCEND_REACH, TOTK_ASCEND_THICK). A ray from inside a surface does not hit it, so tops
    are found from above (ascend_plan). ZL + L while ready (L is then kept from the game, so no rune fires) rises at
@@ -247,6 +249,7 @@ static uint64_t ascend_frame(uint64_t buttons, uint64_t pressed) {
         g_dur = fmax(0.8, (g_to_y - at[1]) / ASCEND_SPEED);
         g_phase = 1; atomic_store(&g_ready, 0);
         fprintf(stderr, "[abilities] ascend: %.2f -> %.2f (ceiling underside %.2f) over %.2f s, %u copies of his position\n", at[1], g_to_y, g_under, g_dur, g_nslot);
+        fx(actor, "Demo005_0_warp", "Kago_WindRiseUp");   /* the Sheikah warp's shimmer, Revali's Gale's rise */
         dump("t0");
         if (getenv("TOTK_ASCEND_DUMP"))   /* which layers make up what is above him */
             for (int layer = 0; layer < 20; layer++) {
@@ -263,9 +266,11 @@ static uint64_t ascend_frame(uint64_t buttons, uint64_t pressed) {
     if (g_phase == 1 && (pressed & PAD_B)) {
         g_phase = 2; g_back_from_y = g_now_y; g_t0 = now_s(); g_dur = 0.35; t = 0;
         fprintf(stderr, "[abilities] ascend: cancelled at %.2f, back to %.2f\n", g_back_from_y, g_from[1]);
+        fx(actor, NULL, "Demo_SheikPadTouchOff");
     }
     if (g_phase == 1) put_player(g_from[1] + (g_to_y - g_from[1]) * ease((float)t));
     else put_player(g_back_from_y + (g_from[1] - g_back_from_y) * ease((float)t));
+    { static double glow; if (g_phase == 1 && t > 0.05 && t < 1 && now_s() - glow > 1.2) { glow = now_s(); fx(actor, "Demo005_0_warp", NULL); } }   /* the glow lasts the rise */
     atomic_store(&g_rise, g_now_y - g_from[1]); atomic_store(&g_rise_total, g_to_y - g_from[1]); atomic_store(&g_phase_seen, g_phase);
     /* Held at the end a moment longer: Havok kept the contacts of his pass through the ceiling, which push him back
        down through the top when he is let go on it at once (he fell from rest through the ground he stood on,
@@ -273,9 +278,98 @@ static uint64_t ascend_frame(uint64_t buttons, uint64_t pressed) {
     if (t >= 1 + ASCEND_SETTLE / g_dur) {
         fprintf(stderr, "[abilities] ascend: %s at %.2f (the matrix says %.2f)\n", g_phase == 1 ? "arrived" : "back", g_now_y, player(at) ? at[1] : NAN);
         dump("end"); if (getenv("TOTK_ASCEND_DUMP")) g_after = 120;
+        if (g_phase == 1) fx(actor, "Demo005_1_warp_appear", "Demo005_1_warp_appear");   /* the warp's arrival */
         g_phase = 0; atomic_store(&g_phase_seen, 0);
     }
     return 0;   /* he does nothing else while he rises */
+}
+
+/* Effects and sounds (A3b), through the actor's xlink as the game's own XLinkEventCreateAction::oneShot_ does it
+   (main+0x15481e0): actor +0x568 its ksys xlink, whose +0x48 is the ELink (effects) user instance and +0x50 the SLink
+   (sounds) one; a 0x18-byte xlink2::Locator {vtable main+0x2a6e688, 0, 0}; xlink2::UserInstance's searchAsset(locator,
+   name) at main+0x1346600 says whether the user has that event and sets the locator to it, and emit(locator, handle)
+   at main+0x13462b0 starts it. Main thread only (the controller poll), as for the ray casts. */
+enum { ACTOR_XLINK = 0x568, XLINK_ELINK = 0x48, XLINK_SLINK = 0x50,
+       XLINK_LOCATOR_VTABLE = 0x2a6e688, XLINK_SEARCH_ASSET = 0x1346600, XLINK_EMIT = 0x13462b0 };
+typedef struct { uintptr_t event; uint32_t id, pad; } XlinkHandle;
+/* Event `name` on `actor`'s effects (sound 0) or sounds (1): 1 when the user has it and it started. */
+static int xlink_emit(uintptr_t actor, int sound, const char *name, XlinkHandle *handle) {
+    uintptr_t xl = actor ? read_ptr(actor + ACTOR_XLINK) : 0, user = xl ? read_ptr(xl + (sound ? XLINK_SLINK : XLINK_ELINK)) : 0;
+    if (!user) return 0;
+    _Alignas(16) uint8_t locator[0x20] = {0};
+    uint64_t v = (uint64_t)(g_main + XLINK_LOCATOR_VTABLE); memcpy(locator, &v, 8);
+    if (!((bool (*)(uintptr_t, void *, const char *))(g_main + XLINK_SEARCH_ASSET))(user, locator, name)) return 0;
+    XlinkHandle h = {0};
+    ((bool (*)(uintptr_t, void *, XlinkHandle *))(g_main + XLINK_EMIT))(user, locator, &h);
+    if (handle) *handle = h;
+    return h.event != 0;
+}
+/* The actor a Havok body belongs to, or 0: hkpEntity +0x18 (m_userData) is its ksys phys::RigidBody, which points back
+   at it at +0x78 (mHkBody) and has its UserTag at +0x80; an actor's tag (act::PhysicsUserTag) has the actor at +0x8.
+   Taken only when that actor stands within 20 m of the body. */
+static uintptr_t body_actor(uintptr_t body) {
+    uintptr_t rb = read_ptr(body + 0x18), tag = rb && read_ptr(rb + 0x78) == body ? read_ptr(rb + 0x80) : 0, actor = tag ? read_ptr(tag + 8) : 0;
+    float m[12], c[3];
+    if (!actor || !read_ptr(actor + ACTOR_XLINK) || !read_mem(actor + ACTOR_MTX, m, sizeof m) || !read_mem(body + 0x1c0, c, sizeof c)) return 0;
+    return fabsf(m[3] - c[0]) < 20 && fabsf(m[7] - c[1]) < 20 && fabsf(m[11] - c[2]) < 20 ? actor : 0;
+}
+/* The abilities' look and sound go 1:1 with Tears of the Kingdom's own assets (BOTW_ABILITIES_SCOPE.md, A3b); until those
+   are in, TOTK_ABILITY_FX=botw plays BotW events that stand in for them, for tests of the plumbing only: `effect` and
+   `sound` on `actor`, either may be NULL; the log says which the actor had. */
+static int g_fx;
+static void fx(uintptr_t actor, const char *effect, const char *sound) {
+    if (!g_fx || !actor) return;
+    int e = effect ? xlink_emit(actor, 0, effect, NULL) : -1, so = sound ? xlink_emit(actor, 1, sound, NULL) : -1;
+    fprintf(stderr, "[abilities] fx on %#lx: %s %s, %s %s\n", (unsigned long)actor, effect ? effect : "-", e < 0 ? "" : e ? "(played)" : "(not there)", sound ? sound : "-", so < 0 ? "" : so ? "(played)" : "(not there)");
+}
+
+/* TOTK_XLINK_LIST=<file of names>, tests: every name in it `actor`'s effects or sounds have, at once (some ms). */
+static void xlink_list(uintptr_t actor, const char *what) {
+    FILE *f = fopen(getenv("TOTK_XLINK_LIST"), "r"); if (!f) return;
+    uintptr_t xl = read_ptr(actor + ACTOR_XLINK), users[2] = {xl ? read_ptr(xl + XLINK_ELINK) : 0, xl ? read_ptr(xl + XLINK_SLINK) : 0};
+    char line[256]; int n = 0, found = 0;
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0; n++;
+        for (int u = 0; u < 2; u++) {
+            _Alignas(16) uint8_t locator[0x20] = {0}; uint64_t v = (uint64_t)(g_main + XLINK_LOCATOR_VTABLE); memcpy(locator, &v, 8);
+            if (users[u] && ((bool (*)(uintptr_t, void *, const char *))(g_main + XLINK_SEARCH_ASSET))(users[u], locator, line)) { found++; fprintf(stderr, "[abilities] xlink: %s has %s %s\n", what, u ? "sound" : "effect", line); }
+        }
+    }
+    fclose(f); fprintf(stderr, "[abilities] xlink: %s: %d of %d names\n", what, found, n);
+}
+
+/* TOTK_XLINK_PROBE="name,name,...": after ZL + Down, which of the names Link's effects and sounds have (each one found
+   is started, 1.5 s apart, for screenshots). */
+static void xlink_probe(uintptr_t actor, uint64_t buttons, uint64_t pressed, double now) {
+    static const char *list; static char buf[4096], *names[128]; static int n = -1, next, go; static double at;
+    if (n < 0) {
+        n = 0; if (!(list = getenv("TOTK_XLINK_PROBE"))) return;
+        snprintf(buf, sizeof buf, "%s", list);
+        for (char *t = strtok(buf, ","); t && n < 128; t = strtok(NULL, ",")) names[n++] = t;
+    }
+    if (!go && n && (buttons & 256) && (pressed & 0x8000)) { go = 1; at = now; }
+    /* TOTK_XLINK_LIST=<file of names>: with the probe started, which of them Link's two users have (no emit; 1000 a frame) */
+    static FILE *lf; static int lchecked;
+    if (go == 1 && !lf && getenv("TOTK_XLINK_LIST")) { lf = fopen(getenv("TOTK_XLINK_LIST"), "r"); go = 2; }
+    if (lf) {
+        uintptr_t xl = read_ptr(actor + ACTOR_XLINK), users[2] = {xl ? read_ptr(xl + XLINK_ELINK) : 0, xl ? read_ptr(xl + XLINK_SLINK) : 0};
+        char line[256];
+        for (int i = 0; i < 1000 && fgets(line, sizeof line, lf); i++) {
+            line[strcspn(line, "\r\n")] = 0; lchecked++;
+            for (int u = 0; u < 2; u++) {
+                _Alignas(16) uint8_t locator[0x20] = {0}; uint64_t v = (uint64_t)(g_main + XLINK_LOCATOR_VTABLE); memcpy(locator, &v, 8);
+                if (users[u] && ((bool (*)(uintptr_t, void *, const char *))(g_main + XLINK_SEARCH_ASSET))(users[u], locator, line))
+                    fprintf(stderr, "[abilities] xlink: Link has %s %s\n", u ? "sound" : "effect", line);
+            }
+        }
+        if (feof(lf)) { fclose(lf); lf = NULL; fprintf(stderr, "[abilities] xlink: list done, %d names checked\n", lchecked); }
+        return;
+    }
+    if (!go || next >= n || now < at) return;
+    const char *name = names[next++]; at = now + 1.5;
+    XlinkHandle h;
+    int e = xlink_emit(actor, 0, name, &h), so = xlink_emit(actor, 1, name, &h);
+    fprintf(stderr, "[abilities] xlink: %-32s effect %s, sound %s\n", name, e ? "yes" : "no", so ? "yes" : "no");
 }
 
 /* Recall (A3). Every game frame the moving Havok bodies near him are recorded: the world's active simulation islands
@@ -307,6 +401,7 @@ static _Atomic float g_aim_seconds, g_aim_distance, g_recall_left;
 static _Atomic int g_recalling;
 static Track *g_rt;   /* the body being recalled */
 static int g_see_all;   /* TOTK_RECALL_SEE_ALL=1 (tests): the aim takes bodies out of sight too */
+static int g_recall_debug;   /* TOTK_RECALL_DEBUG=1, below */
 static double g_rt_play, g_rt_last;
 
 static void quat_from_columns(const float *m, float q[4]) {   /* m: three hkVector4 columns, 4 floats apart */
@@ -419,8 +514,17 @@ static void world_call(uintptr_t world, uintptr_t body, uintptr_t fn) {   /* fn(
     ((void (*)(uintptr_t))(g_main + fn))(body);
     ((void (*)(uintptr_t))(g_main + HK_WORLD_UNLOCK))(world);
 }
+/* Stasis's lock-on on the object and the Slate's touch on Link; Stasis's release at the end. */
+static void xlink_list(uintptr_t actor, const char *what);
+static void recall_fx_start(void) {
+    float at[3]; uintptr_t pl = player(at), obj = g_rt ? body_actor(g_rt->body) : 0;
+    if (obj && g_recall_debug && getenv("TOTK_XLINK_LIST")) xlink_list(obj, "the recalled object");
+    fx(pl, NULL, "Demo_SheikPadTouch");
+    if (obj) fx(obj, "BitaLocked_Start", "BitaLockStart"); else if (g_fx) fprintf(stderr, "[abilities] fx: the recalled body has no actor\n");
+}
 static void recall_stop(const char *why) {
     if (!g_rt) return;
+    { uintptr_t obj = body_actor(g_rt->body); if (obj) fx(obj, "BitaLocked_End", "BitaLockEnd"); }
     float zero[3] = {0};
     if (dynamic_body(g_rt->body)) { memcpy((void *)(g_rt->body + HK_ENTITY_LINEAR), zero, 12); memcpy((void *)(g_rt->body + HK_ENTITY_ANGULAR), zero, 12); }
     fprintf(stderr, "[abilities] recall: %s\n", why);
@@ -431,7 +535,6 @@ static void recall_stop(const char *why) {
 /* TOTK_RECALL_DEBUG=1, for tests without aiming: ZL + Y kicks the nearest movable body within 30 m (awake or asleep) up
    and away from him, ZL + X recalls the nearest one with motion on record, and every 2 s the log says what is on record. */
 enum { PAD_X = 4, PAD_Y = 8, HK_WORLD_INACTIVE_ISLANDS = 0x50 };
-static int g_recall_debug;
 static uintptr_t g_aim_logged;
 static double g_record_us; static unsigned g_record_n;   /* what recording costs a frame */
 static uintptr_t nearest_body(const float at[3], int with_motion, double now) {
@@ -542,6 +645,7 @@ static uint64_t recall_frame(uint64_t buttons, uint64_t pressed) {
     double now = now_s();
     if (!player(at) || !world_up() || !havok_thread()) { recall_stop("the world went away"); atomic_store(&g_aim, 0); return buttons; }
     record(at, now);
+    { uintptr_t pl = player(at); if (pl) xlink_probe(pl, buttons, pressed, now); }
     if (g_recall_debug) { g_record_us += (now_s() - now) * 1e6; g_record_n++; recall_debug(at, buttons, pressed, now); }
     if (g_recall_debug && !g_rt && (buttons & PAD_ZL) && (pressed & PAD_X)) {   /* recall the nearest without aiming */
         uintptr_t b = nearest_body(at, 1, now); Track *k = b ? track_of(b) : NULL;
@@ -550,6 +654,7 @@ static uint64_t recall_frame(uint64_t buttons, uint64_t pressed) {
             g_rt = k; g_rt_play = newest(k)->t; g_rt_last = now; atomic_store(&g_recalling, 1);
             uintptr_t world = read_ptr(b + HK_ENTITY_WORLD); if (world) world_call(world, b, HK_ENTITY_ACTIVATE);
             fprintf(stderr, "[abilities] recall: body %#lx (nearest), %.1f s of motion over %u samples, from %.2f %.2f %.2f\n", (unsigned long)b, motion_seconds(k, now), k->n, newest(k)->c[0], newest(k)->c[1], newest(k)->c[2]);
+            recall_fx_start();
         }
     }
     if (g_rt) {
@@ -617,6 +722,7 @@ static uint64_t recall_frame(uint64_t buttons, uint64_t pressed) {
     g_rt = k; g_rt_play = newest(k)->t; g_rt_last = now; atomic_store(&g_recalling, 1);
     uintptr_t world = read_ptr(k->body + HK_ENTITY_WORLD); if (world) world_call(world, k->body, HK_ENTITY_ACTIVATE);
     fprintf(stderr, "[abilities] recall: body %#lx, %.1f s of motion over %u samples, from %.2f %.2f %.2f\n", (unsigned long)k->body, seconds, k->n, newest(k)->c[0], newest(k)->c[1], newest(k)->c[2]);
+    recall_fx_start();
     return buttons;
 }
 
@@ -638,6 +744,7 @@ void botw_abilities_init(Module *m) {
         runtime_fail("abilities: Breath of the Wild 1.6.0 main expected");
     g_main = m->base;
     if (!(g_track = calloc(TRACKS, sizeof *g_track))) runtime_fail("abilities: no memory for Recall's record");
+    { const char *f = getenv("TOTK_ABILITY_FX"); g_fx = f && !strcmp(f, "botw"); }
     { const char *d = getenv("TOTK_RECALL_DEBUG"); g_recall_debug = d && !strcmp(d, "1"); d = getenv("TOTK_RECALL_SEE_ALL"); g_see_all = d && !strcmp(d, "1"); }
     const char *r = getenv("TOTK_ABILITY_RAY"); g_ray = !(r && !strcmp(r, "0"));
     if ((r = getenv("TOTK_ASCEND_REACH"))) g_reach = fminf(fmaxf(strtof(r, NULL), 1), 64);
