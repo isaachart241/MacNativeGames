@@ -11,6 +11,9 @@
    Effect algorithms/layouts follow Ryujinx.Audio (MIT; third_party/licenses/Ryujinx-Audio.txt). */
 #include "runtime.h"
 #include "audio_mixer.h"
+#ifdef GAME_BOTW
+#include "host_sound.h"
+#endif
 #include "audio_reverb.h"
 #include "audio_effects.h"
 #include <AudioToolbox/AudioToolbox.h>
@@ -733,6 +736,9 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
             l *= gain; rr *= gain;
             lr[2 * k] = l > 1 ? 1 : l < -1 ? -1 : l; lr[2 * k + 1] = rr > 1 ? 1 : rr < -1 ? -1 : rr;
         }
+#ifdef GAME_BOTW
+        host_sound_mix(lr, frames, r->param.sample_rate, gain);   /* Tears of the Kingdom's ability sounds (host_sound.h) */
+#endif
     } else if (!sink && !circular) report_once(m, 5, "no device sink in use", r->param.sink_count);
     { /* Per-renderer level report; independent renderers never share scratch or meter state. */
       for (int k = 0; k < 2 * frames; k++) { double x = lr[k];m->level_sum+=x*x;if(fabs(x)>m->level_peak)m->level_peak=fabs(x); }

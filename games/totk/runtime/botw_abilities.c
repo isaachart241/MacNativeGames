@@ -22,6 +22,7 @@
    the poll left. */
 #include "botw_abilities.h"
 #include "game_version.h"
+#include "host_sound.h"
 #include <mach/mach.h>
 #include "mach_vm_compat.h"
 #include <math.h>
@@ -113,6 +114,22 @@ static int ray_cast(const float from[3], const float to[3], uint32_t layers, flo
 }
 
 static void fx(uintptr_t actor, const char *effect, const char *sound);   /* the abilities' look and sound, below */
+/* Tears of the Kingdom's own sounds (host_sound.h; Ascend is "Toreroof" in its data, Recall "Modoreco"), played by the host
+   at the moments its own events play them. TOTK_ABILITY_SOUND=0: none. */
+static int g_snd = 1;
+static float g_snd_volume = 0.5f;   /* TOTK_ABILITY_SOUND_VOLUME: all of them, until TotK's own per-sound volumes are read (at 1 Ascend's start clipped) */
+static int snd(const char *name, float volume, float pan, int loop) { return g_snd ? host_sound_play(name, volume * g_snd_volume, pan, loop) : 0; }
+static void snd_stop(int *voice, float fade) { if (*voice) host_sound_stop(*voice, fade); *voice = 0; }
+/* Volume and pan of a sound at `p` as the camera hears it: full within 5 m, half at 15 m. */
+static void spatial(const float p[3], float *volume, float *pan) {
+    uintptr_t cam = read_ptr((uintptr_t)g_main + CAMERA_ROOT); cam = cam ? read_ptr(cam + CAMERA_STEP1) : 0;
+    float c[6]; *volume = 1; *pan = 0;
+    if (!cam || !read_mem(cam + CAMERA_OFF, c, sizeof c)) return;
+    float fx_ = c[3] - c[0], fz = c[5] - c[2], fn = sqrtf(fx_ * fx_ + fz * fz), dx = p[0] - c[0], dy = p[1] - c[1], dz = p[2] - c[2];
+    float d = sqrtf(dx * dx + dy * dy + dz * dz);
+    *volume = d < 5 ? 1 : 1 / (1 + (d - 5) / 10);
+    if (fn > 1e-3f && d > 1e-3f) *pan = (-fz / fn * dx + fx_ / fn * dz) / d;   /* the camera's right is (-fz, fx) */
+}
 
 /* Ascend (A2). Ready when a ray from his head finds a ceiling within g_reach and, within g_thick above it, a top with
    room to stand (12 and 64 m; TOTK_ASCEND_REACH, TOTK_ASCEND_THICK). A ray from inside a surface does not hit it, so tops
@@ -130,6 +147,7 @@ static struct { uintptr_t at; float rel[3]; } g_slot[160];
 static unsigned g_nslot;
 static uintptr_t g_matrix, g_velocity;
 static float g_from[3], g_to_y, g_now_y, g_back_from_y;
+static int g_inside, g_v_ground, g_v_bg;   /* Ascend: his head in the ceiling; the loops then */
 static double g_t0, g_dur;
 
 static const char *g_why = "";   /* why the last plan found no way up */
@@ -159,10 +177,33 @@ static int ascend_plan(const float at[3], float *ceiling, float *under, float *t
     return 0;
 }
 
-/* Every float triple near `cur` in the player's blocks, as survey move collects them; 0 without a Havok body. */
-static int collect(uintptr_t actor, const float cur[3]) {
+static uintptr_t body_actor(uintptr_t body);
+static uintptr_t entity_world(void);
+/* The player's Havok body (hkpEntity) and the block it sits in at +0x420: world_survey.c's chain
+   [[main+0x2d37af0]+0xf0]+0xd28 when it is set (it can be empty for a while after a load: Ascend found no body twice,
+   2026-10-26), else the body in the world's islands whose actor is the player. *parent: the chain's middle block, or 0. */
+enum { PLAYER_BODY_IN_BLOCK_ = 0x420 };
+static uintptr_t player_body(uintptr_t actor, uintptr_t *parent) {
     uintptr_t hk1 = read_ptr((uintptr_t)g_main + HAVOK_ROOT); if (hk1) hk1 = read_ptr(hk1 + HAVOK_STEP1);
     uintptr_t hk = hk1 ? read_ptr(hk1 + HAVOK_STEP2) : 0;
+    *parent = hk ? hk1 : 0;
+    if (hk) return hk + PLAYER_BODY_IN_BLOCK_;
+    uintptr_t world = entity_world();
+    for (int list = 0; world && list < 2; list++) {
+        struct { uintptr_t data; int32_t size, cap; } islands, bodies;
+        if (!read_mem(world + (list ? 0x50 : 0x40), &islands, sizeof islands) || islands.size <= 0 || islands.size > 4096) continue;
+        static uintptr_t isl[4096], ent[4096];
+        if (!read_mem(islands.data, isl, (size_t)islands.size * 8)) continue;
+        for (int i = 0; i < islands.size; i++) {
+            if (!read_mem(isl[i] + 0x60, &bodies, sizeof bodies) || bodies.size <= 0 || bodies.size > 4096 || !read_mem(bodies.data, ent, (size_t)bodies.size * 8)) continue;
+            for (int j = 0; j < bodies.size; j++) if (body_actor(ent[j]) == actor) return ent[j];
+        }
+    }
+    return 0;
+}
+/* Every float triple near `cur` in the player's blocks, as survey move collects them; 0 without a Havok body. */
+static int collect(uintptr_t actor, const float cur[3]) {
+    uintptr_t hk1, body = player_body(actor, &hk1), hk = body ? body - PLAYER_BODY_IN_BLOCK_ : 0;
     uintptr_t cam = read_ptr((uintptr_t)g_main + CAMERA_ROOT); cam = cam ? read_ptr(cam + CAMERA_STEP1) : 0;
     struct { uintptr_t base; size_t size; float window; } blocks[4] = {{actor, 0x4000, 2}, {hk, 0x1000, 2}, {hk1, 0x1000, 2}, {cam ? cam + CAMERA_OFF : 0, 0x18, 12}};
     static float buf[0x1000];
@@ -178,6 +219,7 @@ static int collect(uintptr_t actor, const float cur[3]) {
     }
     g_matrix = actor + ACTOR_MTX;
     g_velocity = hk ? hk + HAVOK_VELOCITY : 0;
+    if (hk && !hk1) fprintf(stderr, "[abilities] ascend: his Havok body from the world's islands (%#lx)\n", (unsigned long)body);
     return hk != 0;
 }
 static void put_player(float y) {
@@ -209,6 +251,7 @@ static void dump(const char *label) {
 static float ease(float t) { return t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t); }
 static void stop(const char *why) {
     if (g_phase) fprintf(stderr, "[abilities] ascend: %s\n", why);
+    snd_stop(&g_v_ground, 0.1f); snd_stop(&g_v_bg, 0.1f);
     g_phase = 0; atomic_store(&g_phase_seen, 0);
 }
 
@@ -250,6 +293,8 @@ static uint64_t ascend_frame(uint64_t buttons, uint64_t pressed) {
         g_phase = 1; atomic_store(&g_ready, 0);
         fprintf(stderr, "[abilities] ascend: %.2f -> %.2f (ceiling underside %.2f) over %.2f s, %u copies of his position\n", at[1], g_to_y, g_under, g_dur, g_nslot);
         fx(actor, "Demo005_0_warp", "Kago_WindRiseUp");   /* the Sheikah warp's shimmer, Revali's Gale's rise */
+        snd("Toreroof_Start_00", 1, 0, 0); snd("Fol_Pl_Toreroof_Start_00", 1, 0, 0); snd("Toreroof_Green_Start_00", 1, 0, 0); snd("Fol_Pl_Toreroof_Jump_00", 1, 0, 0);
+        g_inside = 0;
         dump("t0");
         if (getenv("TOTK_ASCEND_DUMP"))   /* which layers make up what is above him */
             for (int layer = 0; layer < 20; layer++) {
@@ -266,11 +311,21 @@ static uint64_t ascend_frame(uint64_t buttons, uint64_t pressed) {
     if (g_phase == 1 && (pressed & PAD_B)) {
         g_phase = 2; g_back_from_y = g_now_y; g_t0 = now_s(); g_dur = 0.35; t = 0;
         fprintf(stderr, "[abilities] ascend: cancelled at %.2f, back to %.2f\n", g_back_from_y, g_from[1]);
+        snd_stop(&g_v_ground, 0.2f); snd_stop(&g_v_bg, 0.3f); snd("Pl_Toreroof_Cancel_00", 1, 0, 0);
         fx(actor, NULL, "Demo_SheikPadTouchOff");
     }
     if (g_phase == 1) put_player(g_from[1] + (g_to_y - g_from[1]) * ease((float)t));
     else put_player(g_back_from_y + (g_from[1] - g_back_from_y) * ease((float)t));
     { static double glow; if (g_phase == 1 && t > 0.05 && t < 1 && now_s() - glow > 1.2) { glow = now_s(); fx(actor, "Demo005_0_warp", NULL); } }   /* the glow lasts the rise */
+    /* into the ceiling (his head at its underside) and out of its top (his feet over it), as TotK's sounds go */
+    if (g_phase == 1 && !g_inside && g_now_y + HEAD >= g_under) {
+        g_inside = 1; snd("Fol_Pl_Toreroof_In_00", 1, 0, 0);
+        g_v_ground = snd("Fol_Pl_Toreroof_Ground_lp_00", 1, 0, 1); g_v_bg = snd("Toreroof_BgStart_00", 1, 0, 1);
+    }
+    if (g_phase == 1 && g_inside == 1 && g_now_y >= g_top) {
+        g_inside = 2; snd_stop(&g_v_ground, 0.2f); snd_stop(&g_v_bg, 0.4f);
+        snd("Fol_Pl_Toreroof_Out_00", 1, 0, 0); snd("Fol_Pl_Toreroof_Out_Eff_00", 1, 0, 0); snd("Toreroof_Green_End_00", 1, 0, 0);
+    }
     atomic_store(&g_rise, g_now_y - g_from[1]); atomic_store(&g_rise_total, g_to_y - g_from[1]); atomic_store(&g_phase_seen, g_phase);
     /* Held at the end a moment longer: Havok kept the contacts of his pass through the ceiling, which push him back
        down through the top when he is let go on it at once (he fell from rest through the ground he stood on,
@@ -278,6 +333,7 @@ static uint64_t ascend_frame(uint64_t buttons, uint64_t pressed) {
     if (t >= 1 + ASCEND_SETTLE / g_dur) {
         fprintf(stderr, "[abilities] ascend: %s at %.2f (the matrix says %.2f)\n", g_phase == 1 ? "arrived" : "back", g_now_y, player(at) ? at[1] : NAN);
         dump("end"); if (getenv("TOTK_ASCEND_DUMP")) g_after = 120;
+        snd_stop(&g_v_ground, 0.2f); snd_stop(&g_v_bg, 0.3f);
         if (g_phase == 1) fx(actor, "Demo005_1_warp_appear", "Demo005_1_warp_appear");   /* the warp's arrival */
         g_phase = 0; atomic_store(&g_phase_seen, 0);
     }
@@ -398,8 +454,9 @@ typedef struct { uintptr_t body; double seen; unsigned head, n; Sample s[SAMPLES
 static Track *g_track;   /* TRACKS of them, allocated at init */
 static _Atomic uintptr_t g_aim;           /* the body under the aim while ZL is held, for the HUD */
 static _Atomic float g_aim_seconds, g_aim_distance, g_recall_left;
-static _Atomic int g_recalling;
+static _Atomic int g_recalling, g_mode_seen;
 static Track *g_rt;   /* the body being recalled */
+static int g_recall_mode, g_v_search, g_v_reverse;   /* Recall's aiming mode (as TotK's); its search loop; the rewinding loop */
 static int g_see_all;   /* TOTK_RECALL_SEE_ALL=1 (tests): the aim takes bodies out of sight too */
 static int g_recall_debug;   /* TOTK_RECALL_DEBUG=1, below */
 static double g_rt_play, g_rt_last;
@@ -518,12 +575,18 @@ static void world_call(uintptr_t world, uintptr_t body, uintptr_t fn) {   /* fn(
 static void xlink_list(uintptr_t actor, const char *what);
 static void recall_fx_start(void) {
     float at[3]; uintptr_t pl = player(at), obj = g_rt ? body_actor(g_rt->body) : 0;
+    g_recall_mode = 0; snd_stop(&g_v_search, 0.2f);
+    { float c[3], v, p; if (g_rt && read_mem(g_rt->body + HK_ENTITY_CENTER, c, sizeof c)) {
+        spatial(c, &v, &p); snd("Modoreco_Reverse_01", 1, 0, 0); snd("Modoreco_Reverse_Spread_00", v, p, 0); g_v_reverse = snd("Modoreco_Reverse_lp_02", v, p, 1); } }
     if (obj && g_recall_debug && getenv("TOTK_XLINK_LIST")) xlink_list(obj, "the recalled object");
     fx(pl, NULL, "Demo_SheikPadTouch");
     if (obj) fx(obj, "BitaLocked_Start", "BitaLockStart"); else if (g_fx) fprintf(stderr, "[abilities] fx: the recalled body has no actor\n");
 }
 static void recall_stop(const char *why) {
     if (!g_rt) return;
+    { float c[3], v, p; snd_stop(&g_v_reverse, 0.15f);
+      if (read_mem(g_rt->body + HK_ENTITY_CENTER, c, sizeof c)) { spatial(c, &v, &p); snd("Modoreco_Reverse_End_00", v, p, 0); }
+      snd("Modoreco_End_00", 1, 0, 0); }
     { uintptr_t obj = body_actor(g_rt->body); if (obj) fx(obj, "BitaLocked_End", "BitaLockEnd"); }
     float zero[3] = {0};
     if (dynamic_body(g_rt->body)) { memcpy((void *)(g_rt->body + HK_ENTITY_LINEAR), zero, 12); memcpy((void *)(g_rt->body + HK_ENTITY_ANGULAR), zero, 12); }
@@ -643,7 +706,12 @@ static void recall_debug(const float at[3], uint64_t buttons, uint64_t pressed, 
 static uint64_t recall_frame(uint64_t buttons, uint64_t pressed) {
     float at[3];
     double now = now_s();
-    if (!player(at) || !world_up() || !havok_thread()) { recall_stop("the world went away"); atomic_store(&g_aim, 0); return buttons; }
+    if (!player(at) || !world_up() || !havok_thread()) {
+        recall_stop("the world went away"); atomic_store(&g_aim, 0);
+        if (g_recall_mode) { g_recall_mode = 0; snd_stop(&g_v_search, 0.1f); }
+        atomic_store(&g_mode_seen, 0); return buttons;
+    }
+    atomic_store(&g_mode_seen, g_recall_mode);
     record(at, now);
     { uintptr_t pl = player(at); if (pl) xlink_probe(pl, buttons, pressed, now); }
     if (g_recall_debug) { g_record_us += (now_s() - now) * 1e6; g_record_n++; recall_debug(at, buttons, pressed, now); }
@@ -658,7 +726,7 @@ static uint64_t recall_frame(uint64_t buttons, uint64_t pressed) {
         }
     }
     if (g_rt) {
-        if ((buttons & PAD_ZL) && (pressed & PAD_R)) { recall_stop("let go"); return buttons & ~(uint64_t)PAD_R; }
+        if (pressed & (PAD_R | PAD_B)) { recall_stop("let go"); return buttons & ~(uint64_t)(PAD_R | PAD_B); }
         if (!dynamic_body(g_rt->body)) { recall_stop("the body went away"); return buttons; }
         double dt = now - g_rt_last; g_rt_last = now; if (dt <= 0 || dt > 0.1) dt = 1.0 / 30;
         double next = step_back(g_rt, g_rt_play, dt);
@@ -676,12 +744,26 @@ static uint64_t recall_frame(uint64_t buttons, uint64_t pressed) {
         if (sn > 1e-6f) { float angle = 2 * atan2f(sn, e[3]); for (int x = 0; x < 3; x++) w[x] = e[x] / sn * angle / (float)dt; }
         memcpy((void *)(g_rt->body + HK_ENTITY_LINEAR), v, 12);
         memcpy((void *)(g_rt->body + HK_ENTITY_ANGULAR), w, 12);
+        if (g_v_reverse) { float sv, sp; spatial(cur, &sv, &sp); host_sound_set(g_v_reverse, sv * g_snd_volume, sp); }
         static unsigned frame; if (frame++ % 10 == 0) { uintptr_t world = read_ptr(g_rt->body + HK_ENTITY_WORLD); if (world) world_call(world, g_rt->body, HK_ENTITY_ACTIVATE); }
         atomic_store(&g_recall_left, (float)motion_before(g_rt, g_rt_play, now));
         if (g_recall_debug && frame % 15 == 0) fprintf(stderr, "[abilities] recall: at %.2f %.2f %.2f, to %.2f %.2f %.2f, %.1f s left\n", cur[0], cur[1], cur[2], c[0], c[1], c[2], atomic_load(&g_recall_left));
         return buttons;
     }
-    if (!(buttons & PAD_ZL)) { atomic_store(&g_aim, 0); return buttons; }
+    /* Recall's mode, as TotK's: ZL + R enters it, the camera aims (nothing held), R recalls what it aims at, B leaves */
+    if (!g_recall_mode) {
+        atomic_store(&g_aim, 0);
+        if (!((buttons & PAD_ZL) && (pressed & PAD_R))) return buttons;
+        g_recall_mode = 1; snd("Modoreco_Start_00", 1, 0, 0); g_v_search = snd("Modoreco_Search_lp_00", 1, 0, 1);
+        fprintf(stderr, "[abilities] recall: mode on\n");
+        return buttons & ~(uint64_t)PAD_R;
+    }
+    if (pressed & PAD_B) {
+        g_recall_mode = 0; atomic_store(&g_aim, 0); snd_stop(&g_v_search, 0.2f); snd("Modoreco_End_00", 1, 0, 0);
+        fprintf(stderr, "[abilities] recall: mode off\n");
+        return buttons & ~(uint64_t)PAD_B;
+    }
+    buttons &= ~(uint64_t)(PAD_R | PAD_B);   /* in the mode R and B are Recall's */
     /* aiming: the camera's look ray */
     uintptr_t cam = read_ptr((uintptr_t)g_main + CAMERA_ROOT); cam = cam ? read_ptr(cam + CAMERA_STEP1) : 0;
     float c[6], hit[3];
@@ -745,6 +827,8 @@ void botw_abilities_init(Module *m) {
     g_main = m->base;
     if (!(g_track = calloc(TRACKS, sizeof *g_track))) runtime_fail("abilities: no memory for Recall's record");
     { const char *f = getenv("TOTK_ABILITY_FX"); g_fx = f && !strcmp(f, "botw"); }
+    { const char *f = getenv("TOTK_ABILITY_SOUND"); g_snd = !(f && !strcmp(f, "0")); }
+    { const char *f = getenv("TOTK_ABILITY_SOUND_VOLUME"); if (f) g_snd_volume = fminf(fmaxf(strtof(f, NULL), 0), 2); }
     { const char *d = getenv("TOTK_RECALL_DEBUG"); g_recall_debug = d && !strcmp(d, "1"); d = getenv("TOTK_RECALL_SEE_ALL"); g_see_all = d && !strcmp(d, "1"); }
     const char *r = getenv("TOTK_ABILITY_RAY"); g_ray = !(r && !strcmp(r, "0"));
     if ((r = getenv("TOTK_ASCEND_REACH"))) g_reach = fminf(fmaxf(strtof(r, NULL), 1), 64);
@@ -761,13 +845,17 @@ void botw_abilities_tick(void) {
     float at[3];
     if (!player(at)) { hud_publish(HUD_LINE_ABILITY, "Abilities: no player", 0); return; }
     if (atomic_load(&g_recalling)) {
-        snprintf(line, sizeof line, "Recall: %.1f s left  (ZL+R: let go)", atomic_load(&g_recall_left));
+        snprintf(line, sizeof line, "Recall: %.1f s left  (R or B: let go)", atomic_load(&g_recall_left));
         hud_publish(HUD_LINE_ABILITY, line, 1);
         return;
     }
     if (atomic_load(&g_aim)) {
-        snprintf(line, sizeof line, "Recall: %.1f s of motion, %.0f m  (ZL+R)", atomic_load(&g_aim_seconds), atomic_load(&g_aim_distance));
+        snprintf(line, sizeof line, "Recall: %.1f s of motion, %.0f m  (R: recall, B: leave)", atomic_load(&g_aim_seconds), atomic_load(&g_aim_distance));
         hud_publish(HUD_LINE_ABILITY, line, 1);
+        return;
+    }
+    if (atomic_load(&g_mode_seen)) {
+        hud_publish(HUD_LINE_ABILITY, "Recall: look at something that moved  (R: recall, B: leave)", 1);
         return;
     }
     int phase = atomic_load(&g_phase_seen);
