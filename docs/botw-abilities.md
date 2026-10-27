@@ -1,7 +1,7 @@
 # Tears of the Kingdom abilities in Breath of the Wild (experimental)
 
-Breath of the Wild **1.6.0** on the Mac can use **Ascend** from Tears of the Kingdom. It's off unless you turn it on,
-and with it off the game runs exactly as before. 1.9.0 and the iPhone build don't have it.
+Breath of the Wild **1.6.0** on the Mac can use **Ascend** and **Recall** from Tears of the Kingdom. They're off unless
+you turn them on, and with them off the game runs exactly as before. 1.9.0 and the iPhone build don't have them.
 
 ## Turn it on
 
@@ -26,6 +26,22 @@ ceiling at 4 m/s and lands on top of it. **B** while rising takes him back down.
 - Puzzles and scripted scenes weren't made for this. Shrines can be skipped, and a scene can get stuck. Turn it off for
   those.
 
+## Recall
+
+Anything with physics that moved in the last 30 seconds near Link can be sent back along its path: a crate, a barrel,
+a boulder, a pot. Hold **ZL** and look at it. The abilities line turns yellow and says how many seconds of motion it has,
+for example **Recall: 3.1 s of motion, 18 m (ZL+R)**. Press **R** (still holding ZL) and it runs its path backwards at
+the speed it went. **ZL+R** again lets it go, and so does the end of its record. Either way physics takes over: in the
+air, it falls.
+
+- Aim doesn't have to be exact: the nearest recallable object within 15° of where the camera looks, and in its sight,
+  is taken.
+- The object is driven like a moving platform (physics carries it), so whatever stands on it goes along.
+- Only objects with physics count. Keyframed things (doors, platforms moved by animation) and the ground don't.
+- While Recall has something in its sights, ZL + R is Recall's (no weapon throw). Everywhere else it's BotW's.
+- Tested on 2026-10-26 in the Shrine of Resurrection, on a pot that had been knocked across the room. Riding a recalled
+  object isn't tested yet: there's nothing to stand on there.
+
 ## How it works
 
 `games/totk/runtime/botw_abilities.c`, entered from two places:
@@ -40,6 +56,11 @@ his Havok body and the camera keeps its offset from him and is written every fra
 them. He ends a metre above the top and is held there for a moment, so the contacts Havok kept from passing through the
 ceiling expire before he drops onto it.
 
+Recall records, every frame, the centre of mass and rotation of each moving physics body within 60 m. The bodies come
+from the Havok world's active simulation islands, using layouts from the decompilation's Havok headers. Recording costs
+about 30 µs a frame. A recalled body gets, each frame, the linear and angular velocity that take it to the next point
+of its path. That's how a keyframed body moves, so physics carries it and anything on it.
+
 The 1.6.0 addresses, and how each was found and checked, are at the top of the source file. The work is planned in
 ThorNative's `BOTW_ABILITIES_SCOPE.md`. The tools that found the addresses and the test driver are in
 `ThorNative/botw-abilities/tools/`.
@@ -49,3 +70,7 @@ ThorNative's `BOTW_ABILITIES_SCOPE.md`. The tools that found the addresses and t
 - `TOTK_ABILITY_RAY=0`: no ray casts and no Ascend; just the abilities line.
 - `TOTK_ASCEND_DUMP=<folder>`: during a rise, saves Link's actor and Havok blocks, logs which collision layers are above
   him, and logs his height and velocity for a few seconds after landing.
+- `TOTK_RECALL_DEBUG=1`: ZL + Y kicks the movable body nearest the aim (within 25°) up and away, and ZL + X recalls the
+  nearest body with motion. The log lists the bodies around the camera, follows a kicked body, says what the aim hits
+  and what recording costs.
+- `TOTK_RECALL_SEE_ALL=1`: the aim also takes bodies out of sight (for tests behind closed doors).
