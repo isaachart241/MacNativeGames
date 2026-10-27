@@ -39,7 +39,8 @@ air, it falls.
 - The object is driven like a moving platform (physics carries it), so whatever stands on it goes along.
 - Only objects with physics count. Keyframed things (doors, platforms moved by animation) and the ground don't.
 - While Recall has something in its sights, ZL + R is Recall's (no weapon throw). Everywhere else it's BotW's.
-- Tested on 2026-10-26 in the Shrine of Resurrection, on a pot that had been knocked across the room. Riding a recalled
+- Tested on 2026-10-26 in the Shrine of Resurrection, on a small physics object knocked across the next room by a test
+  kick (aimed through the closed door with `TOTK_RECALL_SEE_ALL`). Riding a recalled
   object isn't tested yet: there's nothing to stand on there.
 
 ## How it works
