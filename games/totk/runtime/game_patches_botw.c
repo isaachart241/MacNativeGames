@@ -10,6 +10,7 @@
 #include <math.h>
 #include "game_patches.h"
 #include "game_version.h"
+#include "botw_abilities.h"
 #include "aspect_math.h"   /* key 4: TOTK_ASPECT parsing */
 #include <TargetConditionals.h>
 uint32_t runtime_thread_current_handle(void);
@@ -174,6 +175,7 @@ static void pad_tick_advance(void) {
 void runtime_frame_step_update(uint64_t now_ns) {
     botw_aspect_apply();   /* key 4 */
     botw_output_tick();    /* key 3 */
+    botw_abilities_tick(); /* TOTK_ABILITIES=1 */
     if (!frame_step_data || !now_ns) return;
     frame_step_measure(now_ns);
     if (pad_tick) pad_tick_advance();
@@ -556,6 +558,7 @@ void runtime_game_patches(Module *m) {
           if (!w) fprintf(stderr, "[botw] exclusive loads with acquire: set at build time (iOS), none left\n"); else
           fprintf(stderr, "[botw] exclusive loads with acquire: %u in the code, %u in the rewriter's patch area (TOTK_EXCL_ACQUIRE=0: as shipped)\n", t, p);
       } else fprintf(stderr, "[botw] exclusive loads as shipped (TOTK_EXCL_ACQUIRE=0)\n"); }
+    botw_abilities_init(m);   /* TOTK_ABILITIES=1: Tears of the Kingdom abilities (botw_abilities.c) */
     const char *e = getenv("TOTK_JQ_CHECK"); if (!e || !*e || !strcmp(e, "0") || ios_code()) return;
     for (int i = 0; i < JQ_SITES; i++) { uint32_t w; memcpy(&w, m->base + g_jq_site[i].off, 4);
         if (w != g_jq_site[i].word) { fprintf(stderr, "[botw] TOTK_JQ_CHECK: main+%#x is %08x, not %08x (%s): not armed\n", g_jq_site[i].off, w, g_jq_site[i].word, g_jq_site[i].what); return; } }

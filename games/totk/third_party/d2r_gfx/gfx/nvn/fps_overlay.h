@@ -30,7 +30,7 @@ void fps_overlay_text(const fps_overlay_info *info, char *out, size_t n);   /* "
    (compact only) and load lines are
    not drawn into the picture but published here, and the window's corner panel (runtime/frontend.m) shows them with the
    shortcuts in one small box. */
-enum { HUD_FPS, HUD_SHADER, HUD_PSO, HUD_LOAD, HUD_LINES };
+enum { HUD_FPS, HUD_SHADER, HUD_PSO, HUD_LOAD, HUD_ABILITY, HUD_LINES };   /* HUD_ABILITY: runtime/botw_abilities.c, compact only */
 int hud_compact(void);
 void hud_publish(int line, const char *text, int highlight);
 int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* 0: the line was never published (hidden or not known yet) */

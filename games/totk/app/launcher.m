@@ -267,6 +267,9 @@ int main(int argc, char **argv) {
           unsigned long long mb = NSProcessInfo.processInfo.physicalMemory / 10 * 3 >> 20;
           char budget[32]; snprintf(budget, sizeof budget, "%llu", mb < 5000 ? 5000ULL : mb);
           setenv("TOTK_GPU_BUDGET_MB", budget, 0); }
+        /* Tears of the Kingdom abilities in Breath of the Wild (runtime/botw_abilities.c): defaults write
+           org.macnativegames.botw TOTK_ABILITIES -bool YES, or TOTK_ABILITIES=1 in the environment, which wins. */
+        if (!getenv("TOTK_ABILITIES") && [NSUserDefaults.standardUserDefaults boolForKey:@"TOTK_ABILITIES"]) setenv("TOTK_ABILITIES", "1", 1);
         setenv("TOTK_SLOT_OWNER", "user", 0);
         setenv("TOTK_SLOT_PURPOSE", "player", 0);
         NSString *contrib = env_or("TOTK_SHADER_CONTRIB", contrib_file(data));
